@@ -1,0 +1,4 @@
+module CLibUSB [system] {
+    header "shim.h"
+    export *
+}
