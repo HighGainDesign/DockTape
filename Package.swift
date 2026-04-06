@@ -5,7 +5,6 @@ let package = Package(
     name: "DockTape",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "DockTape", targets: ["DockTape"]),
         .executable(name: "hidock", targets: ["HiDockCLI"]),
         .library(name: "HiDockKit", targets: ["HiDockKit"]),
     ],
@@ -41,12 +40,8 @@ let package = Package(
                 .linkedFramework("IOKit"),
             ]
         ),
-        // macOS SwiftUI app
-        .executableTarget(
-            name: "DockTape",
-            dependencies: ["HiDockKit"],
-            path: "Sources/DockTape"
-        ),
+        // macOS SwiftUI app (built via Xcode project for .app bundle)
+        // Sources live in Sources/DockTape/ but the app target is in the .xcodeproj
         // CLI tool — same capabilities as the SwiftUI app, headless
         .executableTarget(
             name: "HiDockCLI",

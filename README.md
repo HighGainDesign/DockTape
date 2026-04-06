@@ -25,18 +25,28 @@ Download, transcribe, diarize, and manage recordings entirely on-device. No clou
 
 ## Building
 
+### macOS App (.app bundle)
+
+Requires [xcodegen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`):
+
+```bash
+./scripts/build-app.sh              # Build Release .app
+./scripts/build-app.sh --install    # Build and copy to /Applications
+```
+
+The Xcode project is generated from `project.yml` — don't edit `DockTape.xcodeproj` directly.
+
+### CLI
+
 ```bash
 swift build
-```
-
-Run the GUI app:
-```bash
-swift run DockTape
-```
-
-Run the CLI:
-```bash
 swift run hidock help
+```
+
+### Tests
+
+```bash
+swift test
 ```
 
 ## Architecture
