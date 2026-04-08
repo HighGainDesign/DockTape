@@ -15,5 +15,11 @@ DerivedData/
 .vscode/
 .idea/
 
-# Claude
+# Agent config (local only — generated from docs/DEVELOPMENT.md)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursorrules
+HANDOFF.md
 .claude/
+.gemini/

@@ -8,8 +8,8 @@ Download, transcribe, diarize, and manage recordings entirely on-device. No clou
 
 - **USB device management** — connect via USB, browse files, monitor battery and storage
 - **One-click sync** — download recordings from device, auto-convert HDA to MP3
-- **Local transcription** — speech-to-text using [WhisperKit](https://github.com/argmaxinc/WhisperKit) (Whisper Large v3), runs on Apple Silicon
-- **Speaker diarization** — identify and label different speakers using Sortformer
+- **Local transcription** — speech-to-text using Parakeet ASR via [FluidAudio](https://github.com/FluidInference/FluidAudio), runs on Apple Silicon
+- **Speaker diarization** — identify and label different speakers using Sortformer via FluidAudio
 - **Speaker renaming** — rename detected speakers for readable transcripts
 - **Multiple export formats** — plain text, SRT subtitles, JSONL, JSON
 - **Audio playback** — built-in player with variable speed (0.5x–3x), seek-to-timestamp from transcript
@@ -56,6 +56,10 @@ swift test
 - **HiDockCLI** — command-line interface using HiDockKit
 
 Recordings are stored in `~/Documents/HiDock Recordings/`. The filesystem is the source of truth — no database or metadata files. MP3 files on disk are the canonical record.
+
+## Development
+
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for architecture, conventions, and detailed build instructions.
 
 ## License
 

@@ -1,7 +1,7 @@
 import Foundation
 
 /// Protocol for transcription backends.
-/// Implementations can use whisper.cpp, WhisperKit, Apple Speech, or remote APIs.
+/// The default implementation uses Parakeet ASR via FluidAudio.
 public protocol TranscriptionEngine: Sendable {
     /// Transcribe an audio file and return timestamped segments.
     /// - Parameters:
@@ -14,7 +14,7 @@ public protocol TranscriptionEngine: Sendable {
         onProgress: (@Sendable (Double) -> Void)?
     ) async throws -> [Transcript.Segment]
 
-    /// The model identifier (e.g., "whisper-large-v3").
+    /// The model identifier (e.g., "parakeet-tdt-1.0").
     var modelIdentifier: String { get }
 
     /// Whether the engine is ready (model loaded, etc.).

@@ -27,7 +27,7 @@ final class SyncEngineTests: XCTestCase {
 
         let transcript = Transcript(
             recordingFilename: "2026Mar30-172146-Rec00.hda",
-            transcriptionModel: "whisper-large-v3",
+            transcriptionModel: "parakeet-tdt-1.0",
             hasSpeakerLabels: true,
             segments: [
                 .init(startTime: 0, endTime: 10, text: "Hello world", speakerID: "S1"),

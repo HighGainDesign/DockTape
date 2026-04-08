@@ -6,7 +6,7 @@ final class TranscriptExporterTests: XCTestCase {
     private func sampleTranscript() -> Transcript {
         Transcript(
             recordingFilename: "2026Mar30-172146-Rec00.hda",
-            transcriptionModel: "whisper-large-v3",
+            transcriptionModel: "parakeet-tdt-1.0",
             hasSpeakerLabels: true,
             segments: [
                 .init(startTime: 0, endTime: 10, text: "Let me start with the Q4 numbers.", speakerID: "S1"),

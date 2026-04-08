@@ -10,7 +10,7 @@ public struct Transcript: Codable, Sendable, Identifiable {
     /// When this transcript was generated.
     public let createdAt: Date
 
-    /// The model/engine used for transcription (e.g., "whisper-large-v3").
+    /// The model/engine used for transcription (e.g., "parakeet-tdt-1.0").
     public let transcriptionModel: String
 
     /// Whether speaker diarization was applied.
