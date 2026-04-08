@@ -14,6 +14,15 @@ Redesign DockTape from a 2-column layout (sidebar + detail) to a 3-pane layout m
 3. **macOS HIG compliance** — actions in toolbar + menu bar, not inline CTAs. Standard `NavigationSplitView` three-column layout. Every toolbar action has a menu bar equivalent with a keyboard shortcut.
 4. **Filesystem as source of truth** — folders are real directories. The app watches and reflects the filesystem, never caches a separate folder model.
 
+### Metadata Portability (Open Question)
+
+Transcripts are currently stored as sidecar JSON files (`recording.json` alongside `recording.mp3`). This works but creates an orphaning risk when files are moved outside the app. As more per-recording artifacts are added (summaries, action items), this tension grows. Possible future directions:
+- **Sidecar convention** (current) — predictable naming, easy to inspect, risk of orphaning on external move
+- **Embed in MP3 ID3 tags** — single file, truly portable, harder to inspect
+- **Directory-per-recording** — each recording is a folder containing all its artifacts, most extensible
+
+For this redesign: continue with sidecar convention. All move/rename/delete operations must always move the full set of associated files (MP3 + transcript JSON + any future sidecars) as a unit. This is a prerequisite for folder drag-and-drop.
+
 ## Architecture
 
 ### 1. Three-Pane Layout
@@ -48,7 +57,8 @@ Two sections:
 - Folder count badge on each item
 
 **Device section:**
-- "HiDock [model]" — shown when connected, with green dot indicator
+- Shows actual device name (e.g., "HiDock P1") — never a generic "On Device" label. Uses `device.model.rawValue`.
+- Green dot indicator when connected
 - Device status footer: connection state, battery, storage (same as current sidebar footer)
 
 **Folder management:**
@@ -71,11 +81,14 @@ The middle pane shows a list of recordings filtered by the sidebar selection:
 
 Header shows the current context name and item count. Search bar filters the current list.
 
-Sort and filter controls remain in the toolbar (not the sidebar). Current sort options preserved: Newest, Oldest, Longest, Shortest, Largest, Smallest. Type filter (Recording, Phone, Meeting, WIP) and date filter remain in toolbar filter menu.
+Sort and filter controls remain in the toolbar (not the sidebar). Sort options simplified to two pairs: **Newest/Oldest** (by date) and **Longest/Shortest** (by actual MP3 duration from file metadata, not estimated from size). The previous Largest/Smallest sort is removed — file size is visible in the Info tab but not a useful sort axis since duration is what users care about and the two produced identical orderings with fixed-bitrate HiDock audio. Type filter (Recording, Phone, Meeting, WIP) and date filter remain in toolbar filter menu.
 
 Selection: single or multi-select. Selection drives the detail pane content.
 
-**Multi-select behavior:** When multiple items are selected, the detail pane shows a summary ("3 items selected · 1h 24m total"). Toolbar actions (Delete, Export, Download, Move) apply to all selected items. Transcribe and Play apply to the first selected item only.
+**Multi-select behavior:** When multiple items are selected, the detail pane shows a summary card (similar to Mail's stacked message view): item count, total duration, total size, and a list of titles. Toolbar actions:
+- **Delete, Export, Download, Move** — apply to all selected items
+- **Transcribe** — queues all selected items for sequential transcription
+- **Play** — disabled (no meaningful single-item action)
 
 **Empty state:** When no recording is selected (e.g., empty folder), the detail pane shows `ContentUnavailableView` with contextual message ("Select a recording" or "No recordings in this folder").
 
@@ -228,6 +241,10 @@ AppState (coordinator)
 - `setup()` — initializes all sub-objects, starts device monitoring
 
 **Performance impact:** `PlaybackState.progress` updating at 4Hz only invalidates `PlayerBar` — not the sidebar, recording list, or transcript viewer. This is the primary performance win.
+
+**Playback responsiveness fixes** (migrated into `PlaybackState`):
+- Replace `Timer.scheduledTimer` polling with `AVPlayer.addPeriodicTimeObserver(forInterval:queue:)` for pipeline-synchronized progress updates
+- Replace sample-accurate seeking (`toleranceBefore: .zero, toleranceAfter: .zero`) with default tolerances for interactive scrubbing — eliminates 100-200ms seek latency on compressed audio
 
 ### 8. Filesystem Watching
 
