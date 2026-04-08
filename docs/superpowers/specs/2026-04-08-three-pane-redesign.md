@@ -116,7 +116,20 @@ Implementation: a computed `availableTabs` array. Tab bar renders only when `ava
 - For library recordings: download date, transcript status
 
 **Transcript tab contents:**
-- Same as current `TranscriptViewer` — speaker-labeled segments with timestamps, speaker rename, search, copy, export
+- Speaker-labeled segments with timestamps, search, copy, export
+
+**Live highlight + click-to-seek:**
+- During playback, the currently-playing segment is highlighted (subtle background color or leading accent bar) and auto-scrolled into view
+- Active segment is computed by comparing `PlaybackState.progress` against segment start timestamps — derived as `activeSegmentIndex`, which changes infrequently (~every 10-15s) even though progress updates at 4Hz
+- Clicking any transcript segment seeks playback to that segment's start timestamp (bidirectional: player → transcript highlight, transcript click → player seek)
+- If playback is stopped, clicking a segment starts playback from that point
+
+**Speaker management:**
+- **Rename speaker** — existing feature, carried forward
+- **Split speaker** — right-click a segment → "Assign Different Speaker" → creates a new speaker ID for that segment (and optionally all following segments by that speaker). Handles cases where diarization conflates two people into one speaker ID.
+- **Merge speakers** — right-click a speaker label → "Merge with..." → submenu of other speakers. Rewrites all segments from the selected speaker to the target speaker ID.
+- All speaker edits persist to the transcript JSON sidecar immediately.
+- *Speaker split/merge is cuttable from this release if scope requires — the UI scaffolding (context menus on segments) ships regardless.*
 
 **Player bar:**
 - Pinned at the bottom of the detail pane (not the window)
