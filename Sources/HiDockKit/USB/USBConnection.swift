@@ -31,6 +31,8 @@ public final class USBConnection: USBConnectionProtocol, @unchecked Sendable {
         // Open device by VID/PID
         handle = libusb_open_device_with_vid_pid(ctx, vendorID, productID)
         guard handle != nil else {
+            libusb_exit(ctx)
+            context = nil
             throw USBError.deviceNotFound
         }
 
@@ -54,6 +56,10 @@ public final class USBConnection: USBConnectionProtocol, @unchecked Sendable {
             print("    (Add Terminal.app or your IDE)")
             print("")
             print("    Also try: unplug/replug device, close HiNotes browser tab")
+            libusb_close(handle)
+            handle = nil
+            libusb_exit(ctx)
+            context = nil
             throw USBError.openFailed("libusb_claim_interface failed: \(claimResult)")
         }
     }
@@ -112,14 +118,17 @@ public final class USBConnection: USBConnectionProtocol, @unchecked Sendable {
     }
 
     public func close() async {
-        if let h = handle {
-            libusb_release_interface(h, interfaceNum)
-            libusb_close(h)
-            handle = nil
-        }
-        if let ctx = context {
-            libusb_exit(ctx)
-            context = nil
+        // Dispatch through ioQueue to serialize with in-flight send/receive operations
+        ioQueue.sync {
+            if let h = handle {
+                libusb_release_interface(h, interfaceNum)
+                libusb_close(h)
+                handle = nil
+            }
+            if let ctx = context {
+                libusb_exit(ctx)
+                context = nil
+            }
         }
     }
 }

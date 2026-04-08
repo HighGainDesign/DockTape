@@ -169,8 +169,14 @@ func runExport(args: [String]) async throws {
         return
     }
 
-    let format = args.dropFirst().first(where: { !$0.hasPrefix("-") })
-        ?? (args.contains("--format") ? args[args.firstIndex(of: "--format")! + 1] : "txt")
+    let format: String
+    if let positionalFormat = args.dropFirst().first(where: { !$0.hasPrefix("-") }) {
+        format = positionalFormat
+    } else if let idx = args.firstIndex(of: "--format"), idx + 1 < args.count {
+        format = args[idx + 1]
+    } else {
+        format = "txt"
+    }
 
     let pipeline = RecordingPipeline()
     try await pipeline.setup()

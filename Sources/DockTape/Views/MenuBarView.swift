@@ -24,7 +24,11 @@ struct MenuBarView: View {
                     .foregroundStyle(.secondary)
 
                 Button("Open DockTape") {
-                    NSApp.activate(ignoringOtherApps: true)
+                    if #available(macOS 14.0, *) {
+                        NSApp.activate()
+                    } else {
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
                     NSApp.windows.first { $0.isVisible || $0.canBecomeKey }?.makeKeyAndOrderFront(nil)
                 }
             } else {

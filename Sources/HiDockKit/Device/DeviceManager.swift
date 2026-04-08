@@ -116,36 +116,46 @@ public actor DeviceManager {
             device.transferFilename = entry.filename
         }
 
-        defer {
-            Task { @MainActor in
+        do {
+            // Send transfer request with filename as body (ASCII bytes)
+            let filenameBody = Data(entry.filename.utf8)
+            let fileSize = Int(entry.size)
+            var fileData = Data()
+            fileData.reserveCapacity(fileSize)
+
+            // First response frame contains initial chunk of file data
+            let response = try await transport.sendCommand(.transferFile, body: filenameBody)
+            if response.body.count > 0 {
+                fileData.append(response.body)
+            }
+
+            // Read remaining data frames (each is a Jensen frame with cmd=0x05)
+            while fileData.count < fileSize {
+                try Task.checkCancellation()
+                let chunk = try await transport.receiveFrame()
+                guard !chunk.body.isEmpty else {
+                    throw HiDockError.transferFailed("Received empty data frame during transfer of \(entry.filename)")
+                }
+                fileData.append(chunk.body)
+
+                let progress = Double(fileData.count) / Double(fileSize)
+                await MainActor.run { device.transferProgress = progress }
+            }
+
+            await MainActor.run {
                 device.isTransferring = false
                 device.transferProgress = 0
                 device.transferFilename = ""
             }
+            return fileData
+        } catch {
+            await MainActor.run {
+                device.isTransferring = false
+                device.transferProgress = 0
+                device.transferFilename = ""
+            }
+            throw error
         }
-
-        // Send transfer request with filename as body (ASCII bytes)
-        let filenameBody = Data(entry.filename.utf8)
-        let fileSize = Int(entry.size)
-        var fileData = Data()
-        fileData.reserveCapacity(fileSize)
-
-        // First response frame contains initial chunk of file data
-        let response = try await transport.sendCommand(.transferFile, body: filenameBody)
-        if response.body.count > 0 {
-            fileData.append(response.body)
-        }
-
-        // Read remaining data frames (each is a Jensen frame with cmd=0x05)
-        while fileData.count < fileSize {
-            let chunk = try await transport.receiveFrame()
-            fileData.append(chunk.body)
-
-            let progress = Double(fileData.count) / Double(fileSize)
-            await MainActor.run { device.transferProgress = progress }
-        }
-
-        return fileData
     }
 
     /// Delete a file on the device by filename.

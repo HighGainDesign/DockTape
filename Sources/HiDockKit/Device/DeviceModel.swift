@@ -2,7 +2,8 @@ import Foundation
 
 /// Observable state for a connected HiDock device.
 @Observable
-public final class DeviceModel: Identifiable, @unchecked Sendable {
+@MainActor
+public final class DeviceModel: Identifiable, Sendable {
     public let id: String  // serial number or unique ID
     public var model: HiDockModel
     public var firmwareVersion: String = ""

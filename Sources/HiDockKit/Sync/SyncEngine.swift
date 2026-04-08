@@ -90,6 +90,7 @@ public actor SyncEngine {
 
         // Download each new file
         for (i, file) in toDownload.enumerated() {
+            try Task.checkCancellation()
             onProgress?(SyncProgress(phase: .downloading, currentFile: file.filename, fileIndex: i, totalFiles: totalFiles, bytesDownloaded: 0, bytesTotal: Int(file.size)))
 
             do {

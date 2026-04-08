@@ -49,9 +49,13 @@ final class AppState {
     var transcriptionQueueIndex: Int = 0
     var transcriptionStartTime: Date?
 
-    // Settings
-    var autoDeleteAfterDownload: Bool = false
-    var autoSyncClock: Bool = true
+    // Settings (persisted to UserDefaults)
+    var autoDeleteAfterDownload: Bool = false {
+        didSet { UserDefaults.standard.set(autoDeleteAfterDownload, forKey: "autoDeleteAfterDownload") }
+    }
+    var autoSyncClock: Bool = true {
+        didSet { UserDefaults.standard.set(autoSyncClock, forKey: "autoSyncClock") }
+    }
 
     let store: RecordingStore
     let transcriptStore: TranscriptStore
@@ -66,6 +70,8 @@ final class AppState {
         let store = RecordingStore(baseDirectory: customPath)
         self.store = store
         self.transcriptStore = TranscriptStore(baseDirectory: store.baseDirectory)
+        self.autoDeleteAfterDownload = UserDefaults.standard.bool(forKey: "autoDeleteAfterDownload")
+        self.autoSyncClock = UserDefaults.standard.object(forKey: "autoSyncClock") as? Bool ?? true
     }
 
     func setup() async throws {
@@ -76,6 +82,7 @@ final class AppState {
 
     func refreshRecordings() async {
         recordings = await store.allRecordings()
+        downloadedFilenames = Set(recordings.map(\.filename))
         // Reload transcripts from disk so we detect external additions/deletions
         try? await transcriptStore.loadAll()
         await refreshTranscriptStatuses()
@@ -460,14 +467,12 @@ final class AppState {
                     let rec = transcriptionQueue[index]
                     let total = transcriptionQueue.count
 
-                    await MainActor.run {
-                        transcribingFile = rec.filename
-                        transcriptStatuses[rec.filename] = .inProgress
-                        transcriptionStartTime = Date()
-                        let progress = total > 1 ? " (\(index + 1)/\(total))" : ""
-                        transcriptionPhase = "Transcribing\(progress)..."
-                        statusMessage = "Transcribing \(rec.filename)\(progress)..."
-                    }
+                    transcribingFile = rec.filename
+                    transcriptStatuses[rec.filename] = .inProgress
+                    transcriptionStartTime = Date()
+                    let progress = total > 1 ? " (\(index + 1)/\(total))" : ""
+                    transcriptionPhase = "Transcribing\(progress)..."
+                    statusMessage = "Transcribing \(rec.filename)\(progress)..."
 
                     // Delete existing transcript if re-transcribing
                     try? await transcriptStore.delete(for: rec.filename)
@@ -478,49 +483,41 @@ final class AppState {
 
                     // Pipeline saved to disk via its own store; update our cache too
                     try? await transcriptStore.save(transcript, mp3Filename: rec.filename)
-                    await MainActor.run {
-                        transcriptStatuses[rec.filename] = .done
-                        transcriptionQueueIndex += 1
-                    }
+                    transcriptStatuses[rec.filename] = .done
+                    transcriptionQueueIndex += 1
                 }
 
-                await MainActor.run {
-                    let count = transcriptionQueue.count
-                    statusMessage = count == 1 ? "Transcription complete" : "Transcribed \(count) recordings"
-                    transcribingFile = nil
-                    transcriptionPhase = ""
-                    transcriptionQueue = []
-                    transcriptionQueueIndex = 0
-                    transcriptionStartTime = nil
-                    transcriptionTask = nil
-                }
+                let count = transcriptionQueue.count
+                statusMessage = count == 1 ? "Transcription complete" : "Transcribed \(count) recordings"
+                transcribingFile = nil
+                transcriptionPhase = ""
+                transcriptionQueue = []
+                transcriptionQueueIndex = 0
+                transcriptionStartTime = nil
+                transcriptionTask = nil
             } catch is CancellationError {
-                await MainActor.run {
-                    if let file = transcribingFile {
-                        transcriptStatuses[file] = TranscriptStatus.none
-                    }
-                    statusMessage = "Transcription cancelled"
-                    transcribingFile = nil
-                    transcriptionPhase = ""
-                    transcriptionQueue = []
-                    transcriptionQueueIndex = 0
-                    transcriptionStartTime = nil
-                    transcriptionTask = nil
+                if let file = transcribingFile {
+                    transcriptStatuses[file] = TranscriptStatus.none
                 }
+                statusMessage = "Transcription cancelled"
+                transcribingFile = nil
+                transcriptionPhase = ""
+                transcriptionQueue = []
+                transcriptionQueueIndex = 0
+                transcriptionStartTime = nil
+                transcriptionTask = nil
             } catch {
-                await MainActor.run {
-                    if let file = transcribingFile {
-                        transcriptStatuses[file] = .failed
-                    }
-                    errorMessage = "Transcription failed: \(error.localizedDescription)"
-                    statusMessage = "Transcription failed"
-                    transcribingFile = nil
-                    transcriptionPhase = ""
-                    transcriptionQueue = []
-                    transcriptionQueueIndex = 0
-                    transcriptionStartTime = nil
-                    transcriptionTask = nil
+                if let file = transcribingFile {
+                    transcriptStatuses[file] = .failed
                 }
+                errorMessage = "Transcription failed: \(error.localizedDescription)"
+                statusMessage = "Transcription failed"
+                transcribingFile = nil
+                transcriptionPhase = ""
+                transcriptionQueue = []
+                transcriptionQueueIndex = 0
+                transcriptionStartTime = nil
+                transcriptionTask = nil
             }
         }
         transcriptionTask = task
@@ -662,11 +659,13 @@ final class AppState {
 
     // MARK: - Helpers
 
+    private var downloadedFilenames: Set<String> = []
+
     func isDownloaded(_ filename: String) -> Bool {
         let mp3Name = filename.hasSuffix(".hda")
             ? filename.replacingOccurrences(of: ".hda", with: ".mp3")
             : filename
-        return recordings.contains { $0.filename == mp3Name }
+        return downloadedFilenames.contains(mp3Name)
     }
 }
 

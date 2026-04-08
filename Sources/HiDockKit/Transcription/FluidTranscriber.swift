@@ -28,9 +28,11 @@ public final class FluidTranscriber: TranscriptionEngine, @unchecked Sendable {
         language: String?,
         onProgress: (@Sendable (Double) -> Void)?
     ) async throws -> [Transcript.Segment] {
-        guard let manager = asrManager else {
+        if asrManager == nil {
             try await prepare()
-            return try await transcribe(audioURL: audioURL, language: language, onProgress: onProgress)
+        }
+        guard let manager = asrManager else {
+            throw HiDockError.conversionFailed("Failed to initialize ASR engine after prepare()")
         }
 
         onProgress?(0.1)

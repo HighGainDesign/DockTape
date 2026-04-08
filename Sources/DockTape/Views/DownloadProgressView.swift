@@ -15,6 +15,8 @@ struct DownloadProgressView: View {
 
             ProgressView(value: progress)
                 .progressViewStyle(.linear)
+                .accessibilityLabel("Download progress")
+                .accessibilityValue("\(Int(progress * 100)) percent")
 
             Text("\(Int(progress * 100))%")
                 .monospacedDigit()

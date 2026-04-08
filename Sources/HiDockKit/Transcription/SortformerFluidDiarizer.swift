@@ -32,9 +32,11 @@ public final class SortformerFluidDiarizer: DiarizationEngine, @unchecked Sendab
         numSpeakers: Int?,
         onProgress: (@Sendable (Double) -> Void)?
     ) async throws -> [SpeakerSegment] {
-        guard let diarizer else {
+        if diarizer == nil {
             try await prepare()
-            return try await diarize(audioURL: audioURL, numSpeakers: numSpeakers, onProgress: onProgress)
+        }
+        guard let diarizer else {
+            throw HiDockError.conversionFailed("Failed to initialize diarization engine after prepare()")
         }
 
         onProgress?(0.05)

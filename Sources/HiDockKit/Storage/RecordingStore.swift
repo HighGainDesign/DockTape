@@ -57,7 +57,7 @@ public actor RecordingStore {
     /// Store a downloaded .hda file: convert to .mp3.
     @discardableResult
     public func storeRecording(hdaData: Data, entry: FileEntry) throws -> RecordingMetadata {
-        let mp3Filename = entry.filename.replacingOccurrences(of: ".hda", with: ".mp3")
+        let mp3Filename = entry.filename.replacingOccurrences(of: ".hda", with: ".mp3", options: .caseInsensitive)
         let outputURL = baseDirectory.appendingPathComponent(mp3Filename)
 
         try HDAConverter.convertAndWrite(hdaData: hdaData, to: outputURL)

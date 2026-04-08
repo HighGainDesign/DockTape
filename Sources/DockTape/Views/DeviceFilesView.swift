@@ -233,14 +233,19 @@ struct DeviceFilesView: View {
     }
 
     private func filteredFiles(_ files: [FileEntry]) -> [FileEntry] {
+        // Pre-compute parsed filenames once to avoid redundant parsing during filter + sort
+        let parsed = Dictionary(uniqueKeysWithValues: files.map {
+            ($0.filename, FilenameParsing.parse($0.filename))
+        })
+
         var result = files
 
         if let mode = filterMode {
-            result = result.filter { FilenameParsing.parse($0.filename).mode == mode }
+            result = result.filter { parsed[$0.filename]?.mode == mode }
         }
 
         if let startDate = filterPeriod.startDate {
-            result = result.filter { (FilenameParsing.parse($0.filename).date ?? .distantPast) >= startDate }
+            result = result.filter { (parsed[$0.filename]?.date ?? .distantPast) >= startDate }
         }
 
         if !searchText.isEmpty {
@@ -250,13 +255,13 @@ struct DeviceFilesView: View {
 
         switch sortBy {
         case .dateNewest:
-            result.sort { FilenameParsing.parse($0.filename).date ?? .distantPast > FilenameParsing.parse($1.filename).date ?? .distantPast }
+            result.sort { (parsed[$0.filename]?.date ?? .distantPast) > (parsed[$1.filename]?.date ?? .distantPast) }
         case .dateOldest:
-            result.sort { FilenameParsing.parse($0.filename).date ?? .distantPast < FilenameParsing.parse($1.filename).date ?? .distantPast }
+            result.sort { (parsed[$0.filename]?.date ?? .distantPast) < (parsed[$1.filename]?.date ?? .distantPast) }
         case .longest:
-            result.sort { $0.size > $1.size }
+            result.sort { DurationCalculator.estimateDuration(fileSize: UInt64($0.size)) > DurationCalculator.estimateDuration(fileSize: UInt64($1.size)) }
         case .shortest:
-            result.sort { $0.size < $1.size }
+            result.sort { DurationCalculator.estimateDuration(fileSize: UInt64($0.size)) < DurationCalculator.estimateDuration(fileSize: UInt64($1.size)) }
         case .largest:
             result.sort { $0.size > $1.size }
         case .smallest:
@@ -285,6 +290,7 @@ private struct DeviceFileRow: View {
                     .foregroundStyle(modeColor)
                     .font(.system(size: 14))
             }
+            .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(displayName)
@@ -315,17 +321,20 @@ private struct DeviceFileRow: View {
                 if isDownloading {
                     ProgressView()
                         .controlSize(.small)
+                        .accessibilityLabel("Downloading")
                 }
 
                 if isDeleting {
                     ProgressView()
                         .controlSize(.small)
+                        .accessibilityLabel("Deleting")
                 }
 
                 if isDownloaded {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.caption)
                         .foregroundStyle(.green)
+                        .accessibilityLabel("Already downloaded")
                         .help("Already downloaded")
                 }
             }
@@ -333,16 +342,26 @@ private struct DeviceFileRow: View {
         .padding(.vertical, 4)
     }
 
-    private var parsed: FilenameParsing.ParsedFilename {
-        FilenameParsing.parse(file.filename)
+    private let parsed: FilenameParsing.ParsedFilename
+
+    private static let dateFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.dateStyle = .medium
+        fmt.timeStyle = .short
+        return fmt
+    }()
+
+    init(file: FileEntry, isDownloaded: Bool, isDownloading: Bool, isDeleting: Bool) {
+        self.file = file
+        self.isDownloaded = isDownloaded
+        self.isDownloading = isDownloading
+        self.isDeleting = isDeleting
+        self.parsed = FilenameParsing.parse(file.filename)
     }
 
     private var displayName: String {
         if let date = parsed.date {
-            let fmt = DateFormatter()
-            fmt.dateStyle = .medium
-            fmt.timeStyle = .short
-            return fmt.string(from: date)
+            return Self.dateFormatter.string(from: date)
         }
         return file.filename
     }

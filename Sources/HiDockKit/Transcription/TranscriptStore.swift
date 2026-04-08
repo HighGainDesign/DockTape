@@ -18,16 +18,21 @@ public actor TranscriptStore {
         guard fm.fileExists(atPath: baseDirectory.path) else { return }
 
         let files = try fm.contentsOfDirectory(at: baseDirectory, includingPropertiesForKeys: nil)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
         for file in files where file.pathExtension == "json" && file.lastPathComponent.contains(".transcript.") {
-            let data = try Data(contentsOf: file)
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            let transcript = try decoder.decode(Transcript.self, from: data)
-            // Key by MP3 filename derived from the transcript file name
-            let basename = file.lastPathComponent
-                .replacingOccurrences(of: ".transcript.json", with: "")
-            let mp3Key = "\(basename).mp3"
-            cache[mp3Key] = transcript
+            do {
+                let data = try Data(contentsOf: file)
+                let transcript = try decoder.decode(Transcript.self, from: data)
+                // Key by MP3 filename derived from the transcript file name
+                let basename = file.lastPathComponent
+                    .replacingOccurrences(of: ".transcript.json", with: "")
+                let mp3Key = "\(basename).mp3"
+                cache[mp3Key] = transcript
+            } catch {
+                // Skip corrupt transcript files rather than aborting the entire load
+                continue
+            }
         }
     }
 

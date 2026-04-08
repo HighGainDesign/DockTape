@@ -35,25 +35,13 @@ struct ContentView: View {
                 DeviceInfoView(state: state)
             }
         }
-        .sheet(isPresented: Binding(
+        .alert("Error", isPresented: Binding(
             get: { state.errorMessage != nil },
             set: { if !$0 { state.errorMessage = nil } }
         )) {
-            VStack(spacing: 16) {
-                Image(systemName: "exclamationmark.triangle")
-                    .font(.largeTitle)
-                    .foregroundStyle(.red)
-                Text("Error")
-                    .font(.headline)
-                Text(state.errorMessage ?? "")
-                    .font(.body)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Button("Dismiss") { state.errorMessage = nil }
-                    .keyboardShortcut(.defaultAction)
-            }
-            .padding(24)
-            .frame(minWidth: 400, maxWidth: 500)
+            Button("Dismiss", role: .cancel) { state.errorMessage = nil }
+        } message: {
+            Text(state.errorMessage ?? "")
         }
     }
 
@@ -130,6 +118,7 @@ struct ContentView: View {
                     Circle()
                         .fill(.green)
                         .frame(width: 8, height: 8)
+                        .accessibilityLabel("Connected")
                     Text("HiDock \(device.model.rawValue)")
                         .font(.caption.weight(.medium))
                     Spacer()
@@ -141,6 +130,7 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.borderless)
+                    .accessibilityLabel("Device Info")
                     .help("Device Info")
                 }
 
@@ -161,6 +151,8 @@ struct ContentView: View {
                         ProgressView(value: Double(battery.level), total: 100)
                             .tint(batteryColor(battery.level))
                             .controlSize(.small)
+                            .accessibilityLabel("Battery level")
+                            .accessibilityValue("\(battery.level) percent")
                     }
                 }
 
@@ -183,6 +175,8 @@ struct ContentView: View {
                         ProgressView(value: card.usagePercent, total: 100)
                             .tint(storageColor(card.usagePercent))
                             .controlSize(.small)
+                            .accessibilityLabel("Storage used")
+                            .accessibilityValue(String(format: "%.0f percent", card.usagePercent))
                     }
                 }
             }
@@ -193,6 +187,7 @@ struct ContentView: View {
                 Circle()
                     .fill(.secondary.opacity(0.5))
                     .frame(width: 8, height: 8)
+                    .accessibilityLabel("Disconnected")
                 Text("No device connected")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -239,6 +234,7 @@ struct NowPlayingBar: View {
                         .frame(width: 20)
                 }
                 .buttonStyle(.borderless)
+                .accessibilityLabel(state.isPlaying ? "Pause" : "Play")
 
                 if let file = state.playingFile {
                     let rec = state.recordings.first { $0.filename == file }
@@ -266,6 +262,7 @@ struct NowPlayingBar: View {
                     }
                 }
                 .controlSize(.small)
+                .accessibilityLabel("Playback position")
 
                 Text(formatTime(state.playbackDuration))
                     .font(.caption.monospacedDigit())
@@ -301,6 +298,7 @@ struct NowPlayingBar: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.borderless)
+                .accessibilityLabel("Stop playback")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
@@ -330,65 +328,66 @@ struct NowPlayingBar: View {
 
 struct TranscriptionBar: View {
     @Bindable var state: AppState
-    @State private var elapsed: TimeInterval = 0
-    private let elapsedTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     private var queueTotal: Int { state.transcriptionQueue.count }
     private var queueIndex: Int { state.transcriptionQueueIndex }
 
     var body: some View {
-        VStack(spacing: 0) {
-            Divider()
-            HStack(spacing: 12) {
-                ProgressView()
-                    .controlSize(.small)
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let elapsed = state.transcriptionStartTime.map {
+                context.date.timeIntervalSince($0)
+            } ?? 0
 
-                if let file = state.transcribingFile {
-                    let rec = state.recordings.first { $0.filename == file }
-                    VStack(alignment: .leading, spacing: 1) {
-                        HStack(spacing: 6) {
-                            Text(state.transcriptionPhase)
-                                .font(.caption.weight(.medium))
-                            if queueTotal > 1 {
-                                Text("\(queueIndex + 1) of \(queueTotal)")
-                                    .font(.caption.monospacedDigit())
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 1)
-                                    .background(.orange.opacity(0.15))
-                                    .clipShape(Capsule())
+            VStack(spacing: 0) {
+                Divider()
+                HStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Transcribing")
+
+                    if let file = state.transcribingFile {
+                        let rec = state.recordings.first { $0.filename == file }
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 6) {
+                                Text(state.transcriptionPhase)
+                                    .font(.caption.weight(.medium))
+                                if queueTotal > 1 {
+                                    Text("\(queueIndex + 1) of \(queueTotal)")
+                                        .font(.caption.monospacedDigit())
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 1)
+                                        .background(.orange.opacity(0.15))
+                                        .clipShape(Capsule())
+                                        .accessibilityLabel("Transcribing item \(queueIndex + 1) of \(queueTotal)")
+                                }
+                            }
+                            if let rec {
+                                Text(rec.displayTitle)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
                             }
                         }
-                        if let rec {
-                            Text(rec.displayTitle)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
                     }
+
+                    Spacer()
+
+                    // Elapsed time
+                    Text(formatElapsed(elapsed))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+
+                    Button {
+                        state.cancelTranscription()
+                    } label: {
+                        Label("Cancel", systemImage: "xmark.circle.fill")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
-
-                Spacer()
-
-                // Elapsed time
-                Text(formatElapsed(elapsed))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-
-                Button {
-                    state.cancelTranscription()
-                } label: {
-                    Label("Cancel", systemImage: "xmark.circle.fill")
-                        .font(.caption)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(.orange.opacity(0.08))
-        }
-        .onReceive(elapsedTimer) { _ in
-            if let start = state.transcriptionStartTime {
-                elapsed = Date().timeIntervalSince(start)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.orange.opacity(0.08))
             }
         }
     }

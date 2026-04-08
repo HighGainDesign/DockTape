@@ -56,7 +56,7 @@ public struct CardInfo: Sendable {
     }
     public var isInserted: Bool { capacityMB > 0 }
     public var usagePercent: Double {
-        guard capacityMB > 0 else { return 0 }
+        guard capacityMB > 0, freeMB <= capacityMB else { return 0 }
         return Double(capacityMB - freeMB) / Double(capacityMB) * 100
     }
 }

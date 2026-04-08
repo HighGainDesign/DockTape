@@ -115,16 +115,21 @@ struct TranscriptViewer: View {
                 speakerNames[sid] = sid
             }
         }
-        .alert(item: $mergeConfirmation) { merge in
-            Alert(
-                title: Text("Merge Speakers?"),
-                message: Text("\"\(merge.name)\" is already used by another speaker. Merge their segments together?"),
-                primaryButton: .default(Text("Merge")) {
+        .alert("Merge Speakers?", isPresented: Binding(
+            get: { mergeConfirmation != nil },
+            set: { if !$0 { mergeConfirmation = nil } }
+        )) {
+            Button("Merge") {
+                if let merge = mergeConfirmation {
                     speakerNames[merge.sourceSID] = merge.name
                     onSaveSpeakerNames?(speakerNames)
-                },
-                secondaryButton: .cancel()
-            )
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            if let merge = mergeConfirmation {
+                Text("\"\(merge.name)\" is already used by another speaker. Merge their segments together?")
+            }
         }
     }
 
@@ -179,6 +184,7 @@ struct TranscriptViewer: View {
                         .foregroundStyle(.green)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Save speaker name")
                 .help("Save (Return)")
                 Button {
                     editingSpeaker = nil
@@ -188,6 +194,7 @@ struct TranscriptViewer: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Cancel rename")
                 .help("Cancel (Esc)")
             }
         } else {
@@ -259,7 +266,7 @@ struct TranscriptViewer: View {
 
     private func speakerColor(_ sid: String) -> Color {
         let colors: [Color] = [.blue, .green, .purple, .orange, .pink, .cyan]
-        let hash = abs(sid.hashValue)
+        let hash = abs(sid.utf8.reduce(0) { ($0 &* 31) &+ Int($1) })
         return colors[hash % colors.count]
     }
 }
@@ -319,7 +326,7 @@ private struct SegmentRow: View {
 
     private func speakerColor(_ sid: String) -> Color {
         let colors: [Color] = [.blue, .green, .purple, .orange, .pink, .cyan]
-        let hash = abs(sid.hashValue)
+        let hash = abs(sid.utf8.reduce(0) { ($0 &* 31) &+ Int($1) })
         return colors[hash % colors.count]
     }
 }
