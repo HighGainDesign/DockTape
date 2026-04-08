@@ -64,11 +64,28 @@ public actor TranscriptStore {
         Array(cache.values)
     }
 
-    /// Update speaker names in a transcript.
+    /// Update speaker names in a transcript and regenerate .txt export.
     public func updateSpeakerNames(for mp3Filename: String, names: [String: String]) throws {
         guard var transcript = cache[mp3Filename] else { return }
         transcript.speakerNames = names
         try save(transcript, mp3Filename: mp3Filename)
+        try exportPlainText(transcript, mp3Filename: mp3Filename)
+    }
+
+    /// Merge speaker IDs: reassign all segments from `sourceID` to `targetID`, remove sourceID from names.
+    public func mergeSpeakers(for mp3Filename: String, source sourceID: String, into targetID: String) throws {
+        guard var transcript = cache[mp3Filename] else { return }
+        transcript.segments = transcript.segments.map { seg in
+            guard seg.speakerID == sourceID else { return seg }
+            return Transcript.Segment(
+                id: seg.id, startTime: seg.startTime, endTime: seg.endTime,
+                text: seg.text, speakerID: targetID, confidence: seg.confidence
+            )
+        }
+        // Keep target's name, remove source
+        transcript.speakerNames.removeValue(forKey: sourceID)
+        try save(transcript, mp3Filename: mp3Filename)
+        try exportPlainText(transcript, mp3Filename: mp3Filename)
     }
 
     /// Re-key a transcript after a recording rename.
@@ -76,6 +93,13 @@ public actor TranscriptStore {
         guard let transcript = cache.removeValue(forKey: oldMp3) else { return }
         cache[newMp3] = transcript
         // The actual file rename is handled by RecordingStore.renameRecording
+    }
+
+    private func exportPlainText(_ transcript: Transcript, mp3Filename: String) throws {
+        let basename = (mp3Filename as NSString).deletingPathExtension
+        let txtURL = baseDirectory.appendingPathComponent("\(basename).txt")
+        let plainText = TranscriptExporter.exportPlainText(transcript: transcript)
+        try plainText.write(to: txtURL, atomically: true, encoding: .utf8)
     }
 
     private func fileURL(for mp3Filename: String) -> URL {

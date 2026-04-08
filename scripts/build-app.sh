@@ -8,7 +8,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-CONFIG="${1:-Release}"
+INSTALL=false
+CONFIG="Release"
+for arg in "$@"; do
+    case "$arg" in
+        --install) INSTALL=true ;;
+        Debug|Release) CONFIG="$arg" ;;
+    esac
+done
 DERIVED_DATA=".build/xcode"
 
 # Regenerate Xcode project from project.yml
@@ -36,7 +43,7 @@ echo "Built: $APP_PATH"
 echo "Size:  $(du -sh "$APP_PATH" | cut -f1)"
 
 # Install to /Applications if --install flag
-if [ "${1:-}" = "--install" ] || [ "${2:-}" = "--install" ]; then
+if [ "$INSTALL" = true ]; then
     echo ""
     echo "Installing to /Applications..."
     rm -rf /Applications/DockTape.app

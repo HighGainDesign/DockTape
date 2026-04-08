@@ -33,4 +33,5 @@ public enum HiDockError: Error, Sendable {
     case conversionFailed(String)
     case storageError(String)
     case noDevice
+    case invalidFilename(String)
 }

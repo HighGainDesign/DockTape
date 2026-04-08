@@ -76,6 +76,8 @@ final class AppState {
 
     func refreshRecordings() async {
         recordings = await store.allRecordings()
+        // Reload transcripts from disk so we detect external additions/deletions
+        try? await transcriptStore.loadAll()
         await refreshTranscriptStatuses()
     }
 
@@ -470,14 +472,14 @@ final class AppState {
                     // Delete existing transcript if re-transcribing
                     try? await transcriptStore.delete(for: rec.filename)
 
-                    _ = try await pipeline!.transcribeRecording(filename: rec.filename)
+                    let transcript = try await pipeline!.transcribeRecording(filename: rec.filename)
 
                     try Task.checkCancellation()
 
-                    // Verify transcript was saved, then update status
-                    let saved = await transcriptStore.hasTranscript(for: rec.filename)
+                    // Pipeline saved to disk via its own store; update our cache too
+                    try? await transcriptStore.save(transcript, mp3Filename: rec.filename)
                     await MainActor.run {
-                        transcriptStatuses[rec.filename] = saved ? .done : .failed
+                        transcriptStatuses[rec.filename] = .done
                         transcriptionQueueIndex += 1
                     }
                 }
@@ -552,7 +554,30 @@ final class AppState {
 
     func updateSpeakerNames(for filename: String, names: [String: String]) async {
         do {
-            try await transcriptStore.updateSpeakerNames(for: filename, names: names)
+            // Detect speakers that were given the same name → merge them
+            var nameToIDs: [String: [String]] = [:]
+            for (sid, name) in names {
+                nameToIDs[name, default: []].append(sid)
+            }
+
+            for (_, ids) in nameToIDs where ids.count > 1 {
+                let sorted = ids.sorted()
+                let targetID = sorted[0]
+                for sourceID in sorted.dropFirst() {
+                    try await transcriptStore.mergeSpeakers(
+                        for: filename, source: sourceID, into: targetID)
+                }
+            }
+
+            // Update remaining names (merge already removed merged IDs)
+            let current = await transcriptStore.transcript(for: filename)
+            if let current {
+                var finalNames: [String: String] = [:]
+                for sid in current.speakerIDs {
+                    finalNames[sid] = names[sid] ?? sid
+                }
+                try await transcriptStore.updateSpeakerNames(for: filename, names: finalNames)
+            }
         } catch {
             errorMessage = "Failed to save speaker names: \(error.localizedDescription)"
         }

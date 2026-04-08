@@ -10,6 +10,16 @@ struct TranscriptViewer: View {
     @State private var speakerNames: [String: String] = [:]
     @State private var editingSpeaker: String? = nil
     @State private var editText: String = ""
+    @State private var mergeConfirmation: MergeConfirmation? = nil
+    @FocusState private var editFieldFocused: Bool
+
+    private struct MergeConfirmation: Identifiable {
+        let id = UUID()
+        let sourceSID: String
+        let targetSID: String
+        let name: String
+    }
+
     private var hasNameChanges: Bool {
         speakerNames != transcript.speakerNames
     }
@@ -59,7 +69,7 @@ struct TranscriptViewer: View {
                 Button("Done") {
                     saveAndDismiss()
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered)
                 .controlSize(.small)
             }
             .padding()
@@ -92,12 +102,29 @@ struct TranscriptViewer: View {
         }
         .frame(minWidth: 600, minHeight: 400)
         .frame(idealWidth: 700, idealHeight: 600)
+        .onExitCommand {
+            if editingSpeaker != nil {
+                editingSpeaker = nil
+            } else {
+                saveAndDismiss()
+            }
+        }
         .onAppear {
             speakerNames = transcript.speakerNames
-            // Pre-fill any speakers that don't have custom names
             for sid in transcript.speakerIDs where speakerNames[sid] == nil {
                 speakerNames[sid] = sid
             }
+        }
+        .alert(item: $mergeConfirmation) { merge in
+            Alert(
+                title: Text("Merge Speakers?"),
+                message: Text("\"\(merge.name)\" is already used by another speaker. Merge their segments together?"),
+                primaryButton: .default(Text("Merge")) {
+                    speakerNames[merge.sourceSID] = merge.name
+                    onSaveSpeakerNames?(speakerNames)
+                },
+                secondaryButton: .cancel()
+            )
         }
     }
 
@@ -132,29 +159,36 @@ struct TranscriptViewer: View {
 
         if editingSpeaker == sid {
             HStack(spacing: 4) {
-                TextField("Name", text: $editText)
+                Circle()
+                    .fill(speakerColor(sid))
+                    .frame(width: 8, height: 8)
+                TextField("Speaker name", text: $editText)
                     .textFieldStyle(.roundedBorder)
-                    .font(.caption)
-                    .frame(width: 120)
+                    .font(.body)
+                    .frame(width: 150)
+                    .focused($editFieldFocused)
                     .onSubmit {
                         commitEdit(sid: sid)
                     }
+                    .onAppear { editFieldFocused = true }
                 Button {
                     commitEdit(sid: sid)
                 } label: {
                     Image(systemName: "checkmark.circle.fill")
+                        .font(.title2)
                         .foregroundStyle(.green)
-                        .font(.caption)
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.plain)
+                .help("Save (Return)")
                 Button {
                     editingSpeaker = nil
                 } label: {
                     Image(systemName: "xmark.circle.fill")
+                        .font(.title2)
                         .foregroundStyle(.secondary)
-                        .font(.caption)
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.plain)
+                .help("Cancel (Esc)")
             }
         } else {
             Button {
@@ -185,9 +219,19 @@ struct TranscriptViewer: View {
 
     private func commitEdit(sid: String) {
         let trimmed = editText.trimmingCharacters(in: .whitespaces)
-        if !trimmed.isEmpty {
-            speakerNames[sid] = trimmed
+        guard !trimmed.isEmpty else {
+            editingSpeaker = nil
+            return
         }
+
+        // Check if this name is already used by another speaker
+        if let existingID = speakerNames.first(where: { $0.key != sid && $0.value == trimmed })?.key {
+            editingSpeaker = nil
+            mergeConfirmation = MergeConfirmation(sourceSID: sid, targetSID: existingID, name: trimmed)
+            return
+        }
+
+        speakerNames[sid] = trimmed
         editingSpeaker = nil
     }
 
@@ -206,7 +250,6 @@ struct TranscriptViewer: View {
     }
 
     private func copyToClipboard() {
-        // Use current speaker names for the copy
         var copy = transcript
         copy.speakerNames = speakerNames
         let text = copy.plainText(includeSpeakers: true)

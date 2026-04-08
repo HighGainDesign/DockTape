@@ -4,9 +4,9 @@ import HiDockKit
 struct LibraryView: View {
     @Bindable var state: AppState
     @State private var searchText = ""
-    @State private var sortBy: LibrarySort = .dateNewest
-    @State private var filterMode: String? = nil
-    @State private var filterPeriod: TimePeriod = .anyTime
+    @AppStorage("librarySortBy") private var sortBy: LibrarySort = .dateNewest
+    @AppStorage("libraryFilterMode") private var filterMode: String = ""
+    @AppStorage("libraryFilterPeriod") private var filterPeriod: TimePeriod = .anyTime
 
     enum TimePeriod: String, CaseIterable {
         case anyTime = "Any Time"
@@ -100,11 +100,13 @@ struct LibraryView: View {
             }
         }
         .onKeyPress(.space) {
+            guard viewingTranscript == nil else { return .ignored }
             guard let rec = selectedRecordings.first, selection.count == 1 else { return .ignored }
             Task { await state.playRecording(rec) }
             return .handled
         }
         .onKeyPress(.delete) {
+            guard viewingTranscript == nil else { return .ignored }
             guard !selection.isEmpty else { return .ignored }
             Task {
                 for rec in selectedRecordings {
@@ -115,6 +117,7 @@ struct LibraryView: View {
             return .handled
         }
         .onKeyPress(.return) {
+            guard viewingTranscript == nil else { return .ignored }
             guard selection.count == 1, let rec = selectedRecordings.first else { return .ignored }
             let status = state.transcriptStatuses[rec.filename] ?? TranscriptStatus.none
             if status == .done {
@@ -258,7 +261,7 @@ struct LibraryView: View {
 
             Menu {
                 Section("Type") {
-                    Button("All") { filterMode = nil }
+                    Button("All") { filterMode = "" }
                     Button("Recording") { filterMode = "Rec" }
                     Button("Phone") { filterMode = "Pho" }
                     Button("Meeting") { filterMode = "Mee" }
@@ -279,7 +282,7 @@ struct LibraryView: View {
                     }
                 }
             } label: {
-                let isActive = filterMode != nil || filterPeriod != .anyTime
+                let isActive = !filterMode.isEmpty || filterPeriod != .anyTime
                 Label(filterLabel,
                       systemImage: isActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
             }
@@ -355,10 +358,10 @@ struct LibraryView: View {
     }
 
     private var filterLabel: String {
-        if let mode = filterMode, filterPeriod != .anyTime {
-            return "\(modeDisplayName(mode)), \(filterPeriod.rawValue)"
-        } else if let mode = filterMode {
-            return modeDisplayName(mode)
+        if !filterMode.isEmpty && filterPeriod != .anyTime {
+            return "\(modeDisplayName(filterMode)), \(filterPeriod.rawValue)"
+        } else if !filterMode.isEmpty {
+            return modeDisplayName(filterMode)
         } else if filterPeriod != .anyTime {
             return filterPeriod.rawValue
         }
@@ -368,8 +371,8 @@ struct LibraryView: View {
     private var filteredRecordings: [RecordingMetadata] {
         var recs = state.recordings
 
-        if let mode = filterMode {
-            recs = recs.filter { $0.mode == mode }
+        if !filterMode.isEmpty {
+            recs = recs.filter { $0.mode == filterMode }
         }
 
         if let startDate = filterPeriod.startDate {

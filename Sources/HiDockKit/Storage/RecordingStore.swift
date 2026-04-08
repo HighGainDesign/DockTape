@@ -38,20 +38,15 @@ public actor RecordingStore {
                 }
                 let filename = url.lastPathComponent
                 let fileSize = UInt64(attrs.fileSize ?? 0)
-                let creationDate = attrs.creationDate
 
-                // Try to parse mode from filename (device-generated names have mode prefix)
+                // Parse date and mode from filename; fall back to file creation date
                 let parsed = FilenameParsing.parse(filename)
-                let mode: String
-                if parsed.mode != .unknown {
-                    mode = parsed.mode.rawValue
-                } else {
-                    mode = ""
-                }
+                let recordedAt = parsed.date ?? attrs.creationDate
+                let mode = parsed.mode != .unknown ? parsed.mode.rawValue : ""
 
                 return RecordingMetadata(
                     filename: filename,
-                    recordedAt: creationDate,
+                    recordedAt: recordedAt,
                     mode: mode,
                     fileSizeBytes: fileSize,
                     estimatedDuration: DurationCalculator.estimateDuration(fileSize: fileSize)
@@ -74,7 +69,7 @@ public actor RecordingStore {
 
         return RecordingMetadata(
             filename: mp3Filename,
-            recordedAt: attrs.creationDate,
+            recordedAt: parsed.date ?? attrs.creationDate,
             mode: parsed.mode != .unknown ? parsed.mode.rawValue : "",
             fileSizeBytes: fileSize,
             estimatedDuration: DurationCalculator.estimateDuration(fileSize: fileSize)
@@ -87,13 +82,17 @@ public actor RecordingStore {
         try? FileManager.default.removeItem(at: url)
     }
 
-    /// Rename a recording file on disk, plus any associated files (.transcript.json, .txt, .jsonl).
+    /// Rename a recording file on disk, plus the associated transcript file.
     /// Returns the new filename.
     @discardableResult
     public func renameRecording(filename: String, to newName: String) throws -> String {
         let oldBasename = (filename as NSString).deletingPathExtension
-        let newFilename = newName.hasSuffix(".mp3") ? newName : "\(newName).mp3"
-        let newBasename = (newFilename as NSString).deletingPathExtension
+        let sanitized = Self.sanitizeFilename(newName.hasSuffix(".mp3") ? String(newName.dropLast(4)) : newName)
+        guard !sanitized.isEmpty else {
+            throw HiDockError.invalidFilename(newName)
+        }
+        let newFilename = "\(sanitized).mp3"
+        let newBasename = sanitized
 
         guard filename != newFilename else { return filename }
 
@@ -105,8 +104,7 @@ public actor RecordingStore {
         try fm.moveItem(at: oldURL, to: newURL)
 
         // Rename associated files (best effort)
-        let extensions = [".transcript.json", ".txt", ".jsonl"]
-        for ext in extensions {
+        for ext in [".transcript.json", ".txt"] {
             let oldAssoc = baseDirectory.appendingPathComponent("\(oldBasename)\(ext)")
             let newAssoc = baseDirectory.appendingPathComponent("\(newBasename)\(ext)")
             try? fm.moveItem(at: oldAssoc, to: newAssoc)
@@ -118,6 +116,16 @@ public actor RecordingStore {
     /// Get the file URL for a recording's MP3.
     public func mp3URL(for metadata: RecordingMetadata) -> URL {
         baseDirectory.appendingPathComponent(metadata.filename)
+    }
+
+    /// Sanitize a filename by replacing illegal characters.
+    static func sanitizeFilename(_ name: String) -> String {
+        // Replace characters illegal in macOS/Windows filenames
+        let illegal = CharacterSet(charactersIn: "/\\:*?\"<>|\0")
+        let sanitized = name.unicodeScalars
+            .filter { !illegal.contains($0) }
+            .map { Character($0) }
+        return String(sanitized).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Check if a recording has already been downloaded.

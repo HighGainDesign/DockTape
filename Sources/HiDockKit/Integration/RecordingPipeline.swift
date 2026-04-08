@@ -1,6 +1,6 @@
 import Foundation
 
-/// End-to-end pipeline: download files from device → convert HDA → transcribe + diarize → export.
+/// End-to-end pipeline: download files from device → convert HDA → transcribe + diarize.
 /// Used by both the SwiftUI app and CLI. All state is managed internally.
 public actor RecordingPipeline {
     private let recordingStore: RecordingStore
@@ -121,7 +121,7 @@ public actor RecordingPipeline {
         )
 
         try await transcriptStore.save(transcript, mp3Filename: filename)
-        try await exportTranscript(transcript, basename: (filename as NSString).deletingPathExtension)
+        try exportPlainText(transcript, basename: (filename as NSString).deletingPathExtension)
 
         return transcript
     }
@@ -187,7 +187,7 @@ public actor RecordingPipeline {
                 ))
 
                 try await transcriptStore.save(transcript, mp3Filename: meta.filename)
-                try await exportTranscript(transcript, basename: (meta.filename as NSString).deletingPathExtension)
+                try exportPlainText(transcript, basename: (meta.filename as NSString).deletingPathExtension)
                 processedCount += 1
             } catch {
                 onEvent?(.transcriptionFailed(filename: meta.filename, error: error.localizedDescription))
@@ -195,6 +195,12 @@ public actor RecordingPipeline {
         }
 
         onEvent?(.complete(fileCount: processedCount))
+    }
+
+    private func exportPlainText(_ transcript: Transcript, basename: String) throws {
+        let txtURL = recordingStore.baseDirectory.appendingPathComponent("\(basename).txt")
+        let plainText = TranscriptExporter.exportPlainText(transcript: transcript)
+        try plainText.write(to: txtURL, atomically: true, encoding: .utf8)
     }
 
     private func prepareModels() async throws {
@@ -212,17 +218,5 @@ public actor RecordingPipeline {
                 // Diarization is optional — continue without it
             }
         }
-    }
-
-    private func exportTranscript(_ transcript: Transcript, basename: String) async throws {
-        let dir = recordingStore.baseDirectory
-
-        let txtURL = dir.appendingPathComponent("\(basename).txt")
-        let plainText = TranscriptExporter.exportPlainText(transcript: transcript)
-        try plainText.write(to: txtURL, atomically: true, encoding: .utf8)
-
-        let jsonlURL = dir.appendingPathComponent("\(basename).jsonl")
-        let jsonlData = TranscriptExporter.exportJSONLines(transcript: transcript)
-        try jsonlData.write(to: jsonlURL)
     }
 }

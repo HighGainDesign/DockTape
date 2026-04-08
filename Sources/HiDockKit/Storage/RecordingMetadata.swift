@@ -8,7 +8,7 @@ public struct RecordingMetadata: Sendable, Identifiable {
     /// MP3 filename on disk (e.g., "REC_20240315_143000.mp3" or "Meeting with Bob.mp3").
     public let filename: String
 
-    /// When the recording was made, from file creation date.
+    /// When the recording was made, parsed from filename (falls back to file creation date).
     public let recordedAt: Date?
 
     /// Recording mode parsed from filename (Rec, Pho, Mee, Wip), or empty if not parseable.
