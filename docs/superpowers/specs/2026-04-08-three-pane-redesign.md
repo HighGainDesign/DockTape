@@ -128,7 +128,7 @@ Implementation: a computed `availableTabs` array. Tab bar renders only when `ava
 - **Rename speaker** — existing feature, carried forward
 - **Split speaker** — right-click a segment → "Assign Different Speaker" → creates a new speaker ID for that segment (and optionally all following segments by that speaker). Handles cases where diarization conflates two people into one speaker ID.
 - **Merge speakers** — right-click a speaker label → "Merge with..." → submenu of other speakers. Rewrites all segments from the selected speaker to the target speaker ID.
-- All speaker edits persist to the transcript JSON sidecar immediately.
+- All speaker edits persist to the transcript JSON sidecar immediately (atomic write via `atomically: true`). The plain text (.txt) export is regenerated on a coalesced 2-second debounce timer to avoid redundant disk writes during rapid edits. On launch, stale TXT files are detected by comparing mod times with their JSON counterpart and regenerated automatically. JSON is always the source of truth; TXT is a derived artifact.
 - *Speaker split/merge is cuttable from this release if scope requires — the UI scaffolding (context menus on segments) ships regardless.*
 
 **Player bar:**
