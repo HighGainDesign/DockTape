@@ -1,7 +1,7 @@
 # DockTape — Developer Reference
 
-Native macOS app for managing HiDock H1 recordings. Download, transcribe,
-diarize, and export — entirely on-device.
+Native macOS app for managing HiDock recordings (P1, P1 Mini, H1, H1E).
+Download, transcribe, diarize, and export — entirely on-device. Tested with P1.
 
 **Stack:** Swift 5.10+, SwiftUI, SPM, macOS 14+, Apple Silicon required
 **Status:** MVP complete — library, playback, transcription, diarization, export all wired

@@ -1,8 +1,8 @@
 # DockTape
 
-**HiDock Manager** — a native macOS app for managing recordings from your [HiDock](https://hidock.com) device.
+**HiDock Manager** — a native macOS app for managing recordings from your [HiDock](https://hidock.com) device (P1, P1 Mini, H1, H1E).
 
-Download, transcribe, diarize, and manage recordings entirely on-device. No cloud services required.
+Download, transcribe, diarize, and manage recordings entirely on-device. No cloud services required. Tested with HiDock P1.
 
 ## Features
 
@@ -21,7 +21,7 @@ Download, transcribe, diarize, and manage recordings entirely on-device. No clou
 
 - macOS 14 (Sonoma) or later
 - Apple Silicon Mac (for on-device transcription)
-- HiDock H1 device connected via USB
+- HiDock device (P1, P1 Mini, H1, or H1E) connected via USB
 
 ## Building
 
