@@ -192,15 +192,22 @@ for newly transcribed recordings.
 Third tab alongside Info and Transcript.
 
 **No summary yet:**
-- Template picker dropdown (auto-selected from recording mode)
-- "Summarize" button
+- Template picker dropdown (auto-selected from recording mode). Includes
+  "Custom..." option at the bottom.
+- Selecting "Custom..." opens a sheet with a multi-line TextEditor for the
+  prompt, placeholder text (e.g., "Extract all customer objections and our
+  responses..."), and a brief hint about writing effective prompts. Sheet has
+  Cancel and "Summarize" buttons. This sheet pattern also accommodates
+  user-created reusable templates in a future iteration.
+- "Summarize" button (for built-in templates — triggers directly)
 - If no API key configured, button triggers first-use setup flow
 
 **Summary exists:**
 - Sections rendered with headings and markdown content
 - Action items with checkable checkboxes (state persists to disk)
 - Caption showing model, provider, and timestamp
-- "Re-summarize" button in header
+- "Re-summarize" button in header. If original was custom, re-summarize
+  reopens the sheet pre-filled with the saved custom prompt.
 
 **In progress:**
 - Spinner with phase text ("Summarizing with Claude Sonnet 4.6...")
