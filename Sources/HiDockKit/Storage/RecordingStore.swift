@@ -19,39 +19,178 @@ public actor RecordingStore {
         try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
     }
 
-    /// Scan the directory for MP3 files and build metadata from the filesystem.
-    public func allRecordings() -> [RecordingMetadata] {
+    // MARK: - Folder CRUD
+
+    /// Return sorted list of top-level folder names.
+    public func folders() -> [String] {
         let fm = FileManager.default
         guard let contents = try? fm.contentsOfDirectory(
             at: baseDirectory,
-            includingPropertiesForKeys: [.fileSizeKey, .creationDateKey],
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: .skipsHiddenFiles
+        ) else {
+            return []
+        }
+        return contents
+            .filter { url in
+                let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+                return isDir
+            }
+            .map { $0.lastPathComponent }
+            .sorted()
+    }
+
+    /// Create a new top-level folder. Throws if it already exists.
+    public func createFolder(named name: String) throws {
+        let sanitized = Self.sanitizeFilename(name)
+        guard !sanitized.isEmpty else {
+            throw HiDockError.invalidFilename(name)
+        }
+        let url = baseDirectory.appendingPathComponent(sanitized)
+        let fm = FileManager.default
+        if fm.fileExists(atPath: url.path) {
+            throw HiDockError.invalidFilename(name)
+        }
+        try fm.createDirectory(at: url, withIntermediateDirectories: false)
+    }
+
+    /// Rename a top-level folder.
+    public func renameFolder(from oldName: String, to newName: String) throws {
+        let sanitized = Self.sanitizeFilename(newName)
+        guard !sanitized.isEmpty else {
+            throw HiDockError.invalidFilename(newName)
+        }
+        let oldURL = baseDirectory.appendingPathComponent(oldName)
+        let newURL = baseDirectory.appendingPathComponent(sanitized)
+        try FileManager.default.moveItem(at: oldURL, to: newURL)
+    }
+
+    /// Delete a top-level folder and all its contents.
+    public func deleteFolder(named name: String) throws {
+        let sanitized = Self.sanitizeFilename(name)
+        guard !sanitized.isEmpty else { throw HiDockError.invalidFilename(name) }
+        let url = baseDirectory.appendingPathComponent(sanitized)
+        try FileManager.default.removeItem(at: url)
+    }
+
+    // MARK: - Recording scanning
+
+    /// Scan the directory recursively for MP3 files, building metadata with folder info.
+    public func allRecordings() -> [RecordingMetadata] {
+        scanRecordings(in: baseDirectory, relativeTo: baseDirectory)
+    }
+
+    /// Return recordings in a specific folder (relative folder name).
+    public func recordings(inFolder folderName: String) -> [RecordingMetadata] {
+        let folderURL = baseDirectory.appendingPathComponent(folderName)
+        return scanRecordings(in: folderURL, relativeTo: baseDirectory)
+    }
+
+    // MARK: - Move recording
+
+    /// Move a recording (and its sidecars) to a folder, or to root if folder is nil.
+    /// Returns the new relative filename.
+    @discardableResult
+    public func moveRecording(filename: String, toFolder folderName: String?) throws -> String {
+        let fm = FileManager.default
+        let basename = (filename as NSString).lastPathComponent
+        let basenameNoExt = (basename as NSString).deletingPathExtension
+
+        // Compute source directory (relative to baseDirectory)
+        let oldDir: URL
+        let oldFolderPath = (filename as NSString).deletingLastPathComponent
+        if oldFolderPath.isEmpty || oldFolderPath == "." {
+            oldDir = baseDirectory
+        } else {
+            oldDir = baseDirectory.appendingPathComponent(oldFolderPath)
+        }
+
+        // Compute destination directory
+        let newDir: URL
+        let newRelativeDir: String
+        if let folderName = folderName {
+            newDir = baseDirectory.appendingPathComponent(folderName)
+            newRelativeDir = folderName
+        } else {
+            newDir = baseDirectory
+            newRelativeDir = ""
+        }
+
+        // Compute new relative filename
+        let newFilename = newRelativeDir.isEmpty ? basename : "\(newRelativeDir)/\(basename)"
+
+        // Move the MP3 file
+        let oldMP3 = oldDir.appendingPathComponent(basename)
+        let newMP3 = newDir.appendingPathComponent(basename)
+        try fm.moveItem(at: oldMP3, to: newMP3)
+
+        // Move associated sidecar files (best effort)
+        for ext in [".transcript.json", ".txt"] {
+            let oldSidecar = oldDir.appendingPathComponent("\(basenameNoExt)\(ext)")
+            let newSidecar = newDir.appendingPathComponent("\(basenameNoExt)\(ext)")
+            if fm.fileExists(atPath: oldSidecar.path) {
+                try? fm.moveItem(at: oldSidecar, to: newSidecar)
+            }
+        }
+
+        return newFilename
+    }
+
+    // MARK: - Private helpers
+
+    private func scanRecordings(in directory: URL, relativeTo base: URL) -> [RecordingMetadata] {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey, .creationDateKey, .isDirectoryKey],
             options: .skipsHiddenFiles
         ) else {
             return []
         }
 
-        return contents
-            .filter { $0.pathExtension.lowercased() == "mp3" }
-            .compactMap { url -> RecordingMetadata? in
-                guard let attrs = try? url.resourceValues(forKeys: [.fileSizeKey, .creationDateKey]) else {
-                    return nil
-                }
-                let filename = url.lastPathComponent
-                let fileSize = UInt64(attrs.fileSize ?? 0)
+        // Normalize base path for reliable prefix stripping.
+        // Use resolvingSymlinksInPath to handle /var -> /private/var on macOS.
+        let basePath = base.resolvingSymlinksInPath().path
+        let basePrefix = basePath.hasSuffix("/") ? basePath : basePath + "/"
 
-                // Parse date and mode from filename; fall back to file creation date
-                let parsed = FilenameParsing.parse(filename)
-                let recordedAt = parsed.date ?? attrs.creationDate
-                let mode = parsed.mode != .unknown ? parsed.mode.rawValue : ""
+        var results: [RecordingMetadata] = []
+        for case let url as URL in enumerator {
+            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDir { continue }
+            guard url.pathExtension.lowercased() == "mp3" else { continue }
 
-                return RecordingMetadata(
-                    filename: filename,
-                    recordedAt: recordedAt,
-                    mode: mode,
-                    fileSizeBytes: fileSize,
-                    estimatedDuration: DurationCalculator.estimateDuration(fileSize: fileSize)
-                )
+            guard let attrs = try? url.resourceValues(forKeys: [.fileSizeKey, .creationDateKey]) else {
+                continue
             }
+
+            // Compute relative path from base; resolve symlinks to match /var -> /private/var
+            let normalizedPath = url.resolvingSymlinksInPath().path
+            let relativePath: String
+            if normalizedPath.hasPrefix(basePrefix) {
+                relativePath = String(normalizedPath.dropFirst(basePrefix.count))
+            } else {
+                relativePath = url.lastPathComponent
+            }
+
+            // Determine folder from relative path (first path component if nested)
+            let components = relativePath.split(separator: "/", maxSplits: 1)
+            let recordingFolder: String? = components.count > 1 ? String(components[0]) : nil
+
+            let fileSize = UInt64(attrs.fileSize ?? 0)
+            let parsed = FilenameParsing.parse(url.lastPathComponent)
+            let recordedAt = parsed.date ?? attrs.creationDate
+            let mode = parsed.mode != .unknown ? parsed.mode.rawValue : ""
+
+            results.append(RecordingMetadata(
+                filename: relativePath,
+                recordedAt: recordedAt,
+                mode: mode,
+                fileSizeBytes: fileSize,
+                estimatedDuration: DurationCalculator.estimateDuration(fileSize: fileSize),
+                folder: recordingFolder
+            ))
+        }
+        return results
     }
 
     /// Store a downloaded .hda file: convert to .mp3.

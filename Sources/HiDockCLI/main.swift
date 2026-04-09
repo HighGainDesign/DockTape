@@ -281,7 +281,7 @@ func connectDevice() async throws -> (DeviceManager, USBDeviceMonitor.USBDevice)
     let connection = USBConnection(vendorID: target.vendorID, productID: target.productID)
     try connection.open()
 
-    let device = DeviceModel(id: target.model.rawValue, model: target.model)
+    let device = await DeviceModel(id: target.model.rawValue, model: target.model)
     let manager = DeviceManager(device: device)
     await manager.connect(via: connection)
 

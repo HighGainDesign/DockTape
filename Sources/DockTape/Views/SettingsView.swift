@@ -12,7 +12,7 @@ struct SettingsView: View {
             generalSettings
                 .tabItem { Label("General", systemImage: "gear") }
 
-            if let device = state.device, let settings = device.settings {
+            if let device = state.device.model, let settings = device.settings {
                 deviceSettings(settings)
                     .tabItem { Label("Device", systemImage: "waveform") }
             }
@@ -22,7 +22,7 @@ struct SettingsView: View {
         }
         .frame(width: 450)
         .onAppear {
-            libraryPath = state.store.baseDirectory.path(percentEncoded: false)
+            libraryPath = state.library.store.baseDirectory.path(percentEncoded: false)
         }
         .alert("Restart Required", isPresented: $showRestartAlert) {
             Button("OK") {}

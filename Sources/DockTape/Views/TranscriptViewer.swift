@@ -3,9 +3,12 @@ import HiDockKit
 
 struct TranscriptViewer: View {
     let transcript: Transcript
+    var activeSegmentIndex: Int? = nil
     var onSeek: ((TimeInterval) -> Void)?
     var onSaveSpeakerNames: (([String: String]) -> Void)?
-    @Environment(\.dismiss) private var dismiss
+    var onSplitSpeaker: ((_ segmentID: UUID, _ allFollowing: Bool) -> Void)?
+    var onMergeSpeaker: ((_ sourceSID: String, _ targetSID: String) -> Void)?
+
     @State private var filterSpeaker: String? = nil
     @State private var speakerNames: [String: String] = [:]
     @State private var editingSpeaker: String? = nil
@@ -29,8 +32,6 @@ struct TranscriptViewer: View {
             // Header
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(transcript.recordingFilename.replacingOccurrences(of: ".hda", with: ""))
-                        .font(.headline)
                     HStack(spacing: 12) {
                         Label(DurationCalculator.formatDuration(transcript.totalDuration), systemImage: "clock")
                         Label("\(transcript.segments.count) segments", systemImage: "text.alignleft")
@@ -66,11 +67,13 @@ struct TranscriptViewer: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
 
-                Button("Done") {
-                    saveAndDismiss()
+                if hasNameChanges {
+                    Button("Save Names") {
+                        onSaveSpeakerNames?(speakerNames)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
             }
             .padding()
 
@@ -82,35 +85,49 @@ struct TranscriptViewer: View {
 
             Divider()
 
-            // Transcript content
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(filteredSegments) { segment in
-                        SegmentRow(
-                            segment: segment,
-                            speakerNames: speakerNames,
-                            onSeek: onSeek,
-                            onTapSpeaker: { sid in
-                                editingSpeaker = sid
-                                editText = speakerNames[sid] ?? sid
-                            }
-                        )
+            // Transcript content with auto-scroll
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(Array(filteredSegments.enumerated()), id: \.element.id) { index, segment in
+                            let globalIndex = transcript.segments.firstIndex(where: { $0.id == segment.id })
+                            let isActive = globalIndex != nil && globalIndex == activeSegmentIndex
+
+                            SegmentRow(
+                                segment: segment,
+                                speakerNames: speakerNames,
+                                isActive: isActive,
+                                onSeek: onSeek,
+                                onTapSpeaker: { sid in
+                                    editingSpeaker = sid
+                                    editText = speakerNames[sid] ?? sid
+                                },
+                                onSplitSpeaker: onSplitSpeaker,
+                                onMergeSpeaker: onMergeSpeaker,
+                                allSpeakerIDs: transcript.speakerIDs
+                            )
+                            .id(segment.id)
+                        }
+                    }
+                    .padding()
+                }
+                .onChange(of: activeSegmentIndex) { _, newIndex in
+                    guard let newIndex, newIndex < transcript.segments.count else { return }
+                    let segmentID = transcript.segments[newIndex].id
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        proxy.scrollTo(segmentID, anchor: .center)
                     }
                 }
-                .padding()
-            }
-        }
-        .frame(minWidth: 600, minHeight: 400)
-        .frame(idealWidth: 700, idealHeight: 600)
-        .onExitCommand {
-            if editingSpeaker != nil {
-                editingSpeaker = nil
-            } else {
-                saveAndDismiss()
             }
         }
         .onAppear {
             speakerNames = transcript.speakerNames
+            for sid in transcript.speakerIDs where speakerNames[sid] == nil {
+                speakerNames[sid] = sid
+            }
+        }
+        .onChange(of: transcript.speakerNames) { _, newNames in
+            speakerNames = newNames
             for sid in transcript.speakerIDs where speakerNames[sid] == nil {
                 speakerNames[sid] = sid
             }
@@ -172,30 +189,24 @@ struct TranscriptViewer: View {
                     .font(.body)
                     .frame(width: 150)
                     .focused($editFieldFocused)
-                    .onSubmit {
-                        commitEdit(sid: sid)
-                    }
+                    .onSubmit { commitEdit(sid: sid) }
                     .onAppear { editFieldFocused = true }
                 Button {
                     commitEdit(sid: sid)
                 } label: {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.green)
+                        .font(.title2).foregroundStyle(.green)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Save speaker name")
-                .help("Save (Return)")
                 Button {
                     editingSpeaker = nil
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.secondary)
+                        .font(.title2).foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Cancel rename")
-                .help("Cancel (Esc)")
             }
         } else {
             Button {
@@ -209,8 +220,7 @@ struct TranscriptViewer: View {
                     Text(displayName)
                         .font(.caption.weight(.medium))
                     Image(systemName: "pencil")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .font(.caption2).foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
@@ -230,23 +240,13 @@ struct TranscriptViewer: View {
             editingSpeaker = nil
             return
         }
-
-        // Check if this name is already used by another speaker
         if let existingID = speakerNames.first(where: { $0.key != sid && $0.value == trimmed })?.key {
             editingSpeaker = nil
             mergeConfirmation = MergeConfirmation(sourceSID: sid, targetSID: existingID, name: trimmed)
             return
         }
-
         speakerNames[sid] = trimmed
         editingSpeaker = nil
-    }
-
-    private func saveAndDismiss() {
-        if hasNameChanges {
-            onSaveSpeakerNames?(speakerNames)
-        }
-        dismiss()
     }
 
     private var filteredSegments: [Transcript.Segment] {
@@ -271,27 +271,35 @@ struct TranscriptViewer: View {
     }
 }
 
+// MARK: - Segment Row
+
 private struct SegmentRow: View {
     let segment: Transcript.Segment
     let speakerNames: [String: String]
+    var isActive: Bool = false
     var onSeek: ((TimeInterval) -> Void)?
     var onTapSpeaker: ((String) -> Void)?
+    var onSplitSpeaker: ((_ segmentID: UUID, _ allFollowing: Bool) -> Void)?
+    var onMergeSpeaker: ((_ sourceSID: String, _ targetSID: String) -> Void)?
+    var allSpeakerIDs: [String] = []
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            // Timestamp — clickable to seek
-            Button {
-                onSeek?(segment.startTime)
-            } label: {
-                Text(formatTime(segment.startTime))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(onSeek != nil ? Color.blue : Color.secondary)
-            }
-            .buttonStyle(.plain)
-            .frame(width: 60, alignment: .trailing)
-            .help(onSeek != nil ? "Seek to \(formatTime(segment.startTime))" : "")
+        HStack(alignment: .top, spacing: 0) {
+            // Active segment indicator
+            RoundedRectangle(cornerRadius: 2)
+                .fill(isActive ? Color.accentColor : Color.clear)
+                .frame(width: 3)
+                .padding(.trailing, 8)
 
-            // Speaker label — clickable to rename
+            // Timestamp
+            Text(formatTime(segment.startTime))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(onSeek != nil ? Color.accentColor : Color.secondary)
+                .frame(width: 60, alignment: .trailing)
+
+            Spacer().frame(width: 12)
+
+            // Speaker label
             if let sid = segment.speakerID {
                 Button {
                     onTapSpeaker?(sid)
@@ -308,8 +316,53 @@ private struct SegmentRow: View {
             // Text
             Text(segment.text)
                 .font(.body)
-                .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 2)
+        .background(isActive ? Color.accentColor.opacity(0.06) : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onSeek?(segment.startTime)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .contextMenu {
+            segmentContextMenu
+        }
+    }
+
+    @ViewBuilder
+    private var segmentContextMenu: some View {
+        if let sid = segment.speakerID {
+            Button("Split Speaker From Here") {
+                onSplitSpeaker?(segment.id, false)
+            }
+            Button("Split Speaker From Here to End") {
+                onSplitSpeaker?(segment.id, true)
+            }
+
+            if allSpeakerIDs.count > 1 {
+                Divider()
+                Menu("Merge Into...") {
+                    ForEach(allSpeakerIDs.filter { $0 != sid }, id: \.self) { targetSID in
+                        Button(speakerNames[targetSID] ?? targetSID) {
+                            onMergeSpeaker?(sid, targetSID)
+                        }
+                    }
+                }
+            }
+        }
+
+        Divider()
+
+        if onSeek != nil {
+            Button("Play From Here") {
+                onSeek?(segment.startTime)
+            }
+        }
+
+        Button("Copy Text") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(segment.text, forType: .string)
         }
     }
 
@@ -318,9 +371,7 @@ private struct SegmentRow: View {
         let h = total / 3600
         let m = (total % 3600) / 60
         let s = total % 60
-        if h > 0 {
-            return String(format: "%d:%02d:%02d", h, m, s)
-        }
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
         return String(format: "%d:%02d", m, s)
     }
 

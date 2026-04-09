@@ -10,7 +10,7 @@ struct DeviceInfoView: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                if let device = state.device {
+                if let device = state.device.model {
                     deviceSection(device)
                     batterySection(device)
                     storageSection(device)
@@ -201,7 +201,7 @@ struct DeviceInfoView: View {
                     formatConfirmText = ""
                     showFormatConfirmation = true
                 }
-                .disabled(state.isFormattingCard)
+                .disabled(state.device.isFormattingCard)
             }
         } header: {
             Label("Danger Zone", systemImage: "exclamationmark.triangle")
