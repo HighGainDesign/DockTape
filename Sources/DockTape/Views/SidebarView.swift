@@ -12,7 +12,7 @@ struct SidebarView: View {
     var body: some View {
         VStack(spacing: 0) {
             List(selection: $state.selectedView) {
-                Section("Library") {
+                Section(header: libraryHeader) {
                     Label {
                         HStack {
                             Text("All Recordings")
@@ -114,21 +114,6 @@ struct SidebarView: View {
             }
             .listStyle(.sidebar)
 
-            // Folder creation button
-            HStack {
-                Button {
-                    isCreatingFolder = true
-                    newFolderName = ""
-                } label: {
-                    Label("New Folder", systemImage: "plus")
-                        .font(.caption)
-                }
-                .buttonStyle(.borderless)
-                Spacer()
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 6)
-
             Divider()
             deviceStatusBar
         }
@@ -148,6 +133,21 @@ struct SidebarView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await state.library.refresh() }
+        }
+    }
+
+    private var libraryHeader: some View {
+        HStack {
+            Text("Library")
+            Spacer()
+            Button {
+                isCreatingFolder = true
+                newFolderName = ""
+            } label: {
+                Image(systemName: "plus")
+            }
+            .buttonStyle(.borderless)
+            .help("New Folder")
         }
     }
 

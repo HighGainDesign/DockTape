@@ -62,6 +62,9 @@ struct RecordingListPane: View {
         .modifier(SearchFocusModifier(trigger: $state.library.isSearchFocused))
         .toolbar { recordingToolbar }
         .navigationTitle(recordingTitle)
+        .safeAreaInset(edge: .bottom) {
+            sortFilterBar
+        }
         .onChange(of: state.selectedView) { _, _ in
             // Clear selection when switching sidebar sections
             state.library.selectedRecordings.removeAll()
@@ -142,6 +145,9 @@ struct RecordingListPane: View {
         .searchable(text: $searchText, prompt: "Search files")
         .toolbar { deviceToolbar }
         .navigationTitle(state.device.model.map { "HiDock \($0.model.rawValue)" } ?? "On Device")
+        .safeAreaInset(edge: .bottom) {
+            sortFilterBar
+        }
         .onChange(of: state.device.selectedDeviceFiles) { _, newValue in
             if newValue.count == 1 {
                 state.device.selectedDeviceFile = newValue.first
@@ -281,9 +287,6 @@ struct RecordingListPane: View {
             .help("Refresh library")
         }
 
-        ToolbarItemGroup(placement: .primaryAction) {
-            sortFilterMenu
-        }
     }
 
     @ToolbarContentBuilder
@@ -319,10 +322,6 @@ struct RecordingListPane: View {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
             .keyboardShortcut("r", modifiers: .command)
-        }
-
-        ToolbarItemGroup(placement: .primaryAction) {
-            sortFilterMenu
         }
     }
 
@@ -370,6 +369,28 @@ struct RecordingListPane: View {
                       systemImage: isActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
             }
             .help("Filter")
+        }
+    }
+
+    private var sortFilterBar: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 8) {
+                sortFilterMenu
+                Spacer()
+                let isFiltered = !filterMode.isEmpty || filterPeriod != .anyTime
+                if isFiltered {
+                    Button("Clear") {
+                        filterMode = ""
+                        filterPeriod = .anyTime
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.bar)
         }
     }
 

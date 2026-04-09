@@ -7,12 +7,13 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             SidebarView(state: state)
+                .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
         } content: {
             RecordingListPane(state: state)
+                .navigationSplitViewColumnWidth(min: 280, ideal: 340, max: 500)
         } detail: {
             DetailPane(state: state)
         }
-        .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 300)
         .navigationTitle("")
         .frame(minWidth: 960, minHeight: 560)
         .focusedSceneValue(\.appState, state)
