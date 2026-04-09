@@ -12,6 +12,7 @@ struct DetailPane: View {
     enum DetailTab: String, CaseIterable {
         case info = "Info"
         case transcript = "Transcript"
+        case summary = "Summary"
     }
 
     var body: some View {
@@ -197,7 +198,7 @@ struct DetailPane: View {
     private func availableTabs(for rec: RecordingMetadata) -> [DetailTab] {
         let status = state.transcription.statuses[rec.filename] ?? .none
         if status == .done || transcript != nil {
-            return [.info, .transcript]
+            return [.info, .transcript, .summary]
         }
         return [.info]
     }
@@ -249,6 +250,9 @@ struct DetailPane: View {
                     Text("Transcribe this recording to see the transcript.")
                 }
             }
+
+        case .summary:
+            SummaryTabView(state: state, recording: rec)
 
         }
     }

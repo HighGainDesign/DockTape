@@ -24,6 +24,7 @@ final class AppState {
     var device: DeviceState
     var playback: PlaybackState
     var transcription: TranscriptionState
+    var summarization: SummarizationState
 
     var selectedView: SidebarSelection = .allRecordings
     var errorMessage: String?
@@ -50,6 +51,8 @@ final class AppState {
         self.device = DeviceState()
         self.playback = PlaybackState()
         self.transcription = TranscriptionState(transcriptStore: transcriptStore)
+        let summaryStore = SummaryStore(baseDirectory: store.baseDirectory)
+        self.summarization = SummarizationState(summaryStore: summaryStore)
 
         self.autoDeleteAfterDownload = UserDefaults.standard.bool(forKey: "autoDeleteAfterDownload")
         self.autoSyncClock = UserDefaults.standard.object(forKey: "autoSyncClock") as? Bool ?? true
@@ -57,6 +60,7 @@ final class AppState {
 
     func setup() async throws {
         try await library.setup()
+        try await summarization.summaryStore.loadAll()
     }
 
     // MARK: - Cross-cutting actions
@@ -124,13 +128,84 @@ final class AppState {
     }
 
     func transcribeRecordings(_ recs: [RecordingMetadata]) async {
+        let recsToSummarize = recs
         await transcription.transcribe(
             recordings: recs,
             baseDirectory: library.store.baseDirectory,
             onStatusMessage: { [weak self] msg in self?.statusMessage = msg },
             onError: { [weak self] msg in self?.errorMessage = msg },
-            onComplete: { [weak self] in await self?.library.refresh() }
+            onComplete: { [weak self] in
+                await self?.library.refresh()
+                if let self,
+                   UserDefaults.standard.bool(forKey: "autoSummarize") {
+                    self.autoSummarizeRecordings(recsToSummarize)
+                }
+            }
         )
+    }
+
+    func summarizeRecordings(
+        _ recs: [RecordingMetadata],
+        template: SummaryTemplate = .recording,
+        customPrompt: String? = nil,
+        provider: any LLMProvider,
+        model: String
+    ) {
+        summarization.summarize(
+            recordings: recs,
+            template: template,
+            customPrompt: customPrompt,
+            provider: provider,
+            model: model,
+            transcriptStore: transcription.transcriptStore,
+            onError: { [weak self] msg in self?.errorMessage = msg },
+            onComplete: {}
+        )
+    }
+
+    /// Summarize from context menu using current Settings provider/model.
+    func contextMenuSummarize(_ rec: RecordingMetadata) {
+        let keychainService = "com.docktape.ai"
+        let providerName = UserDefaults.standard.string(forKey: "aiProvider") ?? "anthropic"
+        let model = UserDefaults.standard.string(forKey: "aiModel") ?? "claude-sonnet-4-6"
+
+        guard let apiKey = KeychainHelper.read(service: keychainService, account: providerName),
+              !apiKey.isEmpty else {
+            errorMessage = "No API key configured. Go to Settings > AI to add one."
+            return
+        }
+
+        let provider: any LLMProvider = switch providerName {
+        case "openai": OpenAIProvider(apiKey: apiKey)
+        case "openrouter": OpenRouterProvider(apiKey: apiKey)
+        default: AnthropicProvider(apiKey: apiKey)
+        }
+
+        let template = SummaryTemplate.forMode(rec.mode)
+        summarizeRecordings([rec], template: template, provider: provider, model: model)
+    }
+
+    /// Auto-summarize recordings using Settings provider/model/template.
+    private func autoSummarizeRecordings(_ recs: [RecordingMetadata]) {
+        let keychainService = "com.docktape.ai"
+        let providerName = UserDefaults.standard.string(forKey: "aiProvider") ?? "anthropic"
+        let model = UserDefaults.standard.string(forKey: "aiModel") ?? "claude-sonnet-4-6"
+        let templateName = UserDefaults.standard.string(forKey: "autoSummarizeTemplate") ?? "recording"
+
+        guard let apiKey = KeychainHelper.read(service: keychainService, account: providerName),
+              !apiKey.isEmpty else { return }
+
+        let provider: any LLMProvider = switch providerName {
+        case "openai": OpenAIProvider(apiKey: apiKey)
+        case "openrouter": OpenRouterProvider(apiKey: apiKey)
+        default: AnthropicProvider(apiKey: apiKey)
+        }
+
+        let template = SummaryTemplate(rawValue: templateName) ?? .recording
+        for rec in recs {
+            let effectiveTemplate = template == .recording ? SummaryTemplate.forMode(rec.mode) : template
+            summarizeRecordings([rec], template: effectiveTemplate, provider: provider, model: model)
+        }
     }
 
     func renameRecording(_ rec: RecordingMetadata, to name: String) async {
@@ -138,6 +213,7 @@ final class AppState {
             let newFilename = try await library.renameRecording(rec, to: name)
             if playback.playingFile == rec.filename { playback.playingFile = newFilename }
             if transcription.transcribingFile == rec.filename { transcription.transcribingFile = newFilename }
+            await summarization.summaryStore.rename(from: rec.filename, to: newFilename)
         } catch {
             errorMessage = "Rename failed: \(error.localizedDescription)"
         }

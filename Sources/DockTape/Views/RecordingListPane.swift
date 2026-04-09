@@ -204,6 +204,16 @@ struct RecordingListPane: View {
 
         Divider()
 
+        let hasTranscript = (state.transcription.statuses[rec.filename] ?? .none) == .done
+        Button {
+            state.contextMenuSummarize(rec)
+        } label: {
+            Label("Summarize", systemImage: "sparkles")
+        }
+        .disabled(!hasTranscript)
+
+        Divider()
+
         if rec.folder != nil {
             Button {
                 Task {
