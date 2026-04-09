@@ -1,0 +1,559 @@
+import SwiftUI
+import HiDockKit
+
+/// Column 3: Progressive detail view with tabs, player bar, and transcription bar.
+struct DetailPane: View {
+    @Bindable var state: AppState
+    @State private var selectedTab: DetailTab = .info
+    @State private var transcript: Transcript?
+    @State private var renamingRecording: RecordingMetadata?
+    @State private var renameText: String = ""
+
+    enum DetailTab: String, CaseIterable {
+        case info = "Info"
+        case transcript = "Transcript"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            detailContent
+                .frame(maxHeight: .infinity)
+
+            if state.playback.playingFile != nil {
+                NowPlayingBar(state: state)
+            }
+
+            if state.transcription.transcribingFile != nil {
+                TranscriptionBar(state: state)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
+        switch state.selectedView {
+        case .allRecordings, .folder:
+            recordingDetail
+        case .device:
+            deviceDetail
+        }
+    }
+
+    // MARK: - Recording Detail
+
+    @ViewBuilder
+    private var recordingDetail: some View {
+        let selectedCount = state.library.selectedRecordings.count
+        if selectedCount == 0 {
+            ContentUnavailableView {
+                Label("No Selection", systemImage: "doc.text")
+            } description: {
+                Text("Select a recording to see details.")
+            }
+        } else if selectedCount > 1 {
+            let recs = state.library.recordings.filter { state.library.selectedRecordings.contains($0.filename) }
+            MultiSelectSummary(
+                recordings: recs,
+                transcriptionStatuses: state.transcription.statuses,
+                onTranscribe: {
+                    let toTranscribe = recs.filter {
+                        (state.transcription.statuses[$0.filename] ?? .none) != .done
+                    }
+                    Task { await state.transcribeRecordings(toTranscribe) }
+                },
+                onDelete: {
+                    Task {
+                        for rec in recs { await state.deleteLocalRecording(rec) }
+                        state.library.selectedRecordings.removeAll()
+                    }
+                }
+            )
+        } else if let filename = state.library.selectedRecording,
+                  let rec = state.library.recordings.first(where: { $0.filename == filename }) {
+            singleRecordingDetail(rec)
+        } else {
+            ContentUnavailableView {
+                Label("No Selection", systemImage: "doc.text")
+            } description: {
+                Text("Select a recording to see details.")
+            }
+        }
+    }
+
+    private func singleRecordingDetail(_ rec: RecordingMetadata) -> some View {
+        VStack(spacing: 0) {
+            // Header with title and actions
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(rec.displayTitle)
+                        .font(.title2.weight(.semibold))
+                    if let date = rec.recordedAt {
+                        Text(date, style: .date)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                // Action buttons
+                HStack(spacing: 8) {
+                    let isPlaying = state.playback.playingFile == rec.filename && state.playback.isPlaying
+                    Button {
+                        state.playRecording(rec)
+                    } label: {
+                        Label(isPlaying ? "Pause" : "Play",
+                              systemImage: isPlaying ? "pause.fill" : "play.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Play/Pause")
+
+                    Button {
+                        renameText = (rec.filename as NSString).deletingPathExtension
+                        renamingRecording = rec
+                    } label: {
+                        Label("Rename", systemImage: "pencil")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button {
+                        state.library.revealInFinder(rec)
+                    } label: {
+                        Label("Reveal", systemImage: "folder")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            .padding()
+
+            // Tab bar
+            Picker("Detail", selection: $selectedTab) {
+                ForEach(availableTabs(for: rec), id: \.self) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+
+            Divider()
+                .padding(.top, 8)
+
+            // Tab content
+            tabContent(for: rec)
+        }
+        .onChange(of: state.library.selectedRecording) { _, newFilename in
+            if let filename = newFilename {
+                Task {
+                    self.transcript = await state.library.transcript(for: filename)
+                    syncSegmentTimestamps(for: filename)
+                    selectedTab = transcript != nil ? .transcript : .info
+                }
+            } else {
+                state.playback.setSegmentTimestamps([])
+                selectedTab = .info
+            }
+        }
+        .task(id: rec.filename) {
+            transcript = await state.library.transcript(for: rec.filename)
+            syncSegmentTimestamps(for: rec.filename)
+            selectedTab = transcript != nil ? .transcript : .info
+        }
+        .onChange(of: state.transcription.statuses[rec.filename]) { _, newStatus in
+            // Reload transcript when transcription completes for this recording
+            if newStatus == .done {
+                Task {
+                    self.transcript = await state.library.transcript(for: rec.filename)
+                    syncSegmentTimestamps(for: rec.filename)
+                }
+            }
+        }
+        .onChange(of: state.playback.playingFile) { _, newFile in
+            // Sync timestamps when playback starts/stops for this recording
+            if newFile == rec.filename {
+                syncSegmentTimestamps(for: rec.filename)
+            } else {
+                state.playback.setSegmentTimestamps([])
+            }
+        }
+        .alert("Rename Recording", isPresented: Binding(
+            get: { renamingRecording != nil },
+            set: { if !$0 { renamingRecording = nil } }
+        )) {
+            TextField("Name", text: $renameText)
+            Button("Cancel", role: .cancel) { renamingRecording = nil }
+            Button("Save") {
+                if let rec = renamingRecording {
+                    Task { await state.renameRecording(rec, to: renameText) }
+                }
+                renamingRecording = nil
+            }
+        } message: {
+            Text("Enter a display name for this recording.")
+        }
+    }
+
+    private func availableTabs(for rec: RecordingMetadata) -> [DetailTab] {
+        let status = state.transcription.statuses[rec.filename] ?? .none
+        if status == .done || transcript != nil {
+            return [.info, .transcript]
+        }
+        return [.info]
+    }
+
+    @ViewBuilder
+    private func tabContent(for rec: RecordingMetadata) -> some View {
+        switch selectedTab {
+        case .info:
+            InfoTabView(
+                recording: rec,
+                transcriptStatus: state.transcription.statuses[rec.filename] ?? .none
+            )
+
+        case .transcript:
+            if let transcript {
+                TranscriptViewer(
+                    transcript: transcript,
+                    activeSegmentIndex: state.playback.activeSegmentIndex,
+                    onSeek: { time in
+                        if state.playback.playingFile == rec.filename {
+                            state.playback.seek(to: time)
+                        } else {
+                            let url = state.library.store.baseDirectory.appendingPathComponent(rec.filename)
+                            state.playback.play(file: rec.filename, url: url)
+                            state.playback.seek(to: time)
+                        }
+                    },
+                    onSaveSpeakerNames: { names in
+                        Task { try? await state.updateSpeakerNames(for: rec.filename, names: names) }
+                        Task { self.transcript = await state.library.transcript(for: rec.filename) }
+                    },
+                    onSplitSpeaker: { segID, allFollowing in
+                        Task {
+                            try? await state.library.transcriptStore.splitSpeaker(for: rec.filename, segmentID: segID, allFollowing: allFollowing)
+                            self.transcript = await state.library.transcript(for: rec.filename)
+                        }
+                    },
+                    onMergeSpeaker: { sourceSID, targetSID in
+                        Task {
+                            try? await state.library.transcriptStore.mergeSpeakers(for: rec.filename, source: sourceSID, into: targetSID)
+                            self.transcript = await state.library.transcript(for: rec.filename)
+                        }
+                    }
+                )
+            } else {
+                ContentUnavailableView {
+                    Label("No Transcript", systemImage: "doc.text")
+                } description: {
+                    Text("Transcribe this recording to see the transcript.")
+                }
+            }
+
+        }
+    }
+
+    /// Push segment timestamps to PlaybackState so activeSegmentIndex stays in sync.
+    private func syncSegmentTimestamps(for filename: String) {
+        if let transcript, state.playback.playingFile == nil || state.playback.playingFile == filename {
+            state.playback.setSegmentTimestamps(transcript.segments.map(\.startTime))
+        } else {
+            state.playback.setSegmentTimestamps([])
+        }
+    }
+
+    // MARK: - Device Detail
+
+    @ViewBuilder
+    private var deviceDetail: some View {
+        let selectedCount = state.device.selectedDeviceFiles.count
+        if selectedCount == 0 {
+            if state.device.isConnected {
+                ContentUnavailableView {
+                    Label("No Selection", systemImage: "doc")
+                } description: {
+                    Text("Select a file to see details.")
+                }
+            } else {
+                ContentUnavailableView {
+                    Label("Connect Your HiDock", systemImage: "cable.connector.horizontal")
+                } description: {
+                    Text("Plug in your HiDock P1, P1 Mini, H1, or H1E via USB to get started.")
+                }
+            }
+        } else if selectedCount > 1 {
+            deviceMultiSelect
+        } else if let filename = state.device.selectedDeviceFile,
+                  let file = state.device.files.first(where: { $0.filename == filename }) {
+            deviceFileDetail(file)
+        } else {
+            ContentUnavailableView {
+                Label("No Selection", systemImage: "doc")
+            } description: {
+                Text("Select a file to see details.")
+            }
+        }
+    }
+
+    private var deviceMultiSelect: some View {
+        let files = state.device.files.filter { state.device.selectedDeviceFiles.contains($0.filename) }
+        let totalSize = files.reduce(0) { $0 + $1.size }
+        return VStack(spacing: 20) {
+            Spacer()
+            Image(systemName: "doc.on.doc.fill")
+                .font(.system(size: 48))
+                .foregroundStyle(.secondary)
+            Text("\(files.count) files selected")
+                .font(.title2.weight(.medium))
+            Text("Total size: \(ByteCountFormatter.string(fromByteCount: Int64(totalSize), countStyle: .file))")
+                .foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                Button {
+                    Task {
+                        for file in files { await state.downloadFile(file) }
+                    }
+                } label: {
+                    Label("Download All", systemImage: "arrow.down.circle")
+                }
+                .buttonStyle(.bordered)
+
+                Button(role: .destructive) {
+                    Task {
+                        for file in files { await state.deleteFromDevice(file) }
+                        state.device.selectedDeviceFiles.removeAll()
+                    }
+                } label: {
+                    Label("Delete All", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func deviceFileDetail(_ file: FileEntry) -> some View {
+        let parsed = FilenameParsing.parse(file.filename)
+        return Form {
+            Section("File") {
+                LabeledContent("Filename", value: file.filename)
+                if let date = parsed.date {
+                    LabeledContent("Date") {
+                        Text(date, style: .date)
+                        Text(date, style: .time)
+                    }
+                }
+                LabeledContent("Mode", value: parsed.mode.displayName)
+                LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))
+                LabeledContent("Est. Duration", value: DurationCalculator.formatDuration(DurationCalculator.estimateDuration(fileSize: UInt64(file.size))))
+            }
+
+            Section("Status") {
+                LabeledContent("Downloaded") {
+                    if state.library.isDownloaded(file.filename) {
+                        Label("Yes", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else {
+                        Text("No").foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Section {
+                Button {
+                    Task { await state.downloadFile(file) }
+                } label: {
+                    Label("Download", systemImage: "arrow.down.circle")
+                }
+                .disabled(state.device.downloadingFiles.contains(file.filename))
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+// MARK: - Now Playing Bar
+
+struct NowPlayingBar: View {
+    @Bindable var state: AppState
+    @State private var isSeeking = false
+    @State private var seekValue: Double = 0
+
+    var body: some View {
+        // TimelineView drives playback progress. tick() is called from onChange
+        // (not from the body) to avoid an infinite render loop — mutating
+        // @Observable state during body evaluation causes re-render → re-evaluate → loop.
+        TimelineView(.periodic(from: .now, by: 0.25)) { context in
+            barContent
+                .onChange(of: context.date) { _, _ in
+                    state.playback.tick()
+                }
+        }
+    }
+
+    private var barContent: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 12) {
+                Button {
+                    state.playback.togglePlayPause()
+                } label: {
+                    Image(systemName: state.playback.isPlaying ? "pause.fill" : "play.fill")
+                        .frame(width: 20)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(state.playback.isPlaying ? "Pause" : "Play")
+
+                if let file = state.playback.playingFile {
+                    let rec = state.library.recordings.first { $0.filename == file }
+                    Text(rec?.displayTitle ?? file)
+                        .font(.caption)
+                        .lineLimit(1)
+                }
+
+                Text(formatTime(isSeeking ? seekValue : state.playback.progress))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+
+                Slider(
+                    value: Binding(
+                        get: { isSeeking ? seekValue : state.playback.progress },
+                        set: { seekValue = $0 }
+                    ),
+                    in: 0...max(state.playback.duration, 1)
+                ) { editing in
+                    if editing {
+                        isSeeking = true
+                    } else {
+                        state.playback.seek(to: seekValue)
+                        isSeeking = false
+                    }
+                }
+                .controlSize(.small)
+                .accessibilityLabel("Playback position")
+
+                Text(formatTime(state.playback.duration))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+
+                Menu {
+                    ForEach(PlaybackState.speeds, id: \.self) { speed in
+                        Button {
+                            state.playback.setRate(speed)
+                        } label: {
+                            HStack {
+                                Text(speedLabel(speed))
+                                if state.playback.rate == speed { Image(systemName: "checkmark") }
+                            }
+                        }
+                    }
+                } label: {
+                    Text(speedLabel(state.playback.rate))
+                        .font(.caption.monospacedDigit().weight(.medium))
+                        .frame(minWidth: 30)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Playback speed")
+
+                Button {
+                    state.playback.stop()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Stop playback")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(.bar)
+        }
+    }
+
+    private func formatTime(_ seconds: Double) -> String {
+        let total = Int(seconds)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+        return String(format: "%d:%02d", m, s)
+    }
+
+    private func speedLabel(_ rate: Float) -> String {
+        if rate == 1.0 { return "1x" }
+        if rate == floor(rate) { return "\(Int(rate))x" }
+        return String(format: "%.2gx", rate)
+    }
+}
+
+// MARK: - Transcription Progress Bar
+
+struct TranscriptionBar: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let elapsed = state.transcription.startTime.map {
+                context.date.timeIntervalSince($0)
+            } ?? 0
+
+            VStack(spacing: 0) {
+                Divider()
+                HStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Transcribing")
+
+                    if let file = state.transcription.transcribingFile {
+                        let rec = state.library.recordings.first { $0.filename == file }
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 6) {
+                                Text(state.transcription.phase)
+                                    .font(.caption.weight(.medium))
+                                if state.transcription.queue.count > 1 {
+                                    Text("\(state.transcription.queueIndex + 1) of \(state.transcription.queue.count)")
+                                        .font(.caption.monospacedDigit())
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 1)
+                                        .background(.orange.opacity(0.15))
+                                        .clipShape(Capsule())
+                                }
+                            }
+                            if let rec {
+                                Text(rec.displayTitle)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+
+                    Spacer()
+
+                    Text(formatElapsed(elapsed))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+
+                    Button {
+                        state.transcription.cancel()
+                    } label: {
+                        Label("Cancel", systemImage: "xmark.circle.fill")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.orange.opacity(0.08))
+            }
+        }
+    }
+
+    private func formatElapsed(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds)
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%d:%02d", m, s)
+    }
+}

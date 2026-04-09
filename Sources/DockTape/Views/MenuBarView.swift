@@ -6,7 +6,7 @@ struct MenuBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if state.isConnected, let device = state.device {
+            if state.device.isConnected, let device = state.device.model {
                 Label(device.model.rawValue, systemImage: "cable.connector.horizontal")
                     .font(.headline)
 

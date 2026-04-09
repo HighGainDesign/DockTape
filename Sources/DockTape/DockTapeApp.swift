@@ -34,82 +34,128 @@ struct AppCommands: Commands {
     var body: some Commands {
         // Navigation
         CommandGroup(after: .sidebar) {
-            Button("Show Library") {
-                state?.selectedView = .library
+            Button("Show All Recordings") {
+                state?.selectedView = .allRecordings
             }
             .keyboardShortcut("1", modifiers: .command)
 
             Button("Show Device") {
-                guard state?.isConnected == true else { return }
-                state?.selectedView = .onDevice
+                guard state?.device.isConnected == true else { return }
+                state?.selectedView = .device
             }
             .keyboardShortcut("2", modifiers: .command)
-            .disabled(state?.isConnected != true)
+            .disabled(state?.device.isConnected != true)
 
             Divider()
 
             Button("Get Info") {
-                state?.showDeviceInfo = true
+                state?.device.showDeviceInfo = true
             }
             .keyboardShortcut("i", modifiers: .command)
-            .disabled(state?.isConnected != true)
+            .disabled(state?.device.isConnected != true)
 
             Divider()
         }
 
-        // Search — Cmd+F to focus search field
+        // Search
         CommandGroup(replacing: .textEditing) {
             Button("Find") {
-                state?.isSearchFocused = true
+                state?.library.isSearchFocused = true
             }
             .keyboardShortcut("f", modifiers: .command)
 
             Divider()
         }
 
-        // Playback
+        // Recording actions
         CommandGroup(after: .textEditing) {
-            Button(state?.isPlaying == true ? "Pause" : "Play") {
-                state?.togglePlayPause()
+            Button("Transcribe Selected") {
+                guard let state else { return }
+                let selected = state.library.recordings.filter { state.library.selectedRecordings.contains($0.filename) }
+                let toTranscribe = selected.filter {
+                    (state.transcription.statuses[$0.filename] ?? .none) != .done
+                }
+                guard !toTranscribe.isEmpty else { return }
+                Task { await state.transcribeRecordings(toTranscribe) }
+            }
+            .keyboardShortcut("t", modifiers: [.command, .shift])
+            .disabled(state?.library.selectedRecordings.isEmpty ?? true)
+
+            Divider()
+
+            // Playback
+            Button(state?.playback.isPlaying == true ? "Pause" : "Play") {
+                guard let state else { return }
+                if state.playback.playingFile != nil {
+                    state.playback.togglePlayPause()
+                } else if state.library.selectedRecordings.count == 1,
+                          let filename = state.library.selectedRecordings.first,
+                          let rec = state.library.recordings.first(where: { $0.filename == filename }) {
+                    state.playRecording(rec)
+                }
             }
             .keyboardShortcut("p", modifiers: .command)
-            .disabled(state?.playingFile == nil)
+            .disabled(state?.playback.playingFile == nil && state?.library.selectedRecordings.count != 1)
 
             Button("Stop") {
-                state?.stopPlayback()
+                state?.playback.stop()
             }
             .keyboardShortcut(".", modifiers: .command)
-            .disabled(state?.playingFile == nil)
+            .disabled(state?.playback.playingFile == nil)
 
             Divider()
 
             Button("Increase Speed") {
                 guard let state else { return }
-                let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
-                if let idx = speeds.firstIndex(of: state.playbackRate), idx + 1 < speeds.count {
-                    state.setPlaybackRate(speeds[idx + 1])
+                let speeds = PlaybackState.speeds
+                if let idx = speeds.firstIndex(of: state.playback.rate), idx + 1 < speeds.count {
+                    state.playback.setRate(speeds[idx + 1])
                 }
             }
             .keyboardShortcut("]", modifiers: .command)
-            .disabled(state?.playingFile == nil)
+            .disabled(state?.playback.playingFile == nil)
 
             Button("Decrease Speed") {
                 guard let state else { return }
-                let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
-                if let idx = speeds.firstIndex(of: state.playbackRate), idx > 0 {
-                    state.setPlaybackRate(speeds[idx - 1])
+                let speeds = PlaybackState.speeds
+                if let idx = speeds.firstIndex(of: state.playback.rate), idx > 0 {
+                    state.playback.setRate(speeds[idx - 1])
                 }
             }
             .keyboardShortcut("[", modifiers: .command)
-            .disabled(state?.playingFile == nil)
+            .disabled(state?.playback.playingFile == nil)
 
             Button("Reset Speed") {
-                state?.setPlaybackRate(1.0)
+                state?.playback.setRate(1.0)
             }
             .keyboardShortcut("\\", modifiers: .command)
-            .disabled(state?.playingFile == nil)
+            .disabled(state?.playback.playingFile == nil)
 
             Divider()
+        }
+
+        // Device menu
+        CommandMenu("Device") {
+            Button("Sync All") {
+                guard let state else { return }
+                Task { await state.syncAll() }
+            }
+            .keyboardShortcut("s", modifiers: [.command, .shift])
+            .disabled(state?.device.isConnected != true || state?.device.isSyncing == true)
+
+            Button("Refresh Device") {
+                guard let state else { return }
+                Task { await state.device.refreshDevice() }
+            }
+            .disabled(state?.device.isConnected != true)
+
+            Divider()
+
+            Button("Device Info...") {
+                state?.device.showDeviceInfo = true
+            }
+            .keyboardShortcut("i", modifiers: [.command, .shift])
+            .disabled(state?.device.isConnected != true)
         }
     }
 }
@@ -131,10 +177,9 @@ struct DockTapeApp: App {
                     }
                 }
         }
-        .defaultSize(width: 900, height: 600)
+        .defaultSize(width: 1100, height: 700)
         .commands {
             AppCommands()
-            // Remove New Window / New Tab — single-window app
             CommandGroup(replacing: .newItem) {}
         }
 

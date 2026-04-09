@@ -20,28 +20,37 @@ public struct RecordingMetadata: Sendable, Identifiable {
     /// Estimated duration from MP3 file size.
     public let estimatedDuration: TimeInterval
 
+    /// Folder this recording lives in (relative to library root), or nil for root.
+    public let folder: String?
+
     public init(
         filename: String,
         recordedAt: Date?,
         mode: String,
         fileSizeBytes: UInt64,
-        estimatedDuration: TimeInterval
+        estimatedDuration: TimeInterval,
+        folder: String? = nil
     ) {
         self.filename = filename
         self.recordedAt = recordedAt
         self.mode = mode
         self.fileSizeBytes = fileSizeBytes
         self.estimatedDuration = estimatedDuration
+        self.folder = folder
     }
 
     /// Display title: formatted date if the filename parses as a device name, otherwise filename without extension.
     public var displayTitle: String {
         if let date = recordedAt, !mode.isEmpty {
-            let fmt = DateFormatter()
-            fmt.dateStyle = .medium
-            fmt.timeStyle = .short
-            return fmt.string(from: date)
+            return Self.displayFormatter.string(from: date)
         }
         return (filename as NSString).deletingPathExtension
     }
+
+    private static let displayFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.dateStyle = .medium
+        fmt.timeStyle = .short
+        return fmt
+    }()
 }
