@@ -15,6 +15,7 @@ public struct AnthropicProvider: LLMProvider, Sendable {
     public func summarize(transcript: String, systemPrompt: String, model: String) async throws -> String {
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
         request.httpMethod = "POST"
+        request.timeoutInterval = 300  // 5 minutes for long transcripts
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")

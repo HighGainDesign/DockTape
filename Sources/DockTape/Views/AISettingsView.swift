@@ -150,7 +150,7 @@ struct AISettingsView: View {
         case "anthropic": return AnthropicProvider(apiKey: apiKey)
         case "openai":    return OpenAIProvider(apiKey: apiKey)
         case "openrouter": return OpenRouterProvider(apiKey: apiKey)
-        case "custom":    return OpenAIProvider(apiKey: apiKey, baseURL: customBaseURL)
+        case "custom":    return OpenAIProvider(apiKey: apiKey, baseURL: customBaseURL, name: "Custom")
         default: return nil
         }
     }

@@ -282,7 +282,7 @@ struct SummaryTabView: View {
         let provider: any LLMProvider = switch providerName {
         case "openai": OpenAIProvider(apiKey: apiKey)
         case "openrouter": OpenRouterProvider(apiKey: apiKey)
-        case "custom": OpenAIProvider(apiKey: apiKey, baseURL: customBaseURL)
+        case "custom": OpenAIProvider(apiKey: apiKey, baseURL: customBaseURL, name: "Custom")
         default: AnthropicProvider(apiKey: apiKey)
         }
 

@@ -1,16 +1,22 @@
 import Foundation
 
 public struct OpenAIProvider: LLMProvider, Sendable {
-    public let name = "OpenAI"
+    public let name: String
     public let defaultModel = "gpt-4o"
     public let availableModels = ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"]
     private let apiKey: String
     private let session: URLSession
     let baseURL: String
 
-    public init(apiKey: String, baseURL: String = "https://api.openai.com", session: URLSession = .shared) {
+    public init(
+        apiKey: String,
+        baseURL: String = "https://api.openai.com",
+        name: String = "OpenAI",
+        session: URLSession = .shared
+    ) {
         self.apiKey = apiKey
         self.baseURL = baseURL
+        self.name = name
         self.session = session
     }
 
@@ -26,6 +32,7 @@ public struct OpenAIProvider: LLMProvider, Sendable {
     public func summarize(transcript: String, systemPrompt: String, model: String) async throws -> String {
         var request = URLRequest(url: URL(string: "\(normalizedBaseURL)/v1/chat/completions")!)
         request.httpMethod = "POST"
+        request.timeoutInterval = 300  // 5 minutes — local models on long transcripts can be slow
         if !apiKey.isEmpty {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }

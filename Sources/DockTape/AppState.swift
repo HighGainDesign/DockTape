@@ -176,7 +176,8 @@ final class AppState {
         case "openrouter": OpenRouterProvider(apiKey: apiKey)
         case "custom": OpenAIProvider(
             apiKey: apiKey,
-            baseURL: UserDefaults.standard.string(forKey: "aiCustomBaseURL") ?? "http://localhost:11434/v1"
+            baseURL: UserDefaults.standard.string(forKey: "aiCustomBaseURL") ?? "http://localhost:11434/v1",
+            name: "Custom"
         )
         default: AnthropicProvider(apiKey: apiKey)
         }
