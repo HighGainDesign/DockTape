@@ -6,14 +6,15 @@ Download, transcribe, diarize, and manage recordings entirely on-device. No clou
 
 ## Features
 
+- **Three-pane layout** — sidebar (folders/devices), recording list, detail pane with tabbed Info/Transcript/Summary
 - **USB device management** — connect via USB, browse files, monitor battery and storage
-- **One-click sync** — download recordings from device, auto-convert HDA to MP3
+- **Import recordings** — import from device with auto HDA-to-MP3 conversion
 - **Local transcription** — speech-to-text using Parakeet ASR via [FluidAudio](https://github.com/FluidInference/FluidAudio), runs on Apple Silicon
 - **Speaker diarization** — identify and label different speakers using Sortformer via FluidAudio
-- **Speaker renaming** — rename detected speakers for readable transcripts
+- **AI summaries** — summarize transcripts via Anthropic, OpenAI, OpenRouter, or local models (Ollama, LM Studio). Mode-adaptive templates, editable prompts, action item checkboxes
 - **Multiple export formats** — plain text, SRT subtitles, JSONL, JSON
-- **Audio playback** — built-in player with variable speed (0.5x–3x), seek-to-timestamp from transcript
-- **Library management** — search, sort, filter by recording type and date
+- **Audio playback** — built-in player with variable speed (0.5x–3x)
+- **Library management** — folders, search, sort, filter by recording type and date
 - **Menu bar extra** — quick device status from the menu bar
 - **CLI tool** — `hidock` command for headless operation
 
@@ -55,7 +56,7 @@ swift test
 - **HiDockKit** — shared library: USB communication (Jensen protocol), storage, transcription pipeline
 - **HiDockCLI** — command-line interface using HiDockKit
 
-Recordings are stored in `~/Documents/HiDock Recordings/`. The filesystem is the source of truth — no database or metadata files. MP3 files on disk are the canonical record.
+Recordings are stored in `~/Documents/HiDock Recordings/` with transcripts and summaries as JSON sidecar files. The filesystem is the source of truth — no database.
 
 ## Development
 
