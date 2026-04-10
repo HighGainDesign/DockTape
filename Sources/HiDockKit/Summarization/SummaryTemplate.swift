@@ -18,15 +18,44 @@ public enum SummaryTemplate: String, Codable, CaseIterable, Sendable {
         }
     }
 
-    /// The system prompt for this template.
-    public var systemPrompt: String {
+    /// UserDefaults key for user-customized prompt text (without JSON schema).
+    public var userDefaultsKey: String? {
         switch self {
-        case .meeting: return Self.meetingPrompt
-        case .call:    return Self.callPrompt
-        case .memo:    return Self.memoPrompt
-        case .recording: return Self.recordingPrompt
+        case .meeting: return "templatePrompt_meeting"
+        case .call:    return "templatePrompt_call"
+        case .memo:    return "templatePrompt_memo"
+        case .recording: return "templatePrompt_recording"
+        case .custom:  return nil
+        }
+    }
+
+    /// The user-visible prompt text (without JSON schema boilerplate).
+    /// Checks UserDefaults first, falls back to built-in default.
+    public var promptText: String {
+        if let key = userDefaultsKey,
+           let custom = UserDefaults.standard.string(forKey: key),
+           !custom.isEmpty {
+            return custom
+        }
+        return defaultPromptText
+    }
+
+    /// The built-in default prompt text (without JSON schema).
+    public var defaultPromptText: String {
+        switch self {
+        case .meeting: return Self.meetingPromptText
+        case .call:    return Self.callPromptText
+        case .memo:    return Self.memoPromptText
+        case .recording: return Self.recordingPromptText
         case .custom:  return ""
         }
+    }
+
+    /// The full system prompt sent to the LLM (prompt text + JSON schema).
+    public var systemPrompt: String {
+        let text = promptText
+        if text.isEmpty { return "" }
+        return "\(text)\n\n\(Self.jsonSchemaInstruction)"
     }
 
     /// Wrap a user-provided custom prompt with the JSON output schema.
@@ -88,41 +117,33 @@ public enum SummaryTemplate: String, Codable, CaseIterable, Sendable {
     Use "items" array for list-style sections (action items, key points). Use "content" for narrative sections. Set items to null when using content.
     """
 
-    private static let meetingPrompt = """
+    private static let meetingPromptText = """
     You are summarizing a meeting transcript. Produce a structured summary with these sections in this order:
     1. "Action Items" — extracted tasks and follow-ups as items
     2. "Summary" — 2-3 paragraph overview of what was discussed
     3. "Key Decisions" — decisions made, as items
     4. "Next Steps" — upcoming actions or milestones, as items
-
-    \(jsonSchemaInstruction)
     """
 
-    private static let callPrompt = """
+    private static let callPromptText = """
     You are summarizing a phone call transcript. Produce a structured summary with these sections in this order:
     1. "Action Items" — tasks or follow-ups agreed upon, as items
     2. "Synopsis" — 1-2 paragraph overview of the call
     3. "Commitments" — what each party committed to, as items
     4. "Follow-ups" — next steps or scheduled actions, as items
-
-    \(jsonSchemaInstruction)
     """
 
-    private static let memoPrompt = """
+    private static let memoPromptText = """
     You are summarizing a voice memo / dictation. Produce a brief structured summary:
     1. "Gist" — 1-2 sentence summary of the memo content
 
     Keep it concise. This is a short personal note, not a meeting.
-
-    \(jsonSchemaInstruction)
     """
 
-    private static let recordingPrompt = """
+    private static let recordingPromptText = """
     You are summarizing a general audio recording transcript. Produce a structured summary:
     1. "Summary" — 2-3 paragraph overview
     2. "Key Points" — important points, as items
-
-    \(jsonSchemaInstruction)
     """
 
     /// Strip markdown code fences if present and extract JSON.

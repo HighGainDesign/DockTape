@@ -9,6 +9,11 @@ struct AISettingsView: View {
     @AppStorage("autoSummarize") private var autoSummarize: Bool = false
     @AppStorage("autoSummarizeTemplate") private var autoSummarizeTemplate: String = "recording"
 
+    @AppStorage("templatePrompt_meeting") private var templateMeeting: String = ""
+    @AppStorage("templatePrompt_call") private var templateCall: String = ""
+    @AppStorage("templatePrompt_memo") private var templateMemo: String = ""
+    @AppStorage("templatePrompt_recording") private var templateRecording: String = ""
+
     @State private var apiKey: String = ""
     @State private var isVerifying: Bool = false
     @State private var verifyResult: VerifyResult?
@@ -93,6 +98,17 @@ struct AISettingsView: View {
                 }
             }
 
+            Section("Templates") {
+                Text("These prompts are sent to the LLM along with your transcript. The JSON output format is appended automatically.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                templateEditor("Meeting", template: .meeting, storage: $templateMeeting)
+                templateEditor("Call", template: .call, storage: $templateCall)
+                templateEditor("Memo", template: .memo, storage: $templateMemo)
+                templateEditor("Recording", template: .recording, storage: $templateRecording)
+            }
+
             Section("Automation") {
                 Toggle("Auto-summarize after transcription", isOn: $autoSummarize)
                     .disabled(providerName != "custom" && apiKey.isEmpty)
@@ -137,6 +153,33 @@ struct AISettingsView: View {
                 verifyResult = .failure(error.localizedDescription)
             }
             isVerifying = false
+        }
+    }
+
+    private func templateEditor(_ label: String, template: SummaryTemplate, storage: Binding<String>) -> some View {
+        DisclosureGroup(label) {
+            let displayText = storage.wrappedValue.isEmpty ? template.defaultPromptText : storage.wrappedValue
+            TextEditor(text: Binding(
+                get: { displayText },
+                set: { storage.wrappedValue = $0 }
+            ))
+            .font(.body.monospaced())
+            .frame(minHeight: 80)
+            .border(.separator)
+
+            HStack {
+                Spacer()
+                if !storage.wrappedValue.isEmpty {
+                    Button("Reset to Default") {
+                        storage.wrappedValue = ""
+                    }
+                    .font(.caption)
+                } else {
+                    Text("Using default")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
         }
     }
 
