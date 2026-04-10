@@ -34,7 +34,8 @@ struct RecordingListPane: View {
                         recording: rec,
                         transcriptStatus: state.transcription.statuses[rec.filename] ?? .none,
                         isTranscribing: state.transcription.transcribingFile == rec.filename,
-                        isCurrentlyPlaying: state.playback.playingFile == rec.filename && state.playback.isPlaying
+                        isCurrentlyPlaying: state.playback.playingFile == rec.filename && state.playback.isPlaying,
+                        hasSummary: state.summarization.hasSummary.contains(rec.filename)
                     )
                     .tag(rec.filename)
                     .contextMenu { recordingContextMenu(for: rec) }
@@ -60,11 +61,8 @@ struct RecordingListPane: View {
         }
         .searchable(text: $searchText, prompt: "Search recordings")
         .modifier(SearchFocusModifier(trigger: $state.library.isSearchFocused))
-        .toolbar { recordingToolbar }
+        .safeAreaInset(edge: .top, spacing: 0) { recordingListToolbar }
         .navigationTitle(recordingTitle)
-        .safeAreaInset(edge: .bottom) {
-            sortFilterBar
-        }
         .onChange(of: state.selectedView) { _, _ in
             // Clear selection when switching sidebar sections
             state.library.selectedRecordings.removeAll()
@@ -143,11 +141,8 @@ struct RecordingListPane: View {
         }
         .listStyle(.inset(alternatesRowBackgrounds: true))
         .searchable(text: $searchText, prompt: "Search files")
-        .toolbar { deviceToolbar }
+        .safeAreaInset(edge: .top, spacing: 0) { deviceListToolbar }
         .navigationTitle(state.device.model.map { "HiDock \($0.model.rawValue)" } ?? "On Device")
-        .safeAreaInset(edge: .bottom) {
-            sortFilterBar
-        }
         .onChange(of: state.device.selectedDeviceFiles) { _, newValue in
             if newValue.count == 1 {
                 state.device.selectedDeviceFile = newValue.first
@@ -201,6 +196,17 @@ struct RecordingListPane: View {
                 Label(status == .done ? "Re-transcribe" : "Transcribe", systemImage: "text.badge.plus")
             }
         }
+
+        Divider()
+
+        let hasTranscript = (state.transcription.statuses[rec.filename] ?? .none) == .done
+        let hasSummary = state.summarization.hasSummary.contains(rec.filename)
+        Button {
+            state.contextMenuSummarize(rec)
+        } label: {
+            Label(hasSummary ? "Re-summarize" : "Summarize", systemImage: "sparkles")
+        }
+        .disabled(!hasTranscript)
 
         Divider()
 
@@ -262,71 +268,72 @@ struct RecordingListPane: View {
         }
     }
 
-    // MARK: - Toolbars
+    // MARK: - Inline Toolbars (per-pane, not window toolbar)
 
-    @ToolbarContentBuilder
-    private var recordingToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .automatic) {
-            Button {
-                let toTranscribe = selectedRecordings.filter {
-                    (state.transcription.statuses[$0.filename] ?? .none) != .done
+    /// Recordings list toolbar — sort/filter on left, refresh on right.
+    private var recordingListToolbar: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                sortFilterMenu
+                Spacer()
+                toolbarButton("arrow.clockwise", "Refresh") {
+                    Task { await state.library.refresh() }
                 }
-                Task { await state.transcribeRecordings(toTranscribe) }
-            } label: {
-                Label("Transcribe", systemImage: "text.badge.plus")
             }
-            .disabled(state.library.selectedRecordings.isEmpty)
-            .help("Transcribe selected recording(s)")
-
-            Button {
-                Task { await state.library.refresh() }
-            } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
-            }
-            .keyboardShortcut("r", modifiers: .command)
-            .help("Refresh library")
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .frame(minHeight: 28)
+            .background(.bar)
+            Divider()
         }
-
     }
 
-    @ToolbarContentBuilder
-    private var deviceToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .automatic) {
-            Button {
-                Task {
-                    for file in selectedDeviceFiles {
-                        await state.downloadFile(file)
+    /// Device list toolbar — sort/filter on left, device actions on right.
+    private var deviceListToolbar: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                sortFilterMenu
+                Spacer()
+                toolbarButton("arrow.down.circle", "Download") {
+                    Task {
+                        for file in selectedDeviceFiles { await state.downloadFile(file) }
                     }
                 }
-            } label: {
-                Label("Download", systemImage: "arrow.down.circle")
-            }
-            .disabled(state.device.selectedDeviceFiles.isEmpty || state.device.isSyncing)
-            .help("Download selected")
+                .disabled(state.device.selectedDeviceFiles.isEmpty || state.device.isSyncing)
 
-            Button(role: .destructive) {
-                Task {
-                    for file in selectedDeviceFiles {
-                        await state.deleteFromDevice(file)
+                toolbarButton("trash", "Delete") {
+                    Task {
+                        for file in selectedDeviceFiles { await state.deleteFromDevice(file) }
+                        state.device.selectedDeviceFiles.removeAll()
                     }
-                    state.device.selectedDeviceFiles.removeAll()
                 }
-            } label: {
-                Label("Delete", systemImage: "trash")
-            }
-            .disabled(state.device.selectedDeviceFiles.isEmpty)
+                .disabled(state.device.selectedDeviceFiles.isEmpty)
 
-            Button {
-                Task { await state.device.refreshDevice() }
-            } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
+                toolbarButton("arrow.clockwise", "Refresh") {
+                    Task { await state.device.refreshDevice() }
+                }
             }
-            .keyboardShortcut("r", modifiers: .command)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .frame(minHeight: 28)
+            .background(.bar)
+            Divider()
         }
+    }
+
+    /// Toolbar button with icon + text label, bordered.
+    private func toolbarButton(_ systemImage: String, _ label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(label, systemImage: systemImage)
+                .font(.caption)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .help(label)
     }
 
     private var sortFilterMenu: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 12) {
             Menu {
                 ForEach(LibrarySort.allCases, id: \.self) { sort in
                     Button {
@@ -340,7 +347,11 @@ struct RecordingListPane: View {
                 }
             } label: {
                 Label("Sort", systemImage: "arrow.up.arrow.down")
+                    .font(.caption)
             }
+            .menuStyle(.borderedButton)
+            .fixedSize()
+            .controlSize(.small)
             .help("Sort")
 
             Menu {
@@ -367,30 +378,12 @@ struct RecordingListPane: View {
                 let isActive = !filterMode.isEmpty || filterPeriod != .anyTime
                 Label("Filter",
                       systemImage: isActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
-            }
-            .help("Filter")
-        }
-    }
-
-    private var sortFilterBar: some View {
-        VStack(spacing: 0) {
-            Divider()
-            HStack(spacing: 8) {
-                sortFilterMenu
-                Spacer()
-                let isFiltered = !filterMode.isEmpty || filterPeriod != .anyTime
-                if isFiltered {
-                    Button("Clear") {
-                        filterMode = ""
-                        filterPeriod = .anyTime
-                    }
-                    .buttonStyle(.borderless)
                     .font(.caption)
-                }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(.bar)
+            .menuStyle(.borderedButton)
+            .fixedSize()
+            .controlSize(.small)
+            .help("Filter")
         }
     }
 
@@ -507,6 +500,7 @@ struct RecordingRow: View {
     let transcriptStatus: TranscriptStatus
     let isTranscribing: Bool
     let isCurrentlyPlaying: Bool
+    let hasSummary: Bool
 
     var body: some View {
         HStack(spacing: 12) {
@@ -554,6 +548,11 @@ struct RecordingRow: View {
                     ProgressView().controlSize(.small)
                 }
                 transcriptBadge
+                if hasSummary {
+                    Image(systemName: "sparkles")
+                        .font(.caption).foregroundStyle(.purple)
+                        .help("Summarized")
+                }
             }
         }
         .padding(.vertical, 4)

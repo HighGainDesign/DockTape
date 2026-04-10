@@ -5,13 +5,17 @@ import HiDockKit
 struct DetailPane: View {
     @Bindable var state: AppState
     @State private var selectedTab: DetailTab = .info
+    @State private var userHasPickedTab: Bool = false
     @State private var transcript: Transcript?
     @State private var renamingRecording: RecordingMetadata?
     @State private var renameText: String = ""
+    @State private var confirmRetranscribe: RecordingMetadata?
+    @State private var confirmResummarize: RecordingMetadata?
 
     enum DetailTab: String, CaseIterable {
         case info = "Info"
         case transcript = "Transcript"
+        case summary = "Summary"
     }
 
     var body: some View {
@@ -80,51 +84,82 @@ struct DetailPane: View {
         }
     }
 
+    /// Toolbar button with icon + text label, bordered.
+    private func toolbarButton(_ systemImage: String, _ label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(label, systemImage: systemImage)
+                .font(.caption)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .help(label)
+    }
+
     private func singleRecordingDetail(_ rec: RecordingMetadata) -> some View {
-        VStack(spacing: 0) {
-            // Header with title and actions
+        let isPlaying = state.playback.playingFile == rec.filename && state.playback.isPlaying
+        let hasTranscript = (state.transcription.statuses[rec.filename] ?? .none) == .done || transcript != nil
+
+        return VStack(spacing: 0) {
+            // Detail toolbar
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    toolbarButton(isPlaying ? "pause.fill" : "play.fill", isPlaying ? "Pause" : "Play") {
+                        state.playRecording(rec)
+                    }
+
+                    toolbarButton("text.badge.plus", "Transcribe") {
+                        if hasTranscript {
+                            confirmRetranscribe = rec
+                        } else {
+                            Task { await state.transcribeRecordings([rec]) }
+                        }
+                    }
+
+                    toolbarButton("sparkles", "Summarize") {
+                        Task {
+                            let hasSummary = await state.summarization.summaryStore.hasSummary(for: rec.filename)
+                            if hasSummary {
+                                confirmResummarize = rec
+                            } else {
+                                state.contextMenuSummarize(rec)
+                            }
+                        }
+                    }
+                    .disabled(!hasTranscript)
+
+                    Spacer()
+
+                    toolbarButton("pencil", "Rename") {
+                        renameText = (rec.filename as NSString).deletingPathExtension
+                        renamingRecording = rec
+                    }
+
+                    toolbarButton("folder", "Reveal") {
+                        state.library.revealInFinder(rec)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .frame(minHeight: 28)
+                .background(.bar)
+                Divider()
+            }
+
+            // Header with title
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(rec.displayTitle)
                         .font(.title2.weight(.semibold))
                     if let date = rec.recordedAt {
-                        Text(date, style: .date)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: 4) {
+                            Text(date, style: .date)
+                            Text(date, style: .time)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                 }
-
                 Spacer()
-
-                // Action buttons
-                HStack(spacing: 8) {
-                    let isPlaying = state.playback.playingFile == rec.filename && state.playback.isPlaying
-                    Button {
-                        state.playRecording(rec)
-                    } label: {
-                        Label(isPlaying ? "Pause" : "Play",
-                              systemImage: isPlaying ? "pause.fill" : "play.fill")
-                    }
-                    .buttonStyle(.bordered)
-                    .help("Play/Pause")
-
-                    Button {
-                        renameText = (rec.filename as NSString).deletingPathExtension
-                        renamingRecording = rec
-                    } label: {
-                        Label("Rename", systemImage: "pencil")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
-                    Button {
-                        state.library.revealInFinder(rec)
-                    } label: {
-                        Label("Reveal", systemImage: "folder")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
             }
             .padding()
 
@@ -135,6 +170,7 @@ struct DetailPane: View {
                 }
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .padding(.horizontal)
 
             Divider()
@@ -148,7 +184,7 @@ struct DetailPane: View {
                 Task {
                     self.transcript = await state.library.transcript(for: filename)
                     syncSegmentTimestamps(for: filename)
-                    selectedTab = transcript != nil ? .transcript : .info
+                    ensureTabAvailable(for: rec)
                 }
             } else {
                 state.playback.setSegmentTimestamps([])
@@ -158,7 +194,15 @@ struct DetailPane: View {
         .task(id: rec.filename) {
             transcript = await state.library.transcript(for: rec.filename)
             syncSegmentTimestamps(for: rec.filename)
-            selectedTab = transcript != nil ? .transcript : .info
+            if !userHasPickedTab {
+                // First load: auto-select best tab
+                selectedTab = transcript != nil ? .transcript : .info
+            } else {
+                ensureTabAvailable(for: rec)
+            }
+        }
+        .onChange(of: selectedTab) { _, _ in
+            userHasPickedTab = true
         }
         .onChange(of: state.transcription.statuses[rec.filename]) { _, newStatus in
             // Reload transcript when transcription completes for this recording
@@ -192,12 +236,40 @@ struct DetailPane: View {
         } message: {
             Text("Enter a display name for this recording.")
         }
+        .alert("Re-transcribe?", isPresented: Binding(
+            get: { confirmRetranscribe != nil },
+            set: { if !$0 { confirmRetranscribe = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { confirmRetranscribe = nil }
+            Button("Re-transcribe") {
+                if let rec = confirmRetranscribe {
+                    Task { await state.transcribeRecordings([rec]) }
+                }
+                confirmRetranscribe = nil
+            }
+        } message: {
+            Text("This recording already has a transcript. Re-transcribing will replace it.")
+        }
+        .alert("Re-summarize?", isPresented: Binding(
+            get: { confirmResummarize != nil },
+            set: { if !$0 { confirmResummarize = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { confirmResummarize = nil }
+            Button("Re-summarize") {
+                if let rec = confirmResummarize {
+                    state.contextMenuSummarize(rec)
+                }
+                confirmResummarize = nil
+            }
+        } message: {
+            Text("This recording already has a summary. Re-summarizing will replace it.")
+        }
     }
 
     private func availableTabs(for rec: RecordingMetadata) -> [DetailTab] {
         let status = state.transcription.statuses[rec.filename] ?? .none
         if status == .done || transcript != nil {
-            return [.info, .transcript]
+            return [.info, .transcript, .summary]
         }
         return [.info]
     }
@@ -250,6 +322,17 @@ struct DetailPane: View {
                 }
             }
 
+        case .summary:
+            SummaryTabView(state: state, recording: rec)
+
+        }
+    }
+
+    /// If the user's current tab isn't available for this recording, fall back.
+    private func ensureTabAvailable(for rec: RecordingMetadata) {
+        let available = availableTabs(for: rec)
+        if !available.contains(selectedTab) {
+            selectedTab = available.last ?? .info
         }
     }
 

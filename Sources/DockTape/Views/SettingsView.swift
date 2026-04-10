@@ -12,6 +12,9 @@ struct SettingsView: View {
             generalSettings
                 .tabItem { Label("General", systemImage: "gear") }
 
+            AISettingsView()
+                .tabItem { Label("AI", systemImage: "sparkles") }
+
             if let device = state.device.model, let settings = device.settings {
                 deviceSettings(settings)
                     .tabItem { Label("Device", systemImage: "waveform") }

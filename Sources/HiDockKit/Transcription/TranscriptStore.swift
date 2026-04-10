@@ -107,6 +107,11 @@ public actor TranscriptStore {
         Array(cache.values)
     }
 
+    /// All MP3 filenames that have transcripts.
+    public func allTranscribedFilenames() -> [String] {
+        Array(cache.keys)
+    }
+
     /// Update speaker names in a transcript. JSON is written immediately; TXT regeneration is debounced.
     public func updateSpeakerNames(for mp3Filename: String, names: [String: String]) throws {
         guard var transcript = cache[mp3Filename] else { return }
