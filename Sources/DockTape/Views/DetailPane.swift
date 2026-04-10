@@ -9,6 +9,8 @@ struct DetailPane: View {
     @State private var transcript: Transcript?
     @State private var renamingRecording: RecordingMetadata?
     @State private var renameText: String = ""
+    @State private var confirmRetranscribe: RecordingMetadata?
+    @State private var confirmResummarize: RecordingMetadata?
 
     enum DetailTab: String, CaseIterable {
         case info = "Info"
@@ -105,11 +107,22 @@ struct DetailPane: View {
                     }
 
                     toolbarButton("text.badge.plus", "Transcribe") {
-                        Task { await state.transcribeRecordings([rec]) }
+                        if hasTranscript {
+                            confirmRetranscribe = rec
+                        } else {
+                            Task { await state.transcribeRecordings([rec]) }
+                        }
                     }
 
                     toolbarButton("sparkles", "Summarize") {
-                        state.contextMenuSummarize(rec)
+                        Task {
+                            let hasSummary = await state.summarization.summaryStore.hasSummary(for: rec.filename)
+                            if hasSummary {
+                                confirmResummarize = rec
+                            } else {
+                                state.contextMenuSummarize(rec)
+                            }
+                        }
                     }
                     .disabled(!hasTranscript)
 
@@ -137,9 +150,12 @@ struct DetailPane: View {
                     Text(rec.displayTitle)
                         .font(.title2.weight(.semibold))
                     if let date = rec.recordedAt {
-                        Text(date, style: .date)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: 4) {
+                            Text(date, style: .date)
+                            Text(date, style: .time)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                 }
                 Spacer()
@@ -218,6 +234,34 @@ struct DetailPane: View {
             }
         } message: {
             Text("Enter a display name for this recording.")
+        }
+        .alert("Re-transcribe?", isPresented: Binding(
+            get: { confirmRetranscribe != nil },
+            set: { if !$0 { confirmRetranscribe = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { confirmRetranscribe = nil }
+            Button("Re-transcribe") {
+                if let rec = confirmRetranscribe {
+                    Task { await state.transcribeRecordings([rec]) }
+                }
+                confirmRetranscribe = nil
+            }
+        } message: {
+            Text("This recording already has a transcript. Re-transcribing will replace it.")
+        }
+        .alert("Re-summarize?", isPresented: Binding(
+            get: { confirmResummarize != nil },
+            set: { if !$0 { confirmResummarize = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { confirmResummarize = nil }
+            Button("Re-summarize") {
+                if let rec = confirmResummarize {
+                    state.contextMenuSummarize(rec)
+                }
+                confirmResummarize = nil
+            }
+        } message: {
+            Text("This recording already has a summary. Re-summarizing will replace it.")
         }
     }
 

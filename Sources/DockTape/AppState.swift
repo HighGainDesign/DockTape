@@ -61,6 +61,14 @@ final class AppState {
     func setup() async throws {
         try await library.setup()
         try await summarization.summaryStore.loadAll()
+
+        // Populate transcript statuses for recordings that already have transcripts on disk
+        let allTranscripts = await transcription.transcriptStore.allTranscripts()
+        for transcript in allTranscripts {
+            if transcription.statuses[transcript.recordingFilename] == nil {
+                transcription.statuses[transcript.recordingFilename] = .done
+            }
+        }
     }
 
     // MARK: - Cross-cutting actions

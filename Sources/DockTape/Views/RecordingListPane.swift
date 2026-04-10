@@ -330,7 +330,7 @@ struct RecordingListPane: View {
     }
 
     private var sortFilterMenu: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 12) {
             Menu {
                 ForEach(LibrarySort.allCases, id: \.self) { sort in
                     Button {
@@ -344,7 +344,10 @@ struct RecordingListPane: View {
                 }
             } label: {
                 Label("Sort", systemImage: "arrow.up.arrow.down")
+                    .font(.caption)
             }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
             .help("Sort")
 
             Menu {
@@ -371,7 +374,10 @@ struct RecordingListPane: View {
                 let isActive = !filterMode.isEmpty || filterPeriod != .anyTime
                 Label("Filter",
                       systemImage: isActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                    .font(.caption)
             }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
             .help("Filter")
         }
     }
