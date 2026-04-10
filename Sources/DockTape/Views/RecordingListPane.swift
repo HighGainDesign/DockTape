@@ -60,6 +60,7 @@ struct RecordingListPane: View {
         }
         .searchable(text: $searchText, prompt: "Search recordings")
         .modifier(SearchFocusModifier(trigger: $state.library.isSearchFocused))
+        .safeAreaInset(edge: .top, spacing: 0) { listToolbar }
         .toolbar { recordingToolbar }
         .navigationTitle(recordingTitle)
         .onChange(of: state.selectedView) { _, _ in
@@ -140,6 +141,7 @@ struct RecordingListPane: View {
         }
         .listStyle(.inset(alternatesRowBackgrounds: true))
         .searchable(text: $searchText, prompt: "Search files")
+        .safeAreaInset(edge: .top, spacing: 0) { listToolbar }
         .toolbar { deviceToolbar }
         .navigationTitle(state.device.model.map { "HiDock \($0.model.rawValue)" } ?? "On Device")
         .onChange(of: state.device.selectedDeviceFiles) { _, newValue in
@@ -270,12 +272,6 @@ struct RecordingListPane: View {
 
     @ToolbarContentBuilder
     private var recordingToolbar: some ToolbarContent {
-        // Sort/filter — left side of toolbar (list-level controls)
-        ToolbarItemGroup(placement: .secondaryAction) {
-            sortFilterMenu
-        }
-
-        // Per-recording actions — right side of toolbar
         ToolbarItemGroup(placement: .primaryAction) {
             let singleSelected = state.library.selectedRecordings.count == 1
             let singleRec = singleSelected
@@ -315,10 +311,6 @@ struct RecordingListPane: View {
 
     @ToolbarContentBuilder
     private var deviceToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .secondaryAction) {
-            sortFilterMenu
-        }
-
         ToolbarItemGroup(placement: .primaryAction) {
             Button {
                 Task {
@@ -350,6 +342,21 @@ struct RecordingListPane: View {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
             .keyboardShortcut("r", modifiers: .command)
+        }
+    }
+
+    /// Inline toolbar for the list pane — sort/filter controls above the list,
+    /// visually separate from the window toolbar (which has per-recording actions).
+    private var listToolbar: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                sortFilterMenu
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(.bar)
+            Divider()
         }
     }
 
