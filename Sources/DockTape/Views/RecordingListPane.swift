@@ -349,8 +349,9 @@ struct RecordingListPane: View {
                 Label("Sort", systemImage: "arrow.up.arrow.down")
                     .font(.caption)
             }
-            .menuStyle(.borderlessButton)
+            .menuStyle(.borderedButton)
             .fixedSize()
+            .controlSize(.small)
             .help("Sort")
 
             Menu {
@@ -379,8 +380,9 @@ struct RecordingListPane: View {
                       systemImage: isActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
                     .font(.caption)
             }
-            .menuStyle(.borderlessButton)
+            .menuStyle(.borderedButton)
             .fixedSize()
+            .controlSize(.small)
             .help("Filter")
         }
     }

@@ -132,7 +132,7 @@ struct SidebarView: View {
             Text("Enter a name for the new folder.")
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            Task { await state.library.refresh() }
+            Task { await state.refreshAll() }
         }
     }
 

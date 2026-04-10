@@ -75,6 +75,29 @@ final class AppState {
         summarization.hasSummary = Set(summarizedFiles)
     }
 
+    /// Refresh library, transcript statuses, and summary statuses from disk.
+    /// Called on app activate to pick up external filesystem changes.
+    func refreshAll() async {
+        await library.refresh()
+        try? await transcription.transcriptStore.loadAll()
+        try? await summarization.summaryStore.loadAll()
+
+        // Re-sync statuses from disk
+        let transcribedFiles = await transcription.transcriptStore.allTranscribedFilenames()
+        var newStatuses: [String: TranscriptStatus] = [:]
+        for filename in transcribedFiles {
+            newStatuses[filename] = .done
+        }
+        // Preserve in-progress statuses from current session
+        for (file, status) in transcription.statuses where status == .inProgress {
+            newStatuses[file] = .inProgress
+        }
+        transcription.statuses = newStatuses
+
+        let summarizedFiles = await summarization.summaryStore.allSummarizedFilenames()
+        summarization.hasSummary = Set(summarizedFiles)
+    }
+
     // MARK: - Cross-cutting actions
 
     func downloadFile(_ file: FileEntry) async {
