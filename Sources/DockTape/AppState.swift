@@ -163,48 +163,54 @@ final class AppState {
         )
     }
 
-    /// Summarize from context menu using current Settings provider/model.
-    func contextMenuSummarize(_ rec: RecordingMetadata) {
+    /// Create an LLM provider from current Settings.
+    private func makeSettingsProvider() -> (provider: any LLMProvider, model: String)? {
         let keychainService = "com.docktape.ai"
         let providerName = UserDefaults.standard.string(forKey: "aiProvider") ?? "anthropic"
-        let model = UserDefaults.standard.string(forKey: "aiModel") ?? "claude-sonnet-4-6"
+        let apiKey = KeychainHelper.read(service: keychainService, account: providerName) ?? ""
 
-        guard let apiKey = KeychainHelper.read(service: keychainService, account: providerName),
-              !apiKey.isEmpty else {
+        if providerName != "custom" && apiKey.isEmpty { return nil }
+
+        let provider: any LLMProvider = switch providerName {
+        case "openai": OpenAIProvider(apiKey: apiKey)
+        case "openrouter": OpenRouterProvider(apiKey: apiKey)
+        case "custom": OpenAIProvider(
+            apiKey: apiKey,
+            baseURL: UserDefaults.standard.string(forKey: "aiCustomBaseURL") ?? "http://localhost:11434/v1"
+        )
+        default: AnthropicProvider(apiKey: apiKey)
+        }
+
+        let model: String
+        if providerName == "custom" {
+            model = UserDefaults.standard.string(forKey: "aiCustomModel") ?? ""
+        } else {
+            model = UserDefaults.standard.string(forKey: "aiModel") ?? "claude-sonnet-4-6"
+        }
+
+        return (provider, model)
+    }
+
+    /// Summarize from context menu using current Settings provider/model.
+    func contextMenuSummarize(_ rec: RecordingMetadata) {
+        guard let settings = makeSettingsProvider() else {
             errorMessage = "No API key configured. Go to Settings > AI to add one."
             return
         }
 
-        let provider: any LLMProvider = switch providerName {
-        case "openai": OpenAIProvider(apiKey: apiKey)
-        case "openrouter": OpenRouterProvider(apiKey: apiKey)
-        default: AnthropicProvider(apiKey: apiKey)
-        }
-
         let template = SummaryTemplate.forMode(rec.mode)
-        summarizeRecordings([rec], template: template, provider: provider, model: model)
+        summarizeRecordings([rec], template: template, provider: settings.provider, model: settings.model)
     }
 
     /// Auto-summarize recordings using Settings provider/model/template.
     private func autoSummarizeRecordings(_ recs: [RecordingMetadata]) {
-        let keychainService = "com.docktape.ai"
-        let providerName = UserDefaults.standard.string(forKey: "aiProvider") ?? "anthropic"
-        let model = UserDefaults.standard.string(forKey: "aiModel") ?? "claude-sonnet-4-6"
+        guard let settings = makeSettingsProvider() else { return }
+
         let templateName = UserDefaults.standard.string(forKey: "autoSummarizeTemplate") ?? "recording"
-
-        guard let apiKey = KeychainHelper.read(service: keychainService, account: providerName),
-              !apiKey.isEmpty else { return }
-
-        let provider: any LLMProvider = switch providerName {
-        case "openai": OpenAIProvider(apiKey: apiKey)
-        case "openrouter": OpenRouterProvider(apiKey: apiKey)
-        default: AnthropicProvider(apiKey: apiKey)
-        }
-
         let template = SummaryTemplate(rawValue: templateName) ?? .recording
         for rec in recs {
             let effectiveTemplate = template == .recording ? SummaryTemplate.forMode(rec.mode) : template
-            summarizeRecordings([rec], template: effectiveTemplate, provider: provider, model: model)
+            summarizeRecordings([rec], template: effectiveTemplate, provider: settings.provider, model: settings.model)
         }
     }
 

@@ -4,6 +4,8 @@ import HiDockKit
 struct AISettingsView: View {
     @AppStorage("aiProvider") private var providerName: String = "anthropic"
     @AppStorage("aiModel") private var selectedModel: String = "claude-sonnet-4-6"
+    @AppStorage("aiCustomBaseURL") private var customBaseURL: String = "http://localhost:11434/v1"
+    @AppStorage("aiCustomModel") private var customModel: String = ""
     @AppStorage("autoSummarize") private var autoSummarize: Bool = false
     @AppStorage("autoSummarizeTemplate") private var autoSummarizeTemplate: String = "recording"
 
@@ -25,25 +27,39 @@ struct AISettingsView: View {
                     Text("Anthropic").tag("anthropic")
                     Text("OpenAI").tag("openai")
                     Text("OpenRouter").tag("openrouter")
+                    Divider()
+                    Text("Custom (OpenAI-compatible)").tag("custom")
                 }
                 .onChange(of: providerName) { _, newValue in
                     apiKey = KeychainHelper.read(
                         service: keychainService,
                         account: newValue
                     ) ?? ""
-                    selectedModel = makeProvider(name: newValue, apiKey: "")?.defaultModel ?? ""
+                    if newValue != "custom" {
+                        selectedModel = makeProvider(name: newValue, apiKey: "")?.defaultModel ?? ""
+                    }
                     verifyResult = nil
                 }
 
-                Picker("Model", selection: $selectedModel) {
-                    let provider = makeProvider(name: providerName, apiKey: "")
-                    ForEach(provider?.availableModels ?? [], id: \.self) { model in
-                        Text(model).tag(model)
+                if providerName == "custom" {
+                    TextField("Base URL", text: $customBaseURL)
+                        .textFieldStyle(.roundedBorder)
+                        .help("e.g., http://localhost:11434/v1 for Ollama")
+
+                    TextField("Model name", text: $customModel)
+                        .textFieldStyle(.roundedBorder)
+                        .help("e.g., llama3.1, mistral, gemma2")
+                } else {
+                    Picker("Model", selection: $selectedModel) {
+                        let provider = makeProvider(name: providerName, apiKey: "")
+                        ForEach(provider?.availableModels ?? [], id: \.self) { model in
+                            Text(model).tag(model)
+                        }
                     }
                 }
             }
 
-            Section("API Key") {
+            Section(providerName == "custom" ? "API Key (optional)" : "API Key") {
                 SecureField("API Key", text: $apiKey)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { saveKey() }
@@ -53,7 +69,7 @@ struct AISettingsView: View {
                         .disabled(apiKey.isEmpty)
 
                     Button("Verify") { verifyKey() }
-                        .disabled(apiKey.isEmpty || isVerifying)
+                        .disabled(isVerifying || (providerName != "custom" && apiKey.isEmpty))
 
                     if isVerifying {
                         ProgressView().controlSize(.small)
@@ -79,7 +95,7 @@ struct AISettingsView: View {
 
             Section("Automation") {
                 Toggle("Auto-summarize after transcription", isOn: $autoSummarize)
-                    .disabled(apiKey.isEmpty)
+                    .disabled(providerName != "custom" && apiKey.isEmpty)
 
                 if autoSummarize {
                     Picker("Default template", selection: $autoSummarizeTemplate) {
@@ -124,11 +140,17 @@ struct AISettingsView: View {
         }
     }
 
+    /// The effective model name — custom provider uses free-text field.
+    var effectiveModel: String {
+        providerName == "custom" ? customModel : selectedModel
+    }
+
     private func makeProvider(name: String, apiKey: String) -> (any LLMProvider)? {
         switch name {
         case "anthropic": return AnthropicProvider(apiKey: apiKey)
         case "openai":    return OpenAIProvider(apiKey: apiKey)
         case "openrouter": return OpenRouterProvider(apiKey: apiKey)
+        case "custom":    return OpenAIProvider(apiKey: apiKey, baseURL: customBaseURL)
         default: return nil
         }
     }

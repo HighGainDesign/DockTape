@@ -268,9 +268,12 @@ struct SummaryTabView: View {
 
     // MARK: - Actions
 
+    @AppStorage("aiCustomBaseURL") private var customBaseURL: String = "http://localhost:11434/v1"
+    @AppStorage("aiCustomModel") private var customModel: String = ""
+
     private func handleSummarize() {
-        let apiKey = KeychainHelper.read(service: keychainService, account: providerName)
-        guard let apiKey, !apiKey.isEmpty else {
+        let apiKey = KeychainHelper.read(service: keychainService, account: providerName) ?? ""
+        if providerName != "custom" && apiKey.isEmpty {
             showAPIKeySetup = true
             return
         }
@@ -278,15 +281,17 @@ struct SummaryTabView: View {
         let provider: any LLMProvider = switch providerName {
         case "openai": OpenAIProvider(apiKey: apiKey)
         case "openrouter": OpenRouterProvider(apiKey: apiKey)
+        case "custom": OpenAIProvider(apiKey: apiKey, baseURL: customBaseURL)
         default: AnthropicProvider(apiKey: apiKey)
         }
 
+        let effectiveModel = providerName == "custom" ? customModel : selectedModel
         state.summarizeRecordings(
             [recording],
             template: selectedTemplate,
             customPrompt: selectedTemplate == .custom ? customPromptText : nil,
             provider: provider,
-            model: selectedModel
+            model: effectiveModel
         )
     }
 }
