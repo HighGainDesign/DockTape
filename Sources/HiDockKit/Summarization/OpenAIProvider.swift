@@ -6,7 +6,7 @@ public struct OpenAIProvider: LLMProvider, Sendable {
     public let availableModels = ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"]
     private let apiKey: String
     private let session: URLSession
-    let baseURL: String
+    private let baseURL: String
 
     public init(
         apiKey: String,

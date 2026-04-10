@@ -28,7 +28,11 @@ public struct OpenRouterProvider: LLMProvider, Sendable {
             "messages": [["role": "system", "content": systemPrompt], ["role": "user", "content": transcript]]
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, _) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let body = String(data: data, encoding: .utf8) ?? "No response body"
+            throw LLMError.apiError("HTTP \(http.statusCode): \(body.prefix(200))")
+        }
         return try OpenAIProvider.extractText(from: data)
     }
 

@@ -7,7 +7,7 @@ import HiDockKit
 final class SummarizationState {
     var summarizingFile: String?
     var phase: String = ""
-    var queue: [RecordingMetadata] = []
+    var queueCount: Int = 0
     var queueIndex: Int = 0
     /// Tracks which recordings have summaries (for synchronous UI checks).
     var hasSummary: Set<String> = []
@@ -15,8 +15,16 @@ final class SummarizationState {
     let summaryStore: SummaryStore
 
     private var summarizationTask: Task<Void, Never>?
+    /// Each queued item carries its own template so mixed-mode auto-summarize works.
+    private var queue: [QueueEntry] = []
 
     var isSummarizing: Bool { summarizingFile != nil }
+
+    private struct QueueEntry {
+        let recording: RecordingMetadata
+        let template: SummaryTemplate
+        let customPrompt: String?
+    }
 
     init(summaryStore: SummaryStore) {
         self.summaryStore = summaryStore
@@ -32,14 +40,19 @@ final class SummarizationState {
         onError: @escaping (String) -> Void,
         onComplete: @escaping () -> Void
     ) {
-        let newRecs = recordings.filter { rec in !queue.contains(where: { $0.filename == rec.filename }) }
-        queue.append(contentsOf: newRecs)
+        let existing = Set(queue.map(\.recording.filename))
+        let newEntries = recordings
+            .filter { !existing.contains($0.filename) }
+            .map { QueueEntry(recording: $0, template: template, customPrompt: customPrompt) }
+        queue.append(contentsOf: newEntries)
+        queueCount = queue.count
 
         guard summarizationTask == nil else { return }
 
         summarizationTask = Task {
             while queueIndex < queue.count {
-                let rec = queue[queueIndex]
+                let entry = queue[queueIndex]
+                let rec = entry.recording
                 summarizingFile = rec.filename
                 phase = "Summarizing with \(model)..."
 
@@ -52,10 +65,10 @@ final class SummarizationState {
 
                     let transcriptText = transcript.plainText(includeSpeakers: true)
                     let systemPrompt: String
-                    if template == .custom {
-                        systemPrompt = SummaryTemplate.buildCustomPrompt(customPrompt ?? "")
+                    if entry.template == .custom {
+                        systemPrompt = SummaryTemplate.buildCustomPrompt(entry.customPrompt ?? "")
                     } else {
-                        systemPrompt = template.systemPrompt
+                        systemPrompt = entry.template.systemPrompt
                     }
 
                     let responseText = try await provider.summarize(
@@ -71,8 +84,8 @@ final class SummarizationState {
                         recordingFilename: rec.filename,
                         model: model,
                         provider: provider.name.lowercased(),
-                        templateUsed: template.rawValue,
-                        customPrompt: template == .custom ? customPrompt : nil,
+                        templateUsed: entry.template.rawValue,
+                        customPrompt: entry.template == .custom ? entry.customPrompt : nil,
                         sections: sections
                     )
 
@@ -102,6 +115,7 @@ final class SummarizationState {
         summarizingFile = nil
         phase = ""
         queue = []
+        queueCount = 0
         queueIndex = 0
         summarizationTask = nil
     }

@@ -103,13 +103,31 @@ public actor SummaryStore {
         Array(cache.keys)
     }
 
-    /// Re-key a summary after recording rename, moving the file on disk.
+    /// Re-key a summary after recording rename, moving the file on disk
+    /// and updating the recordingFilename inside the summary.
     public func rename(from oldMp3: String, to newMp3: String) {
-        guard let summary = cache.removeValue(forKey: oldMp3) else { return }
+        guard let oldSummary = cache.removeValue(forKey: oldMp3) else { return }
         let oldURL = fileURL(for: oldMp3)
         let newURL = fileURL(for: newMp3)
+        try? FileManager.default.removeItem(at: newURL)  // avoid collision
         try? FileManager.default.moveItem(at: oldURL, to: newURL)
-        cache[newMp3] = summary
+        let updated = Summary(
+            recordingFilename: newMp3,
+            createdAt: oldSummary.createdAt,
+            model: oldSummary.model,
+            provider: oldSummary.provider,
+            templateUsed: oldSummary.templateUsed,
+            customPrompt: oldSummary.customPrompt,
+            sections: oldSummary.sections
+        )
+        cache[newMp3] = updated
+        // Re-save so the JSON content reflects the new filename
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(updated) {
+            try? data.write(to: newURL)
+        }
     }
 
     private func fileURL(for mp3Filename: String) -> URL {
