@@ -35,6 +35,10 @@ struct AppCommands: Commands {
         !(state?.library.selectedRecordings.isEmpty ?? true)
     }
 
+    private var hasSingleSelection: Bool {
+        state?.library.selectedRecordings.count == 1
+    }
+
     private var selectedRecordings: [RecordingMetadata] {
         guard let state else { return [] }
         return state.library.recordings.filter { state.library.selectedRecordings.contains($0.filename) }
@@ -64,6 +68,24 @@ struct AppCommands: Commands {
             })
 
             Divider()
+
+            Button("Import from Device") {
+                guard let state else { return }
+                let files = state.device.files.filter { state.device.selectedDeviceFiles.contains($0.filename) }
+                Task {
+                    for file in files { await state.downloadFile(file) }
+                }
+            }
+            .keyboardShortcut("i", modifiers: [.command, .shift])
+            .disabled(state?.device.selectedDeviceFiles.isEmpty ?? true)
+
+            Divider()
+
+            Button("Rename...") {
+                state?.triggerRename = true
+            }
+            .keyboardShortcut(.return, modifiers: [])
+            .disabled(!hasSingleSelection)
 
             Button("Reveal in Finder") {
                 guard let state, let rec = selectedRecordings.first else { return }
@@ -110,6 +132,28 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("2", modifiers: .command)
             .disabled(state?.device.isConnected != true)
+
+            Divider()
+
+            Button("Show Previous Tab") {
+                guard let state else { return }
+                let tabs = DetailPane.DetailTab.allCases
+                if let idx = tabs.firstIndex(of: state.selectedDetailTab), idx > 0 {
+                    state.selectedDetailTab = tabs[idx - 1]
+                }
+            }
+            .keyboardShortcut("[", modifiers: [.command, .shift])
+            .disabled(state?.library.selectedRecording == nil)
+
+            Button("Show Next Tab") {
+                guard let state else { return }
+                let tabs = DetailPane.DetailTab.allCases
+                if let idx = tabs.firstIndex(of: state.selectedDetailTab), idx < tabs.count - 1 {
+                    state.selectedDetailTab = tabs[idx + 1]
+                }
+            }
+            .keyboardShortcut("]", modifiers: [.command, .shift])
+            .disabled(state?.library.selectedRecording == nil)
 
             Divider()
         }

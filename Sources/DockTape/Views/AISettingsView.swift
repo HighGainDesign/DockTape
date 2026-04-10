@@ -17,6 +17,8 @@ struct AISettingsView: View {
     @State private var apiKey: String = ""
     @State private var isVerifying: Bool = false
     @State private var verifyResult: VerifyResult?
+    @State private var fetchedModels: [String] = []
+    @State private var isFetchingModels: Bool = false
 
     private let keychainService = KeychainHelper.aiService
 
@@ -50,10 +52,36 @@ struct AISettingsView: View {
                     TextField("Base URL", text: $customBaseURL)
                         .textFieldStyle(.roundedBorder)
                         .help("e.g., http://localhost:11434/v1 for Ollama")
+                        .onChange(of: customBaseURL) { _, _ in fetchedModels = [] }
 
-                    TextField("Model name", text: $customModel)
-                        .textFieldStyle(.roundedBorder)
-                        .help("e.g., llama3.1, mistral, gemma2")
+                    HStack {
+                        if fetchedModels.isEmpty {
+                            TextField("Model name", text: $customModel)
+                                .textFieldStyle(.roundedBorder)
+                        } else {
+                            Picker("Model", selection: $customModel) {
+                                if !fetchedModels.contains(customModel) && !customModel.isEmpty {
+                                    Text(customModel).tag(customModel)
+                                }
+                                ForEach(fetchedModels, id: \.self) { model in
+                                    Text(model).tag(model)
+                                }
+                            }
+                        }
+
+                        Button {
+                            fetchCustomModels()
+                        } label: {
+                            if isFetchingModels {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(isFetchingModels)
+                        .help("Fetch available models from server")
+                    }
                 } else {
                     Picker("Model", selection: $selectedModel) {
                         let provider = makeProvider(name: providerName, apiKey: "")
@@ -75,6 +103,7 @@ struct AISettingsView: View {
 
                     Button("Verify") { verifyKey() }
                         .disabled(isVerifying || (providerName != "custom" && apiKey.isEmpty))
+                        .help("Makes a small API call to verify the key works")
 
                     if isVerifying {
                         ProgressView().controlSize(.small)
@@ -158,12 +187,19 @@ struct AISettingsView: View {
 
     private func templateEditor(_ label: String, template: SummaryTemplate, storage: Binding<String>) -> some View {
         DisclosureGroup(label) {
-            let displayText = storage.wrappedValue.isEmpty ? template.defaultPromptText : storage.wrappedValue
-            TextEditor(text: Binding(
-                get: { displayText },
-                set: { storage.wrappedValue = $0 }
-            ))
-            .font(.body.monospaced())
+            ZStack(alignment: .topLeading) {
+                if storage.wrappedValue.isEmpty {
+                    Text(template.defaultPromptText)
+                        .font(.body.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 6)
+                }
+                TextEditor(text: storage)
+                    .font(.body.monospaced())
+                    .scrollContentBackground(.hidden)
+                    .opacity(storage.wrappedValue.isEmpty ? 0.25 : 1)
+            }
             .frame(minHeight: 80)
             .border(.separator)
 
@@ -188,13 +224,25 @@ struct AISettingsView: View {
         providerName == "custom" ? customModel : selectedModel
     }
 
-    private func makeProvider(name: String, apiKey: String) -> (any LLMProvider)? {
-        switch name {
-        case "anthropic": return AnthropicProvider(apiKey: apiKey)
-        case "openai":    return OpenAIProvider(apiKey: apiKey)
-        case "openrouter": return OpenRouterProvider(apiKey: apiKey)
-        case "custom":    return OpenAIProvider(apiKey: apiKey, baseURL: customBaseURL, name: "Custom")
-        default: return nil
+    private func fetchCustomModels() {
+        isFetchingModels = true
+        Task {
+            defer { isFetchingModels = false }
+            do {
+                let provider = OpenAIProvider(apiKey: apiKey, baseURL: customBaseURL, name: "Custom")
+                let models = try await provider.listModels()
+                fetchedModels = models.sorted()
+                if customModel.isEmpty, let first = fetchedModels.first {
+                    customModel = first
+                }
+            } catch {
+                // Silently fail — user can still type manually
+                fetchedModels = []
+            }
         }
+    }
+
+    private func makeProvider(name: String, apiKey: String) -> (any LLMProvider)? {
+        makeLLMProvider(name: name, apiKey: apiKey, baseURL: customBaseURL)
     }
 }

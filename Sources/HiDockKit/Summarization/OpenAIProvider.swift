@@ -66,6 +66,24 @@ public struct OpenAIProvider: LLMProvider, Sendable {
         }
     }
 
+    /// Fetch available model IDs from the /v1/models endpoint.
+    public func listModels() async throws -> [String] {
+        var request = URLRequest(url: URL(string: "\(normalizedBaseURL)/v1/models")!)
+        request.timeoutInterval = 10
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw LLMError.apiError("HTTP \(http.statusCode)")
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+        guard let models = json["data"] as? [[String: Any]] else {
+            throw LLMError.invalidResponse
+        }
+        return models.compactMap { $0["id"] as? String }
+    }
+
     public static func extractText(from data: Data) throws -> String {
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
         if let error = json["error"] as? [String: Any], let message = error["message"] as? String {

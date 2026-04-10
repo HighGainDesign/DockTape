@@ -27,6 +27,8 @@ final class AppState {
     var summarization: SummarizationState
 
     var selectedView: SidebarSelection = .allRecordings
+    var selectedDetailTab: DetailPane.DetailTab = .info
+    var triggerRename: Bool = false
     var errorMessage: String?
     var statusMessage: String = "No device connected"
 
@@ -200,22 +202,13 @@ final class AppState {
 
     /// Create an LLM provider from current Settings.
     private func makeSettingsProvider() -> (provider: any LLMProvider, model: String)? {
-        let keychainService = KeychainHelper.aiService
         let providerName = UserDefaults.standard.string(forKey: "aiProvider") ?? "anthropic"
-        let apiKey = KeychainHelper.read(service: keychainService, account: providerName) ?? ""
+        let apiKey = KeychainHelper.read(service: KeychainHelper.aiService, account: providerName) ?? ""
 
         if providerName != "custom" && apiKey.isEmpty { return nil }
 
-        let provider: any LLMProvider = switch providerName {
-        case "openai": OpenAIProvider(apiKey: apiKey)
-        case "openrouter": OpenRouterProvider(apiKey: apiKey)
-        case "custom": OpenAIProvider(
-            apiKey: apiKey,
-            baseURL: UserDefaults.standard.string(forKey: "aiCustomBaseURL") ?? "http://localhost:11434/v1",
-            name: "Custom"
-        )
-        default: AnthropicProvider(apiKey: apiKey)
-        }
+        let baseURL = UserDefaults.standard.string(forKey: "aiCustomBaseURL") ?? "http://localhost:11434/v1"
+        guard let provider = makeLLMProvider(name: providerName, apiKey: apiKey, baseURL: baseURL) else { return nil }
 
         let model: String
         if providerName == "custom" {

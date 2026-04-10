@@ -239,6 +239,12 @@ struct RecordingListPane: View {
         Divider()
 
         Button {
+            state.triggerRename = true
+        } label: {
+            Label("Rename...", systemImage: "pencil")
+        }
+
+        Button {
             state.library.revealInFinder(rec)
         } label: {
             Label("Reveal in Finder", systemImage: "folder")
@@ -258,7 +264,7 @@ struct RecordingListPane: View {
         Button {
             Task { await state.downloadFile(file) }
         } label: {
-            Label("Download", systemImage: "arrow.down.circle")
+            Label("Import", systemImage: "arrow.down.circle")
         }
         Divider()
         Button(role: .destructive) {
@@ -294,7 +300,7 @@ struct RecordingListPane: View {
             HStack(spacing: 12) {
                 sortFilterMenu
                 Spacer()
-                toolbarButton("arrow.down.circle", "Download") {
+                toolbarButton("arrow.down.circle", "Import") {
                     Task {
                         for file in selectedDeviceFiles { await state.downloadFile(file) }
                     }

@@ -30,10 +30,10 @@ public enum SummaryTemplate: String, Codable, CaseIterable, Sendable {
     }
 
     /// The user-visible prompt text (without JSON schema boilerplate).
-    /// Checks UserDefaults first, falls back to built-in default.
-    public var promptText: String {
+    /// Pass a customization lookup (e.g. from UserDefaults) to check for overrides.
+    public func promptText(customLookup: (String) -> String? = { _ in nil }) -> String {
         if let key = userDefaultsKey,
-           let custom = UserDefaults.standard.string(forKey: key),
+           let custom = customLookup(key),
            !custom.isEmpty {
             return custom
         }
@@ -52,8 +52,8 @@ public enum SummaryTemplate: String, Codable, CaseIterable, Sendable {
     }
 
     /// The full system prompt sent to the LLM (prompt text + JSON schema).
-    public var systemPrompt: String {
-        let text = promptText
+    public func systemPrompt(customLookup: (String) -> String? = { _ in nil }) -> String {
+        let text = promptText(customLookup: customLookup)
         if text.isEmpty { return "" }
         return "\(text)\n\n\(Self.jsonSchemaInstruction)"
     }
@@ -146,19 +146,16 @@ public enum SummaryTemplate: String, Codable, CaseIterable, Sendable {
     2. "Key Points" — important points, as items
     """
 
-    /// Strip markdown code fences if present and extract JSON.
-    private static func extractJSON(from text: String) -> String {
-        var cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if cleaned.hasPrefix("```") {
-            if let endFence = cleaned.range(of: "\n") {
-                cleaned = String(cleaned[endFence.upperBound...])
-            }
-            if cleaned.hasSuffix("```") {
-                cleaned = String(cleaned.dropLast(3))
-            }
-            cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Extract the JSON object from an LLM response, handling code fences,
+    /// preamble text, and trailing commentary.
+    static func extractJSON(from text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Find the first { and last } to extract the JSON object
+        guard let start = trimmed.firstIndex(of: "{"),
+              let end = trimmed.lastIndex(of: "}") else {
+            return trimmed
         }
-        return cleaned
+        return String(trimmed[start...end])
     }
 }
 

@@ -323,12 +323,7 @@ struct SummaryTabView: View {
             return
         }
 
-        let provider: any LLMProvider = switch providerName {
-        case "openai": OpenAIProvider(apiKey: apiKey)
-        case "openrouter": OpenRouterProvider(apiKey: apiKey)
-        case "custom": OpenAIProvider(apiKey: apiKey, baseURL: customBaseURL, name: "Custom")
-        default: AnthropicProvider(apiKey: apiKey)
-        }
+        guard let provider = makeLLMProvider(name: providerName, apiKey: apiKey, baseURL: customBaseURL) else { return }
 
         let effectiveModel = providerName == "custom" ? customModel : selectedModel
         state.summarizeRecordings(

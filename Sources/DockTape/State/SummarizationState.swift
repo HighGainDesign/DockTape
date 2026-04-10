@@ -37,8 +37,8 @@ final class SummarizationState {
         provider: any LLMProvider,
         model: String,
         transcriptStore: TranscriptStore,
-        onError: @escaping (String) -> Void,
-        onComplete: @escaping () -> Void
+        onError: @MainActor @Sendable @escaping (String) -> Void,
+        onComplete: @MainActor @Sendable @escaping () -> Void
     ) {
         let existing = Set(queue.map(\.recording.filename))
         let newEntries = recordings
@@ -68,7 +68,7 @@ final class SummarizationState {
                     if entry.template == .custom {
                         systemPrompt = SummaryTemplate.buildCustomPrompt(entry.customPrompt ?? "")
                     } else {
-                        systemPrompt = entry.template.systemPrompt
+                        systemPrompt = entry.template.systemPrompt { UserDefaults.standard.string(forKey: $0) }
                     }
 
                     let responseText = try await provider.summarize(

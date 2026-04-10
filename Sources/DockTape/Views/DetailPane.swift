@@ -4,7 +4,6 @@ import HiDockKit
 /// Column 3: Progressive detail view with tabs, player bar, and transcription bar.
 struct DetailPane: View {
     @Bindable var state: AppState
-    @State private var selectedTab: DetailTab = .info
     @State private var userHasPickedTab: Bool = false
     @State private var transcript: Transcript?
     @State private var renamingRecording: RecordingMetadata?
@@ -164,7 +163,7 @@ struct DetailPane: View {
             .padding()
 
             // Tab bar
-            Picker("Detail", selection: $selectedTab) {
+            Picker("Detail", selection: $state.selectedDetailTab) {
                 ForEach(availableTabs(for: rec), id: \.self) { tab in
                     Text(tab.rawValue).tag(tab)
                 }
@@ -188,7 +187,7 @@ struct DetailPane: View {
                 }
             } else {
                 state.playback.setSegmentTimestamps([])
-                selectedTab = .info
+                state.selectedDetailTab = .info
             }
         }
         .task(id: rec.filename) {
@@ -196,12 +195,12 @@ struct DetailPane: View {
             syncSegmentTimestamps(for: rec.filename)
             if !userHasPickedTab {
                 // First load: auto-select best tab
-                selectedTab = transcript != nil ? .transcript : .info
+                state.selectedDetailTab = transcript != nil ? .transcript : .info
             } else {
                 ensureTabAvailable(for: rec)
             }
         }
-        .onChange(of: selectedTab) { _, _ in
+        .onChange(of: state.selectedDetailTab) { _, _ in
             userHasPickedTab = true
         }
         .onChange(of: state.transcription.statuses[rec.filename]) { _, newStatus in
@@ -219,6 +218,13 @@ struct DetailPane: View {
                 syncSegmentTimestamps(for: rec.filename)
             } else {
                 state.playback.setSegmentTimestamps([])
+            }
+        }
+        .onChange(of: state.triggerRename) { _, trigger in
+            if trigger, renamingRecording == nil {
+                renameText = (rec.filename as NSString).deletingPathExtension
+                renamingRecording = rec
+                state.triggerRename = false
             }
         }
         .alert("Rename Recording", isPresented: Binding(
@@ -276,7 +282,7 @@ struct DetailPane: View {
 
     @ViewBuilder
     private func tabContent(for rec: RecordingMetadata) -> some View {
-        switch selectedTab {
+        switch state.selectedDetailTab {
         case .info:
             InfoTabView(
                 recording: rec,
@@ -331,8 +337,8 @@ struct DetailPane: View {
     /// If the user's current tab isn't available for this recording, fall back.
     private func ensureTabAvailable(for rec: RecordingMetadata) {
         let available = availableTabs(for: rec)
-        if !available.contains(selectedTab) {
-            selectedTab = available.last ?? .info
+        if !available.contains(state.selectedDetailTab) {
+            state.selectedDetailTab = available.last ?? .info
         }
     }
 
@@ -397,7 +403,7 @@ struct DetailPane: View {
                         for file in files { await state.downloadFile(file) }
                     }
                 } label: {
-                    Label("Download All", systemImage: "arrow.down.circle")
+                    Label("Import All", systemImage: "arrow.down.circle")
                 }
                 .buttonStyle(.bordered)
 
@@ -447,7 +453,7 @@ struct DetailPane: View {
                 Button {
                     Task { await state.downloadFile(file) }
                 } label: {
-                    Label("Download", systemImage: "arrow.down.circle")
+                    Label("Import", systemImage: "arrow.down.circle")
                 }
                 .disabled(state.device.downloadingFiles.contains(file.filename))
             }

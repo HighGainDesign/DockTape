@@ -8,6 +8,21 @@ public protocol LLMProvider: Sendable {
     func verifyKey() async throws
 }
 
+/// Build a provider by name.
+public func makeLLMProvider(
+    name: String,
+    apiKey: String,
+    baseURL: String = "http://localhost:11434/v1"
+) -> (any LLMProvider)? {
+    switch name {
+    case "anthropic":  return AnthropicProvider(apiKey: apiKey)
+    case "openai":     return OpenAIProvider(apiKey: apiKey)
+    case "openrouter": return OpenRouterProvider(apiKey: apiKey)
+    case "custom":     return OpenAIProvider(apiKey: apiKey, baseURL: baseURL, name: "Custom")
+    default:           return nil
+    }
+}
+
 public enum LLMError: LocalizedError {
     case apiError(String)
     case networkError(Error)

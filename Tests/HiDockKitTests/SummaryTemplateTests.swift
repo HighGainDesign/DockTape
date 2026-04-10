@@ -13,7 +13,7 @@ final class SummaryTemplateTests: XCTestCase {
     }
 
     func testMeetingPromptContainsRequiredSections() {
-        let prompt = SummaryTemplate.meeting.systemPrompt
+        let prompt = SummaryTemplate.meeting.systemPrompt()
         XCTAssertTrue(prompt.contains("Action Items"))
         XCTAssertTrue(prompt.contains("Summary"))
         XCTAssertTrue(prompt.contains("Key Decisions"))
@@ -22,14 +22,14 @@ final class SummaryTemplateTests: XCTestCase {
     }
 
     func testCallPromptContainsRequiredSections() {
-        let prompt = SummaryTemplate.call.systemPrompt
+        let prompt = SummaryTemplate.call.systemPrompt()
         XCTAssertTrue(prompt.contains("Action Items"))
         XCTAssertTrue(prompt.contains("Synopsis"))
         XCTAssertTrue(prompt.contains("Commitments"))
     }
 
     func testMemoPromptIsShort() {
-        let prompt = SummaryTemplate.memo.systemPrompt
+        let prompt = SummaryTemplate.memo.systemPrompt()
         XCTAssertTrue(prompt.contains("Gist"))
         // Memo should not request action items as a numbered section
         // (the shared JSON schema example mentions "Action Items" but that's just format guidance)
@@ -57,6 +57,25 @@ final class SummaryTemplateTests: XCTestCase {
         XCTAssertEqual(sections.count, 2)
         XCTAssertEqual(sections[0].heading, "Summary")
         XCTAssertEqual(sections[1].items?.count, 1)
+    }
+
+    func testParseSectionsFromCodeFencedJSON() throws {
+        let response = """
+        Here is the summary:
+        ```json
+        {"sections": [{"heading": "Summary", "content": "Fenced.", "items": null}]}
+        ```
+        Some trailing text.
+        """
+        let sections = try SummaryTemplate.parseSections(from: response)
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertEqual(sections[0].content, "Fenced.")
+    }
+
+    func testExtractJSONWithPreamble() {
+        let response = "Sure! Here's your JSON:\n{\"key\": \"value\"}\nHope that helps!"
+        let extracted = SummaryTemplate.extractJSON(from: response)
+        XCTAssertEqual(extracted, "{\"key\": \"value\"}")
     }
 
     func testParseSectionsFallbackOnInvalidJSON() throws {

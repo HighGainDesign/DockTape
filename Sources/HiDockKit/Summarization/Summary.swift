@@ -2,7 +2,7 @@
 import Foundation
 
 /// A structured AI-generated summary of a transcript.
-public struct Summary: Codable, Sendable, Identifiable {
+public struct Summary: Codable, Sendable, Identifiable, Equatable {
     public var id: String { recordingFilename }
 
     public let recordingFilename: String
@@ -31,7 +31,7 @@ public struct Summary: Codable, Sendable, Identifiable {
         self.sections = sections
     }
 
-    public struct Section: Codable, Sendable, Identifiable {
+    public struct Section: Codable, Sendable, Identifiable, Equatable {
         public let id: UUID
         public let heading: String
         public let content: String
@@ -45,7 +45,7 @@ public struct Summary: Codable, Sendable, Identifiable {
         }
     }
 
-    public struct Item: Codable, Sendable, Identifiable {
+    public struct Item: Codable, Sendable, Identifiable, Equatable {
         public let id: UUID
         public let text: String
         public var isCompleted: Bool

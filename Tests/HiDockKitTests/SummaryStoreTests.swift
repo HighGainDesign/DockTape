@@ -98,6 +98,90 @@ final class SummaryStoreTests: XCTestCase {
         XCTAssertTrue(reloaded?.sections[0].items?[0].isCompleted ?? false)
     }
 
+    func testRenameMovesFileAndUpdatesFilename() async throws {
+        let store = SummaryStore(baseDirectory: tempDir)
+        let summary = Summary(
+            recordingFilename: "old.mp3",
+            model: "gpt-4o",
+            provider: "openai",
+            templateUsed: "meeting",
+            sections: [Summary.Section(heading: "Summary", content: "Test.", items: nil)]
+        )
+        try await store.save(summary, mp3Filename: "old.mp3")
+
+        await store.rename(from: "old.mp3", to: "new.mp3")
+
+        // Old file gone, new file exists
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent("old.summary.json").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent("new.summary.json").path))
+
+        // Cache updated
+        let old = await store.summary(for: "old.mp3")
+        XCTAssertNil(old)
+        let new = await store.summary(for: "new.mp3")
+        XCTAssertNotNil(new)
+        XCTAssertEqual(new?.recordingFilename, "new.mp3")
+
+        // Persists across reload
+        let store2 = SummaryStore(baseDirectory: tempDir)
+        try await store2.loadAll()
+        let reloaded = await store2.summary(for: "new.mp3")
+        XCTAssertEqual(reloaded?.recordingFilename, "new.mp3")
+    }
+
+    func testDeleteRemovesFileAndCache() async throws {
+        let store = SummaryStore(baseDirectory: tempDir)
+        let summary = Summary(
+            recordingFilename: "doomed.mp3",
+            model: "gpt-4o",
+            provider: "openai",
+            templateUsed: "memo",
+            sections: [Summary.Section(heading: "Gist", content: "Gone soon.", items: nil)]
+        )
+        try await store.save(summary, mp3Filename: "doomed.mp3")
+        let hasBefore = await store.hasSummary(for: "doomed.mp3")
+        XCTAssertTrue(hasBefore)
+
+        try await store.delete(for: "doomed.mp3")
+
+        let hasAfter = await store.hasSummary(for: "doomed.mp3")
+        XCTAssertFalse(hasAfter)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent("doomed.summary.json").path))
+    }
+
+    func testLoadAllWithSubfolders() async throws {
+        // Create a subfolder structure
+        let subDir = tempDir.appendingPathComponent("Meetings")
+        try FileManager.default.createDirectory(at: subDir, withIntermediateDirectories: true)
+
+        let store = SummaryStore(baseDirectory: tempDir)
+        let s1 = Summary(
+            recordingFilename: "root.mp3",
+            model: "gpt-4o", provider: "openai", templateUsed: "recording",
+            sections: [Summary.Section(heading: "Summary", content: "Root file.", items: nil)]
+        )
+        let s2 = Summary(
+            recordingFilename: "Meetings/standup.mp3",
+            model: "gpt-4o", provider: "openai", templateUsed: "meeting",
+            sections: [Summary.Section(heading: "Summary", content: "Standup notes.", items: nil)]
+        )
+
+        try await store.save(s1, mp3Filename: "root.mp3")
+        try await store.save(s2, mp3Filename: "Meetings/standup.mp3")
+
+        // Reload from disk
+        let store2 = SummaryStore(baseDirectory: tempDir)
+        try await store2.loadAll()
+
+        let root = await store2.summary(for: "root.mp3")
+        XCTAssertEqual(root?.sections[0].content, "Root file.")
+
+        let sub = await store2.summary(for: "Meetings/standup.mp3")
+        XCTAssertEqual(sub?.sections[0].content, "Standup notes.")
+        let allCount = await store2.allSummaries().count
+        XCTAssertEqual(allCount, 2)
+    }
+
     func testHasSummary() async throws {
         let store = SummaryStore(baseDirectory: tempDir)
         let has = await store.hasSummary(for: "nonexistent.mp3")
