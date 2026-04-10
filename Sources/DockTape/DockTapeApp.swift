@@ -31,8 +31,73 @@ extension FocusedValues {
 struct AppCommands: Commands {
     @FocusedValue(\.appState) var state
 
+    private var hasSelection: Bool {
+        !(state?.library.selectedRecordings.isEmpty ?? true)
+    }
+
+    private var selectedRecordings: [RecordingMetadata] {
+        guard let state else { return [] }
+        return state.library.recordings.filter { state.library.selectedRecordings.contains($0.filename) }
+    }
+
     var body: some Commands {
-        // Navigation
+        // File menu — recording-level actions
+        CommandGroup(replacing: .newItem) {
+            Button("Transcribe") {
+                guard let state else { return }
+                let toTranscribe = selectedRecordings.filter {
+                    (state.transcription.statuses[$0.filename] ?? .none) != .done
+                }
+                guard !toTranscribe.isEmpty else { return }
+                Task { await state.transcribeRecordings(toTranscribe) }
+            }
+            .keyboardShortcut("t", modifiers: [.command, .shift])
+            .disabled(!hasSelection)
+
+            Button("Summarize") {
+                guard let state, let rec = selectedRecordings.first else { return }
+                state.contextMenuSummarize(rec)
+            }
+            .keyboardShortcut("s", modifiers: [.command, .option])
+            .disabled(!hasSelection || selectedRecordings.allSatisfy {
+                (state?.transcription.statuses[$0.filename] ?? .none) != .done
+            })
+
+            Divider()
+
+            Button("Reveal in Finder") {
+                guard let state, let rec = selectedRecordings.first else { return }
+                state.library.revealInFinder(rec)
+            }
+            .keyboardShortcut("r", modifiers: [.command, .shift])
+            .disabled(!hasSelection)
+
+            Divider()
+
+            Button("Delete") {
+                guard let state else { return }
+                Task {
+                    for rec in selectedRecordings {
+                        await state.deleteLocalRecording(rec)
+                    }
+                    state.library.selectedRecordings.removeAll()
+                }
+            }
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(!hasSelection)
+        }
+
+        // Edit menu — just search
+        CommandGroup(replacing: .textEditing) {
+            Button("Find") {
+                state?.library.isSearchFocused = true
+            }
+            .keyboardShortcut("f", modifiers: .command)
+
+            Divider()
+        }
+
+        // View menu — navigation
         CommandGroup(after: .sidebar) {
             Button("Show All Recordings") {
                 state?.selectedView = .allRecordings
@@ -57,33 +122,8 @@ struct AppCommands: Commands {
             Divider()
         }
 
-        // Search
-        CommandGroup(replacing: .textEditing) {
-            Button("Find") {
-                state?.library.isSearchFocused = true
-            }
-            .keyboardShortcut("f", modifiers: .command)
-
-            Divider()
-        }
-
-        // Recording actions
-        CommandGroup(after: .textEditing) {
-            Button("Transcribe Selected") {
-                guard let state else { return }
-                let selected = state.library.recordings.filter { state.library.selectedRecordings.contains($0.filename) }
-                let toTranscribe = selected.filter {
-                    (state.transcription.statuses[$0.filename] ?? .none) != .done
-                }
-                guard !toTranscribe.isEmpty else { return }
-                Task { await state.transcribeRecordings(toTranscribe) }
-            }
-            .keyboardShortcut("t", modifiers: [.command, .shift])
-            .disabled(state?.library.selectedRecordings.isEmpty ?? true)
-
-            Divider()
-
-            // Playback
+        // Playback menu
+        CommandMenu("Playback") {
             Button(state?.playback.isPlaying == true ? "Pause" : "Play") {
                 guard let state else { return }
                 if state.playback.playingFile != nil {
@@ -130,8 +170,6 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("\\", modifiers: .command)
             .disabled(state?.playback.playingFile == nil)
-
-            Divider()
         }
 
         // Device menu
@@ -140,7 +178,7 @@ struct AppCommands: Commands {
                 guard let state else { return }
                 Task { await state.syncAll() }
             }
-            .keyboardShortcut("s", modifiers: [.command, .shift])
+            .keyboardShortcut("d", modifiers: [.command, .shift])
             .disabled(state?.device.isConnected != true || state?.device.isSyncing == true)
 
             Button("Refresh Device") {
