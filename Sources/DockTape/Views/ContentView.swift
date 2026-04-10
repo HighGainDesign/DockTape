@@ -15,6 +15,7 @@ struct ContentView: View {
             DetailPane(state: state)
         }
         .navigationTitle("")
+        .toolbar(.hidden)
         .frame(minWidth: 960, minHeight: 560)
         .focusedSceneValue(\.appState, state)
         .sheet(isPresented: $state.device.showDeviceInfo) {

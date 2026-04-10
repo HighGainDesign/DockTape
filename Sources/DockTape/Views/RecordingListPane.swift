@@ -60,8 +60,7 @@ struct RecordingListPane: View {
         }
         .searchable(text: $searchText, prompt: "Search recordings")
         .modifier(SearchFocusModifier(trigger: $state.library.isSearchFocused))
-        .safeAreaInset(edge: .top, spacing: 0) { listToolbar }
-        .toolbar { recordingToolbar }
+        .safeAreaInset(edge: .top, spacing: 0) { recordingListToolbar }
         .navigationTitle(recordingTitle)
         .onChange(of: state.selectedView) { _, _ in
             // Clear selection when switching sidebar sections
@@ -141,8 +140,7 @@ struct RecordingListPane: View {
         }
         .listStyle(.inset(alternatesRowBackgrounds: true))
         .searchable(text: $searchText, prompt: "Search files")
-        .safeAreaInset(edge: .top, spacing: 0) { listToolbar }
-        .toolbar { deviceToolbar }
+        .safeAreaInset(edge: .top, spacing: 0) { deviceListToolbar }
         .navigationTitle(state.device.model.map { "HiDock \($0.model.rawValue)" } ?? "On Device")
         .onChange(of: state.device.selectedDeviceFiles) { _, newValue in
             if newValue.count == 1 {
@@ -268,96 +266,90 @@ struct RecordingListPane: View {
         }
     }
 
-    // MARK: - Toolbars
+    // MARK: - Inline Toolbars (per-pane, not window toolbar)
 
-    @ToolbarContentBuilder
-    private var recordingToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .primaryAction) {
-            let singleSelected = state.library.selectedRecordings.count == 1
-            let singleRec = singleSelected
-                ? state.library.recordings.first(where: { $0.filename == state.library.selectedRecordings.first })
-                : nil
-            let isPlaying = singleRec.map { state.playback.playingFile == $0.filename && state.playback.isPlaying } ?? false
+    /// Recordings list toolbar — sort/filter on left, actions on right.
+    private var recordingListToolbar: some View {
+        let singleSelected = state.library.selectedRecordings.count == 1
+        let singleRec = singleSelected
+            ? state.library.recordings.first(where: { $0.filename == state.library.selectedRecordings.first })
+            : nil
+        let isPlaying = singleRec.map { state.playback.playingFile == $0.filename && state.playback.isPlaying } ?? false
 
-            Button {
-                if let rec = singleRec { state.playRecording(rec) }
-            } label: {
-                Label(isPlaying ? "Pause" : "Play",
-                      systemImage: isPlaying ? "pause.fill" : "play.fill")
-            }
-            .disabled(!singleSelected)
-            .help("Play/Pause")
-
-            Button {
-                let toTranscribe = selectedRecordings.filter {
-                    (state.transcription.statuses[$0.filename] ?? .none) != .done
-                }
-                Task { await state.transcribeRecordings(toTranscribe) }
-            } label: {
-                Label("Transcribe", systemImage: "text.badge.plus")
-            }
-            .disabled(state.library.selectedRecordings.isEmpty)
-            .help("Transcribe selected recording(s)")
-
-            Button {
-                Task { await state.library.refresh() }
-            } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
-            }
-            .keyboardShortcut("r", modifiers: .command)
-            .help("Refresh library")
-        }
-    }
-
-    @ToolbarContentBuilder
-    private var deviceToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .primaryAction) {
-            Button {
-                Task {
-                    for file in selectedDeviceFiles {
-                        await state.downloadFile(file)
-                    }
-                }
-            } label: {
-                Label("Download", systemImage: "arrow.down.circle")
-            }
-            .disabled(state.device.selectedDeviceFiles.isEmpty || state.device.isSyncing)
-            .help("Download selected")
-
-            Button(role: .destructive) {
-                Task {
-                    for file in selectedDeviceFiles {
-                        await state.deleteFromDevice(file)
-                    }
-                    state.device.selectedDeviceFiles.removeAll()
-                }
-            } label: {
-                Label("Delete", systemImage: "trash")
-            }
-            .disabled(state.device.selectedDeviceFiles.isEmpty)
-
-            Button {
-                Task { await state.device.refreshDevice() }
-            } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
-            }
-            .keyboardShortcut("r", modifiers: .command)
-        }
-    }
-
-    /// Inline toolbar for the list pane — sort/filter controls above the list,
-    /// visually separate from the window toolbar (which has per-recording actions).
-    private var listToolbar: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
+        return VStack(spacing: 0) {
+            HStack(spacing: 2) {
                 sortFilterMenu
+
                 Spacer()
+
+                toolbarButton(isPlaying ? "pause.fill" : "play.fill", help: "Play/Pause") {
+                    if let rec = singleRec { state.playRecording(rec) }
+                }
+                .disabled(!singleSelected)
+
+                toolbarButton("text.badge.plus", help: "Transcribe") {
+                    let toTranscribe = selectedRecordings.filter {
+                        (state.transcription.statuses[$0.filename] ?? .none) != .done
+                    }
+                    Task { await state.transcribeRecordings(toTranscribe) }
+                }
+                .disabled(state.library.selectedRecordings.isEmpty)
+
+                toolbarButton("arrow.clockwise", help: "Refresh") {
+                    Task { await state.library.refresh() }
+                }
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.vertical, 4)
+            .frame(minHeight: 28)
             .background(.bar)
             Divider()
         }
+    }
+
+    /// Device list toolbar — sort/filter on left, device actions on right.
+    private var deviceListToolbar: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 2) {
+                sortFilterMenu
+
+                Spacer()
+
+                toolbarButton("arrow.down.circle", help: "Download") {
+                    Task {
+                        for file in selectedDeviceFiles { await state.downloadFile(file) }
+                    }
+                }
+                .disabled(state.device.selectedDeviceFiles.isEmpty || state.device.isSyncing)
+
+                toolbarButton("trash", help: "Delete") {
+                    Task {
+                        for file in selectedDeviceFiles { await state.deleteFromDevice(file) }
+                        state.device.selectedDeviceFiles.removeAll()
+                    }
+                }
+                .disabled(state.device.selectedDeviceFiles.isEmpty)
+
+                toolbarButton("arrow.clockwise", help: "Refresh") {
+                    Task { await state.device.refreshDevice() }
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .frame(minHeight: 28)
+            .background(.bar)
+            Divider()
+        }
+    }
+
+    /// Icon-only toolbar button matching NSToolbar appearance.
+    private func toolbarButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .frame(width: 28, height: 22)
+        }
+        .buttonStyle(.borderless)
+        .help(help)
     }
 
     private var sortFilterMenu: some View {

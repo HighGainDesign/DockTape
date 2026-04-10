@@ -82,8 +82,51 @@ struct DetailPane: View {
         }
     }
 
+    /// Icon-only toolbar button matching NSToolbar appearance.
+    private func toolbarButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .frame(width: 28, height: 22)
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+    }
+
     private func singleRecordingDetail(_ rec: RecordingMetadata) -> some View {
-        VStack(spacing: 0) {
+        let isPlaying = state.playback.playingFile == rec.filename && state.playback.isPlaying
+        let hasTranscript = (state.transcription.statuses[rec.filename] ?? .none) == .done || transcript != nil
+
+        return VStack(spacing: 0) {
+            // Detail toolbar
+            VStack(spacing: 0) {
+                HStack(spacing: 2) {
+                    toolbarButton(isPlaying ? "pause.fill" : "play.fill", help: "Play/Pause") {
+                        state.playRecording(rec)
+                    }
+
+                    toolbarButton("sparkles", help: "Summarize") {
+                        state.contextMenuSummarize(rec)
+                    }
+                    .disabled(!hasTranscript)
+
+                    toolbarButton("pencil", help: "Rename") {
+                        renameText = (rec.filename as NSString).deletingPathExtension
+                        renamingRecording = rec
+                    }
+
+                    toolbarButton("folder", help: "Reveal in Finder") {
+                        state.library.revealInFinder(rec)
+                    }
+
+                    Spacer()
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .frame(minHeight: 28)
+                .background(.bar)
+                Divider()
+            }
+
             // Header with title
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
