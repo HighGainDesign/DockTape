@@ -39,6 +39,14 @@ struct SummaryTabView: View {
             summary = await state.summarization.summaryStore.summary(for: recording.filename)
             hasTranscript = await state.transcription.transcriptStore.hasTranscript(for: recording.filename)
         }
+        .onChange(of: state.summarization.summarizingFile) { old, new in
+            // Reload summary when summarization completes for this recording
+            if old == recording.filename && new != recording.filename {
+                Task {
+                    summary = await state.summarization.summaryStore.summary(for: recording.filename)
+                }
+            }
+        }
     }
 
     // MARK: - No Summary
@@ -173,17 +181,32 @@ struct SummaryTabView: View {
 
                     Spacer()
 
-                    Button {
-                        if summary.templateUsed == "custom" {
+                    Menu {
+                        Button("Meeting") {
+                            selectedTemplate = .meeting
+                            handleSummarize()
+                        }
+                        Button("Call") {
+                            selectedTemplate = .call
+                            handleSummarize()
+                        }
+                        Button("Memo") {
+                            selectedTemplate = .memo
+                            handleSummarize()
+                        }
+                        Button("Recording") {
+                            selectedTemplate = .recording
+                            handleSummarize()
+                        }
+                        Divider()
+                        Button("Custom...") {
                             customPromptText = summary.customPrompt ?? ""
                             showCustomPromptSheet = true
-                        } else {
-                            handleSummarize()
                         }
                     } label: {
                         Label("Re-summarize", systemImage: "arrow.clockwise")
                     }
-                    .buttonStyle(.bordered)
+                    .menuStyle(.borderlessButton)
                     .controlSize(.small)
                 }
 

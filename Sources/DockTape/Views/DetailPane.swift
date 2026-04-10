@@ -5,6 +5,7 @@ import HiDockKit
 struct DetailPane: View {
     @Bindable var state: AppState
     @State private var selectedTab: DetailTab = .info
+    @State private var userHasPickedTab: Bool = false
     @State private var transcript: Transcript?
     @State private var renamingRecording: RecordingMetadata?
     @State private var renameText: String = ""
@@ -119,7 +120,7 @@ struct DetailPane: View {
                 Task {
                     self.transcript = await state.library.transcript(for: filename)
                     syncSegmentTimestamps(for: filename)
-                    selectedTab = transcript != nil ? .transcript : .info
+                    ensureTabAvailable(for: rec)
                 }
             } else {
                 state.playback.setSegmentTimestamps([])
@@ -129,7 +130,15 @@ struct DetailPane: View {
         .task(id: rec.filename) {
             transcript = await state.library.transcript(for: rec.filename)
             syncSegmentTimestamps(for: rec.filename)
-            selectedTab = transcript != nil ? .transcript : .info
+            if !userHasPickedTab {
+                // First load: auto-select best tab
+                selectedTab = transcript != nil ? .transcript : .info
+            } else {
+                ensureTabAvailable(for: rec)
+            }
+        }
+        .onChange(of: selectedTab) { _, _ in
+            userHasPickedTab = true
         }
         .onChange(of: state.transcription.statuses[rec.filename]) { _, newStatus in
             // Reload transcript when transcription completes for this recording
@@ -224,6 +233,14 @@ struct DetailPane: View {
         case .summary:
             SummaryTabView(state: state, recording: rec)
 
+        }
+    }
+
+    /// If the user's current tab isn't available for this recording, fall back.
+    private func ensureTabAvailable(for rec: RecordingMetadata) {
+        let available = availableTabs(for: rec)
+        if !available.contains(selectedTab) {
+            selectedTab = available.last ?? .info
         }
     }
 

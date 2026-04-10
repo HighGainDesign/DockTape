@@ -39,7 +39,7 @@ final class SummarizationState {
             while queueIndex < queue.count {
                 let rec = queue[queueIndex]
                 summarizingFile = rec.filename
-                phase = "Summarizing with \(provider.name)..."
+                phase = "Summarizing with \(model)..."
 
                 do {
                     guard let transcript = await transcriptStore.transcript(for: rec.filename) else {
