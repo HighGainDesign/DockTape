@@ -60,15 +60,6 @@ struct RecordingListPane: View {
         }
         .searchable(text: $searchText, prompt: "Search recordings")
         .modifier(SearchFocusModifier(trigger: $state.library.isSearchFocused))
-        .safeAreaInset(edge: .top) {
-            HStack(spacing: 8) {
-                sortFilterMenu
-                Spacer()
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
-            .background(.bar)
-        }
         .toolbar { recordingToolbar }
         .navigationTitle(recordingTitle)
         .onChange(of: state.selectedView) { _, _ in
@@ -149,15 +140,6 @@ struct RecordingListPane: View {
         }
         .listStyle(.inset(alternatesRowBackgrounds: true))
         .searchable(text: $searchText, prompt: "Search files")
-        .safeAreaInset(edge: .top) {
-            HStack(spacing: 8) {
-                sortFilterMenu
-                Spacer()
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
-            .background(.bar)
-        }
         .toolbar { deviceToolbar }
         .navigationTitle(state.device.model.map { "HiDock \($0.model.rawValue)" } ?? "On Device")
         .onChange(of: state.device.selectedDeviceFiles) { _, newValue in
@@ -288,7 +270,13 @@ struct RecordingListPane: View {
 
     @ToolbarContentBuilder
     private var recordingToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .automatic) {
+        // Sort/filter — left side of toolbar (list-level controls)
+        ToolbarItemGroup(placement: .secondaryAction) {
+            sortFilterMenu
+        }
+
+        // Per-recording actions — right side of toolbar
+        ToolbarItemGroup(placement: .primaryAction) {
             let singleSelected = state.library.selectedRecordings.count == 1
             let singleRec = singleSelected
                 ? state.library.recordings.first(where: { $0.filename == state.library.selectedRecordings.first })
@@ -327,7 +315,11 @@ struct RecordingListPane: View {
 
     @ToolbarContentBuilder
     private var deviceToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .automatic) {
+        ToolbarItemGroup(placement: .secondaryAction) {
+            sortFilterMenu
+        }
+
+        ToolbarItemGroup(placement: .primaryAction) {
             Button {
                 Task {
                     for file in selectedDeviceFiles {

@@ -224,8 +224,15 @@ struct SummaryTabView: View {
         }
     }
 
+    /// Sections whose items are actionable (checkable).
+    private static let actionableSections: Set<String> = [
+        "Action Items", "Commitments", "Follow-ups", "Next Steps"
+    ]
+
     private func sectionView(_ section: Summary.Section) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let isActionable = Self.actionableSections.contains(section.heading)
+
+        return VStack(alignment: .leading, spacing: 8) {
             Text(section.heading)
                 .font(.headline)
 
@@ -238,29 +245,39 @@ struct SummaryTabView: View {
 
             if let items = section.items {
                 ForEach(items) { item in
-                    HStack(alignment: .top, spacing: 8) {
-                        Button {
-                            Task {
-                                try? await state.summarization.summaryStore.toggleItem(
-                                    item.id,
-                                    inSummaryFor: recording.filename
-                                )
-                                self.summary = await state.summarization.summaryStore.summary(
-                                    for: recording.filename
-                                )
+                    if isActionable {
+                        HStack(alignment: .top, spacing: 8) {
+                            Button {
+                                Task {
+                                    try? await state.summarization.summaryStore.toggleItem(
+                                        item.id,
+                                        inSummaryFor: recording.filename
+                                    )
+                                    self.summary = await state.summarization.summaryStore.summary(
+                                        for: recording.filename
+                                    )
+                                }
+                            } label: {
+                                Image(systemName: item.isCompleted
+                                      ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(item.isCompleted ? .green : .secondary)
                             }
-                        } label: {
-                            Image(systemName: item.isCompleted
-                                  ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(item.isCompleted ? .green : .secondary)
-                        }
-                        .buttonStyle(.borderless)
+                            .buttonStyle(.borderless)
 
-                        Text(item.text)
-                            .font(.body)
-                            .strikethrough(item.isCompleted)
-                            .foregroundStyle(item.isCompleted ? .secondary : .primary)
-                            .textSelection(.enabled)
+                            Text(item.text)
+                                .font(.body)
+                                .strikethrough(item.isCompleted)
+                                .foregroundStyle(item.isCompleted ? .secondary : .primary)
+                                .textSelection(.enabled)
+                        }
+                    } else {
+                        HStack(alignment: .top, spacing: 8) {
+                            Text("•")
+                                .foregroundStyle(.secondary)
+                            Text(item.text)
+                                .font(.body)
+                                .textSelection(.enabled)
+                        }
                     }
                 }
             }
