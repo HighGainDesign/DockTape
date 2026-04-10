@@ -4,7 +4,7 @@ Native macOS app for managing HiDock recordings (P1, P1 Mini, H1, H1E).
 Download, transcribe, diarize, and export — entirely on-device. Tested with P1.
 
 **Stack:** Swift 5.10+, SwiftUI, SPM, macOS 14+, Apple Silicon required
-**Status:** MVP complete — library, playback, transcription, diarization, export all wired
+**Status:** Three-pane redesign merged. AI summaries feature in progress (PR #8).
 
 ## Commands
 
@@ -13,7 +13,7 @@ Download, transcribe, diarize, and export — entirely on-device. Tested with P1
 swift build
 swift run hidock help
 
-# Tests (91 unit tests)
+# Tests (130 unit tests; 3 Keychain tests need unlocked keychain)
 swift test
 
 # macOS app (requires: brew install xcodegen)
@@ -40,20 +40,24 @@ Three SPM targets sharing one library:
 | Device | `DeviceManager` actor — high-level queries, file transfer, state via `@Observable DeviceModel` |
 | Storage | `RecordingStore` (filesystem scan), HDA→MP3 conversion, metadata from filenames |
 | Transcription | Parakeet ASR via FluidAudio, Sortformer diarization, pipeline merging, JSON persistence |
+| Summarization | LLM-powered summaries via cloud API (Anthropic/OpenAI/OpenRouter/custom). `Summary` model, `SummaryStore` actor, `LLMProvider` protocol, mode-adaptive `SummaryTemplate` prompts |
 | Sync | `SyncEngine` actor — file sync orchestration; `RecordingPipeline` — end-to-end download→convert→transcribe |
 | Utilities | Filename parsing, duration estimation, endian helpers |
 
 ### Data Flow
 
-USB device → Jensen protocol frames → DeviceManager → SyncEngine → RecordingStore (MP3 on disk) → TranscriptionPipeline → TranscriptStore (JSON on disk)
+USB device → Jensen protocol frames → DeviceManager → SyncEngine → RecordingStore (MP3 on disk) → TranscriptionPipeline → TranscriptStore (JSON on disk) → SummarizationState → LLMProvider → SummaryStore (JSON on disk)
 
 ## Key Design Decisions
 
-1. **Filesystem as source of truth** — no database. MP3 files in `~/Documents/HiDock Recordings/` are canonical. Transcripts stored as `{basename}.transcript.json` alongside.
+1. **Filesystem as source of truth** — no database. MP3 files in `~/Documents/HiDock Recordings/` are canonical. Transcripts as `{basename}.transcript.json`, summaries as `{basename}.summary.json` alongside.
 2. **Actors for concurrency** — DeviceManager, SyncEngine, RecordingPipeline, TranscriptStore, JensenTransport are all actors. No manual locks.
 3. **Protocol-driven USB** — `USBConnectionProtocol` enables full mock testing of the protocol layer without hardware.
 4. **Graceful degradation** — diarization is optional; transcription models download on-demand (FluidAudio caches them).
 5. **Self-contained app** — all logic lives in HiDockKit. No scattered CLI tools or external services.
+6. **Per-pane inline toolbars** — SwiftUI NavigationSplitView can't do per-column NSToolbar. We use `.safeAreaInset(edge: .top)` with `.background(.bar)`. Window toolbar is hidden. Real fix requires AppKit NSSplitViewController + NSTrackingSeparatorToolbarItem.
+7. **LLM API keys in Keychain** — user brings their own key (Anthropic/OpenAI/OpenRouter/custom). Stored via Security.framework, no third-party wrapper. Custom provider reuses OpenAIProvider with configurable baseURL (Ollama, LM Studio, vLLM).
+8. **Three-pane layout** — NavigationSplitView: sidebar (folders/devices), recording list, detail pane with tabbed Info/Transcript/Summary.
 
 ## Code Conventions
 
