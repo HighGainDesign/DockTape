@@ -82,14 +82,14 @@ struct DetailPane: View {
         }
     }
 
-    /// Icon-only toolbar button matching NSToolbar appearance.
-    private func toolbarButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
+    /// Toolbar button with icon + text label.
+    private func toolbarButton(_ systemImage: String, _ label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: systemImage)
-                .frame(width: 28, height: 22)
+            Label(label, systemImage: systemImage)
+                .font(.caption)
         }
         .buttonStyle(.borderless)
-        .help(help)
+        .help(label)
     }
 
     private func singleRecordingDetail(_ rec: RecordingMetadata) -> some View {
@@ -99,26 +99,30 @@ struct DetailPane: View {
         return VStack(spacing: 0) {
             // Detail toolbar
             VStack(spacing: 0) {
-                HStack(spacing: 2) {
-                    toolbarButton(isPlaying ? "pause.fill" : "play.fill", help: "Play/Pause") {
+                HStack(spacing: 12) {
+                    toolbarButton(isPlaying ? "pause.fill" : "play.fill", isPlaying ? "Pause" : "Play") {
                         state.playRecording(rec)
                     }
 
-                    toolbarButton("sparkles", help: "Summarize") {
+                    toolbarButton("text.badge.plus", "Transcribe") {
+                        Task { await state.transcribeRecordings([rec]) }
+                    }
+
+                    toolbarButton("sparkles", "Summarize") {
                         state.contextMenuSummarize(rec)
                     }
                     .disabled(!hasTranscript)
 
-                    toolbarButton("pencil", help: "Rename") {
+                    Spacer()
+
+                    toolbarButton("pencil", "Rename") {
                         renameText = (rec.filename as NSString).deletingPathExtension
                         renamingRecording = rec
                     }
 
-                    toolbarButton("folder", help: "Reveal in Finder") {
+                    toolbarButton("folder", "Reveal") {
                         state.library.revealInFinder(rec)
                     }
-
-                    Spacer()
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)

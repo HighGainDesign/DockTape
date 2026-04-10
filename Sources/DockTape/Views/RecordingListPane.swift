@@ -268,34 +268,13 @@ struct RecordingListPane: View {
 
     // MARK: - Inline Toolbars (per-pane, not window toolbar)
 
-    /// Recordings list toolbar — sort/filter on left, actions on right.
+    /// Recordings list toolbar — sort/filter on left, refresh on right.
     private var recordingListToolbar: some View {
-        let singleSelected = state.library.selectedRecordings.count == 1
-        let singleRec = singleSelected
-            ? state.library.recordings.first(where: { $0.filename == state.library.selectedRecordings.first })
-            : nil
-        let isPlaying = singleRec.map { state.playback.playingFile == $0.filename && state.playback.isPlaying } ?? false
-
-        return VStack(spacing: 0) {
-            HStack(spacing: 2) {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
                 sortFilterMenu
-
                 Spacer()
-
-                toolbarButton(isPlaying ? "pause.fill" : "play.fill", help: "Play/Pause") {
-                    if let rec = singleRec { state.playRecording(rec) }
-                }
-                .disabled(!singleSelected)
-
-                toolbarButton("text.badge.plus", help: "Transcribe") {
-                    let toTranscribe = selectedRecordings.filter {
-                        (state.transcription.statuses[$0.filename] ?? .none) != .done
-                    }
-                    Task { await state.transcribeRecordings(toTranscribe) }
-                }
-                .disabled(state.library.selectedRecordings.isEmpty)
-
-                toolbarButton("arrow.clockwise", help: "Refresh") {
+                toolbarButton("arrow.clockwise", "Refresh") {
                     Task { await state.library.refresh() }
                 }
             }
@@ -310,19 +289,17 @@ struct RecordingListPane: View {
     /// Device list toolbar — sort/filter on left, device actions on right.
     private var deviceListToolbar: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 2) {
+            HStack(spacing: 12) {
                 sortFilterMenu
-
                 Spacer()
-
-                toolbarButton("arrow.down.circle", help: "Download") {
+                toolbarButton("arrow.down.circle", "Download") {
                     Task {
                         for file in selectedDeviceFiles { await state.downloadFile(file) }
                     }
                 }
                 .disabled(state.device.selectedDeviceFiles.isEmpty || state.device.isSyncing)
 
-                toolbarButton("trash", help: "Delete") {
+                toolbarButton("trash", "Delete") {
                     Task {
                         for file in selectedDeviceFiles { await state.deleteFromDevice(file) }
                         state.device.selectedDeviceFiles.removeAll()
@@ -330,7 +307,7 @@ struct RecordingListPane: View {
                 }
                 .disabled(state.device.selectedDeviceFiles.isEmpty)
 
-                toolbarButton("arrow.clockwise", help: "Refresh") {
+                toolbarButton("arrow.clockwise", "Refresh") {
                     Task { await state.device.refreshDevice() }
                 }
             }
@@ -342,14 +319,14 @@ struct RecordingListPane: View {
         }
     }
 
-    /// Icon-only toolbar button matching NSToolbar appearance.
-    private func toolbarButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
+    /// Toolbar button with icon + text label.
+    private func toolbarButton(_ systemImage: String, _ label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: systemImage)
-                .frame(width: 28, height: 22)
+            Label(label, systemImage: systemImage)
+                .font(.caption)
         }
         .buttonStyle(.borderless)
-        .help(help)
+        .help(label)
     }
 
     private var sortFilterMenu: some View {
