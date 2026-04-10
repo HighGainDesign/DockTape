@@ -4,7 +4,7 @@ Native macOS app for managing HiDock recordings (P1, P1 Mini, H1, H1E).
 Download, transcribe, diarize, and export — entirely on-device. Tested with P1.
 
 **Stack:** Swift 5.10+, SwiftUI, SPM, macOS 14+, Apple Silicon required
-**Status:** Three-pane redesign merged. AI summaries feature in progress (PR #8).
+**Status:** Three-pane redesign and AI summaries merged. Playback progress/highlighting deferred (needs AppKit).
 
 ## Commands
 
@@ -13,7 +13,7 @@ Download, transcribe, diarize, and export — entirely on-device. Tested with P1
 swift build
 swift run hidock help
 
-# Tests (130 unit tests; 3 Keychain tests need unlocked keychain)
+# Tests (135 unit tests; 3 Keychain tests need unlocked keychain)
 swift test
 
 # macOS app (requires: brew install xcodegen)
@@ -58,6 +58,9 @@ USB device → Jensen protocol frames → DeviceManager → SyncEngine → Recor
 6. **Per-pane inline toolbars** — SwiftUI NavigationSplitView can't do per-column NSToolbar. We use `.safeAreaInset(edge: .top)` with `.background(.bar)`. Window toolbar is hidden. Real fix requires AppKit NSSplitViewController + NSTrackingSeparatorToolbarItem.
 7. **LLM API keys in Keychain** — user brings their own key (Anthropic/OpenAI/OpenRouter/custom). Stored via Security.framework, no third-party wrapper. Custom provider reuses OpenAIProvider with configurable baseURL (Ollama, LM Studio, vLLM).
 8. **Three-pane layout** — NavigationSplitView: sidebar (folders/devices), recording list, detail pane with tabbed Info/Transcript/Summary.
+9. **Playback progress deferred** — macOS App Nap throttles all timer mechanisms (TimelineView, periodic observers, Timer). Reliable progress tracking requires an AppKit window host. Scrubber and transcript highlighting are intentionally disabled until then.
+10. **"Import" not "Download"** — user-facing label for bringing recordings from device into the library. Internal method names still use `downloadFile`.
+11. **Keychain service** = `KeychainHelper.aiService` (`design.highgain.docktape.ai`). All callers use this constant.
 
 ## Code Conventions
 
