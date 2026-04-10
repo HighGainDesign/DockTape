@@ -83,7 +83,7 @@ struct DetailPane: View {
 
     private func singleRecordingDetail(_ rec: RecordingMetadata) -> some View {
         VStack(spacing: 0) {
-            // Header with title and actions
+            // Header with title
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(rec.displayTitle)
@@ -94,38 +94,7 @@ struct DetailPane: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-
                 Spacer()
-
-                // Action buttons
-                HStack(spacing: 8) {
-                    let isPlaying = state.playback.playingFile == rec.filename && state.playback.isPlaying
-                    Button {
-                        state.playRecording(rec)
-                    } label: {
-                        Label(isPlaying ? "Pause" : "Play",
-                              systemImage: isPlaying ? "pause.fill" : "play.fill")
-                    }
-                    .buttonStyle(.bordered)
-                    .help("Play/Pause")
-
-                    Button {
-                        renameText = (rec.filename as NSString).deletingPathExtension
-                        renamingRecording = rec
-                    } label: {
-                        Label("Rename", systemImage: "pencil")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
-                    Button {
-                        state.library.revealInFinder(rec)
-                    } label: {
-                        Label("Reveal", systemImage: "folder")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
             }
             .padding()
 
@@ -136,6 +105,7 @@ struct DetailPane: View {
                 }
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .padding(.horizontal)
 
             Divider()

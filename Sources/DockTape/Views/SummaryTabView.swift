@@ -9,6 +9,7 @@ struct SummaryTabView: View {
     @AppStorage("aiModel") private var selectedModel: String = "claude-sonnet-4-6"
 
     @State private var summary: Summary?
+    @State private var hasTranscript: Bool = false
     @State private var selectedTemplate: SummaryTemplate
     @State private var showCustomPromptSheet = false
     @State private var customPromptText = ""
@@ -36,6 +37,7 @@ struct SummaryTabView: View {
         }
         .task(id: recording.filename) {
             summary = await state.summarization.summaryStore.summary(for: recording.filename)
+            hasTranscript = await state.transcription.transcriptStore.hasTranscript(for: recording.filename)
         }
     }
 
@@ -52,7 +54,6 @@ struct SummaryTabView: View {
             Text("No Summary")
                 .font(.title3.weight(.medium))
 
-            let hasTranscript = state.transcription.statuses[recording.filename] == .done
             if hasTranscript {
                 HStack(spacing: 12) {
                     Picker("Template", selection: $selectedTemplate) {

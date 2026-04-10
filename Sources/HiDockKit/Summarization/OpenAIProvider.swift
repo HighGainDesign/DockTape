@@ -14,23 +14,40 @@ public struct OpenAIProvider: LLMProvider, Sendable {
         self.session = session
     }
 
+    /// Normalize the base URL: strip trailing /v1 or /v1/ if present, since we add /v1/ ourselves.
+    private var normalizedBaseURL: String {
+        var url = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if url.hasSuffix("/v1") {
+            url = String(url.dropLast(3))
+        }
+        return url
+    }
+
     public func summarize(transcript: String, systemPrompt: String, model: String) async throws -> String {
-        var request = URLRequest(url: URL(string: "\(baseURL)/v1/chat/completions")!)
+        var request = URLRequest(url: URL(string: "\(normalizedBaseURL)/v1/chat/completions")!)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         let body: [String: Any] = [
             "model": model, "max_tokens": 4096,
             "messages": [["role": "system", "content": systemPrompt], ["role": "user", "content": transcript]]
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, _) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let body = String(data: data, encoding: .utf8) ?? "No response body"
+            throw LLMError.apiError("HTTP \(http.statusCode): \(body.prefix(200))")
+        }
         return try Self.extractText(from: data)
     }
 
     public func verifyKey() async throws {
-        var request = URLRequest(url: URL(string: "\(baseURL)/v1/models")!)
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        var request = URLRequest(url: URL(string: "\(normalizedBaseURL)/v1/models")!)
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
         let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode == 401 {
             throw LLMError.apiError("Invalid API key")
