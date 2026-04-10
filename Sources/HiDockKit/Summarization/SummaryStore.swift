@@ -103,9 +103,12 @@ public actor SummaryStore {
         Array(cache.keys)
     }
 
-    /// Re-key a summary after recording rename.
+    /// Re-key a summary after recording rename, moving the file on disk.
     public func rename(from oldMp3: String, to newMp3: String) {
         guard let summary = cache.removeValue(forKey: oldMp3) else { return }
+        let oldURL = fileURL(for: oldMp3)
+        let newURL = fileURL(for: newMp3)
+        try? FileManager.default.moveItem(at: oldURL, to: newURL)
         cache[newMp3] = summary
     }
 

@@ -15,7 +15,7 @@ struct SummaryTabView: View {
     @State private var customPromptText = ""
     @State private var showAPIKeySetup = false
 
-    private let keychainService = "com.docktape.ai"
+    private let keychainService = KeychainHelper.aiService
 
     init(state: AppState, recording: RecordingMetadata) {
         self.state = state

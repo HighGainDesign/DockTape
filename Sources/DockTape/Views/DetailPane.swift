@@ -336,7 +336,8 @@ struct DetailPane: View {
         }
     }
 
-    /// Push segment timestamps to PlaybackState so activeSegmentIndex stays in sync.
+    // TODO: Currently a no-op — setSegmentTimestamps is stubbed out while progress
+    // tracking is disabled. Re-enable when playback progress is fixed (AppKit migration).
     private func syncSegmentTimestamps(for filename: String) {
         if let transcript, state.playback.playingFile == nil || state.playback.playingFile == filename {
             state.playback.setSegmentTimestamps(transcript.segments.map(\.startTime))
@@ -459,22 +460,8 @@ struct DetailPane: View {
 
 struct NowPlayingBar: View {
     @Bindable var state: AppState
-    @State private var isSeeking = false
-    @State private var seekValue: Double = 0
 
     var body: some View {
-        // TimelineView drives playback progress. tick() is called from onChange
-        // (not from the body) to avoid an infinite render loop — mutating
-        // @Observable state during body evaluation causes re-render → re-evaluate → loop.
-        TimelineView(.periodic(from: .now, by: 0.25)) { context in
-            barContent
-                .onChange(of: context.date) { _, _ in
-                    state.playback.tick()
-                }
-        }
-    }
-
-    private var barContent: some View {
         VStack(spacing: 0) {
             Divider()
             HStack(spacing: 12) {
@@ -494,30 +481,7 @@ struct NowPlayingBar: View {
                         .lineLimit(1)
                 }
 
-                Text(formatTime(isSeeking ? seekValue : state.playback.progress))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-
-                Slider(
-                    value: Binding(
-                        get: { isSeeking ? seekValue : state.playback.progress },
-                        set: { seekValue = $0 }
-                    ),
-                    in: 0...max(state.playback.duration, 1)
-                ) { editing in
-                    if editing {
-                        isSeeking = true
-                    } else {
-                        state.playback.seek(to: seekValue)
-                        isSeeking = false
-                    }
-                }
-                .controlSize(.small)
-                .accessibilityLabel("Playback position")
-
-                Text(formatTime(state.playback.duration))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                Spacer()
 
                 Menu {
                     ForEach(PlaybackState.speeds, id: \.self) { speed in
@@ -552,15 +516,6 @@ struct NowPlayingBar: View {
             .padding(.vertical, 8)
             .background(.bar)
         }
-    }
-
-    private func formatTime(_ seconds: Double) -> String {
-        let total = Int(seconds)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let s = total % 60
-        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
-        return String(format: "%d:%02d", m, s)
     }
 
     private func speedLabel(_ rate: Float) -> String {

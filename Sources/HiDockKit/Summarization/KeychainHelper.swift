@@ -5,6 +5,9 @@ import Security
 /// Minimal Keychain wrapper for storing API keys.
 public enum KeychainHelper {
 
+    /// Keychain service name for AI provider API keys.
+    public static let aiService = "design.highgain.docktape.ai"
+
     public static func save(key: String, service: String, account: String) throws {
         let data = Data(key.utf8)
 
@@ -16,7 +19,7 @@ public enum KeychainHelper {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
         ]
 
         let status = SecItemAdd(query as CFDictionary, nil)

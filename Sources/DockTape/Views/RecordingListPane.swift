@@ -321,7 +321,7 @@ struct RecordingListPane: View {
         }
     }
 
-    /// Toolbar button with icon + text label, bordered.
+    /// Toolbar button with icon + text label, matching Sort/Filter style.
     private func toolbarButton(_ systemImage: String, _ label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Label(label, systemImage: systemImage)
@@ -329,6 +329,7 @@ struct RecordingListPane: View {
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
+        .fixedSize()
         .help(label)
     }
 

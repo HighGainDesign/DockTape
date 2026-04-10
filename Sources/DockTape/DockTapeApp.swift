@@ -112,14 +112,6 @@ struct AppCommands: Commands {
             .disabled(state?.device.isConnected != true)
 
             Divider()
-
-            Button("Get Info") {
-                state?.device.showDeviceInfo = true
-            }
-            .keyboardShortcut("i", modifiers: .command)
-            .disabled(state?.device.isConnected != true)
-
-            Divider()
         }
 
         // Playback menu
@@ -192,7 +184,7 @@ struct AppCommands: Commands {
             Button("Device Info...") {
                 state?.device.showDeviceInfo = true
             }
-            .keyboardShortcut("i", modifiers: [.command, .shift])
+            .keyboardShortcut("i", modifiers: .command)
             .disabled(state?.device.isConnected != true)
         }
     }

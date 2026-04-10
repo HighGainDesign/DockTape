@@ -200,7 +200,7 @@ final class AppState {
 
     /// Create an LLM provider from current Settings.
     private func makeSettingsProvider() -> (provider: any LLMProvider, model: String)? {
-        let keychainService = "com.docktape.ai"
+        let keychainService = KeychainHelper.aiService
         let providerName = UserDefaults.standard.string(forKey: "aiProvider") ?? "anthropic"
         let apiKey = KeychainHelper.read(service: keychainService, account: providerName) ?? ""
 

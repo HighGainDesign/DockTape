@@ -18,7 +18,7 @@ struct AISettingsView: View {
     @State private var isVerifying: Bool = false
     @State private var verifyResult: VerifyResult?
 
-    private let keychainService = "com.docktape.ai"
+    private let keychainService = KeychainHelper.aiService
 
     enum VerifyResult {
         case success
