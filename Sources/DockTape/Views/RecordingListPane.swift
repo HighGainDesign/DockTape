@@ -34,7 +34,8 @@ struct RecordingListPane: View {
                         recording: rec,
                         transcriptStatus: state.transcription.statuses[rec.filename] ?? .none,
                         isTranscribing: state.transcription.transcribingFile == rec.filename,
-                        isCurrentlyPlaying: state.playback.playingFile == rec.filename && state.playback.isPlaying
+                        isCurrentlyPlaying: state.playback.playingFile == rec.filename && state.playback.isPlaying,
+                        hasSummary: state.summarization.hasSummary.contains(rec.filename)
                     )
                     .tag(rec.filename)
                     .contextMenu { recordingContextMenu(for: rec) }
@@ -199,10 +200,11 @@ struct RecordingListPane: View {
         Divider()
 
         let hasTranscript = (state.transcription.statuses[rec.filename] ?? .none) == .done
+        let hasSummary = state.summarization.hasSummary.contains(rec.filename)
         Button {
             state.contextMenuSummarize(rec)
         } label: {
-            Label("Summarize", systemImage: "sparkles")
+            Label(hasSummary ? "Re-summarize" : "Summarize", systemImage: "sparkles")
         }
         .disabled(!hasTranscript)
 
@@ -319,13 +321,14 @@ struct RecordingListPane: View {
         }
     }
 
-    /// Toolbar button with icon + text label.
+    /// Toolbar button with icon + text label, bordered.
     private func toolbarButton(_ systemImage: String, _ label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Label(label, systemImage: systemImage)
                 .font(.caption)
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
         .help(label)
     }
 
@@ -495,6 +498,7 @@ struct RecordingRow: View {
     let transcriptStatus: TranscriptStatus
     let isTranscribing: Bool
     let isCurrentlyPlaying: Bool
+    let hasSummary: Bool
 
     var body: some View {
         HStack(spacing: 12) {
@@ -542,6 +546,11 @@ struct RecordingRow: View {
                     ProgressView().controlSize(.small)
                 }
                 transcriptBadge
+                if hasSummary {
+                    Image(systemName: "sparkles")
+                        .font(.caption).foregroundStyle(.purple)
+                        .help("Summarized")
+                }
             }
         }
         .padding(.vertical, 4)

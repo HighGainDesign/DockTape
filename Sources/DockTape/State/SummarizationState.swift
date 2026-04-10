@@ -9,6 +9,8 @@ final class SummarizationState {
     var phase: String = ""
     var queue: [RecordingMetadata] = []
     var queueIndex: Int = 0
+    /// Tracks which recordings have summaries (for synchronous UI checks).
+    var hasSummary: Set<String> = []
 
     let summaryStore: SummaryStore
 
@@ -49,12 +51,12 @@ final class SummarizationState {
                     }
 
                     let transcriptText = transcript.plainText(includeSpeakers: true)
-                    let effectiveTemplate = template == .custom
-                        ? template
-                        : SummaryTemplate.forMode(rec.mode)
-                    let systemPrompt = effectiveTemplate == .custom
-                        ? SummaryTemplate.buildCustomPrompt(customPrompt ?? "")
-                        : effectiveTemplate.systemPrompt
+                    let systemPrompt: String
+                    if template == .custom {
+                        systemPrompt = SummaryTemplate.buildCustomPrompt(customPrompt ?? "")
+                    } else {
+                        systemPrompt = template.systemPrompt
+                    }
 
                     let responseText = try await provider.summarize(
                         transcript: transcriptText,
@@ -69,12 +71,13 @@ final class SummarizationState {
                         recordingFilename: rec.filename,
                         model: model,
                         provider: provider.name.lowercased(),
-                        templateUsed: effectiveTemplate.rawValue,
-                        customPrompt: effectiveTemplate == .custom ? customPrompt : nil,
+                        templateUsed: template.rawValue,
+                        customPrompt: template == .custom ? customPrompt : nil,
                         sections: sections
                     )
 
                     try await summaryStore.save(summary, mp3Filename: rec.filename)
+                    hasSummary.insert(rec.filename)
                     queueIndex += 1
                 } catch is CancellationError {
                     resetState()

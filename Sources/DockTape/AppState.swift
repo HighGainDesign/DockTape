@@ -63,12 +63,16 @@ final class AppState {
         try await summarization.summaryStore.loadAll()
 
         // Populate transcript statuses for recordings that already have transcripts on disk
-        let allTranscripts = await transcription.transcriptStore.allTranscripts()
-        for transcript in allTranscripts {
-            if transcription.statuses[transcript.recordingFilename] == nil {
-                transcription.statuses[transcript.recordingFilename] = .done
+        let transcribedFiles = await transcription.transcriptStore.allTranscribedFilenames()
+        for filename in transcribedFiles {
+            if transcription.statuses[filename] == nil {
+                transcription.statuses[filename] = .done
             }
         }
+
+        // Populate summary existence set
+        let summarizedFiles = await summarization.summaryStore.allSummarizedFilenames()
+        summarization.hasSummary = Set(summarizedFiles)
     }
 
     // MARK: - Cross-cutting actions

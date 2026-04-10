@@ -98,6 +98,11 @@ public actor SummaryStore {
         Array(cache.values)
     }
 
+    /// All MP3 filenames that have summaries.
+    public func allSummarizedFilenames() -> [String] {
+        Array(cache.keys)
+    }
+
     /// Re-key a summary after recording rename.
     public func rename(from oldMp3: String, to newMp3: String) {
         guard let summary = cache.removeValue(forKey: oldMp3) else { return }

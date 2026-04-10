@@ -218,7 +218,6 @@ struct DockTapeApp: App {
         .defaultSize(width: 1100, height: 700)
         .commands {
             AppCommands()
-            CommandGroup(replacing: .newItem) {}
         }
 
         Settings {

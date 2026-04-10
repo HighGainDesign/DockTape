@@ -84,13 +84,14 @@ struct DetailPane: View {
         }
     }
 
-    /// Toolbar button with icon + text label.
+    /// Toolbar button with icon + text label, bordered.
     private func toolbarButton(_ systemImage: String, _ label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Label(label, systemImage: systemImage)
                 .font(.caption)
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
         .help(label)
     }
 
