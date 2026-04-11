@@ -249,33 +249,6 @@ struct SummaryTabView: View {
                     }
 
                     Spacer()
-
-                    Menu {
-                        ForEach(builtInTemplates) { t in
-                            Button(t.name) {
-                                selectedTemplate = t
-                                handleSummarize()
-                            }
-                        }
-                        if !userTemplates.isEmpty {
-                            Divider()
-                            ForEach(userTemplates) { t in
-                                Button(t.name) {
-                                    selectedTemplate = t
-                                    handleSummarize()
-                                }
-                            }
-                        }
-                        Divider()
-                        Button("Custom...") {
-                            customPromptText = summary.customPrompt ?? ""
-                            showCustomPromptSheet = true
-                        }
-                    } label: {
-                        Label("Re-summarize", systemImage: "arrow.clockwise")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .controlSize(.small)
                 }
 
                 Divider()
