@@ -15,6 +15,9 @@ struct SettingsView: View {
             AISettingsView()
                 .tabItem { Label("AI", systemImage: "sparkles") }
 
+            TemplateSettingsView(state: state)
+                .tabItem { Label("Templates", systemImage: "doc.plaintext") }
+
             if let device = state.device.model, let settings = device.settings {
                 deviceSettings(settings)
                     .tabItem { Label("Device", systemImage: "waveform") }

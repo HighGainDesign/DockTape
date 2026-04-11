@@ -25,6 +25,7 @@ final class AppState {
     var playback: PlaybackState
     var transcription: TranscriptionState
     var summarization: SummarizationState
+    var templateStore: TemplateStore
 
     var selectedView: SidebarSelection = .allRecordings
     var selectedDetailTab: DetailPane.DetailTab = .info
@@ -55,6 +56,7 @@ final class AppState {
         self.transcription = TranscriptionState(transcriptStore: transcriptStore)
         let summaryStore = SummaryStore(baseDirectory: store.baseDirectory)
         self.summarization = SummarizationState(summaryStore: summaryStore)
+        self.templateStore = TemplateStore(baseDirectory: store.baseDirectory)
 
         self.autoDeleteAfterDownload = UserDefaults.standard.bool(forKey: "autoDeleteAfterDownload")
         self.autoSyncClock = UserDefaults.standard.object(forKey: "autoSyncClock") as? Bool ?? true
@@ -63,6 +65,8 @@ final class AppState {
     func setup() async throws {
         try await library.setup()
         try await summarization.summaryStore.loadAll()
+        try? await templateStore.load()
+        try? await templateStore.migrateFromUserDefaults(.standard)
 
         // Populate transcript statuses for recordings that already have transcripts on disk
         let transcribedFiles = await transcription.transcriptStore.allTranscribedFilenames()
@@ -183,7 +187,7 @@ final class AppState {
 
     func summarizeRecordings(
         _ recs: [RecordingMetadata],
-        template: SummaryTemplate = .recording,
+        template: Template,
         customPrompt: String? = nil,
         provider: any LLMProvider,
         model: String
@@ -220,26 +224,43 @@ final class AppState {
         return (provider, model)
     }
 
-    /// Summarize from context menu using current Settings provider/model.
+    /// Summarize with the default template for the recording's mode.
     func contextMenuSummarize(_ rec: RecordingMetadata) {
         guard let settings = makeSettingsProvider() else {
             errorMessage = "No API key configured. Go to Settings > AI to add one."
             return
         }
 
-        let template = SummaryTemplate.forMode(rec.mode)
-        summarizeRecordings([rec], template: template, provider: settings.provider, model: settings.model)
+        Task {
+            let template = await templateStore.defaultTemplate(forMode: rec.mode)
+            summarizeRecordings([rec], template: template, provider: settings.provider, model: settings.model)
+        }
+    }
+
+    /// Summarize with a specific template and optional custom prompt.
+    func summarizeWithTemplate(_ rec: RecordingMetadata, template: Template, customPrompt: String? = nil) {
+        guard let settings = makeSettingsProvider() else {
+            errorMessage = "No API key configured. Go to Settings > AI to add one."
+            return
+        }
+        summarizeRecordings([rec], template: template, customPrompt: customPrompt, provider: settings.provider, model: settings.model)
     }
 
     /// Auto-summarize recordings using Settings provider/model/template.
     private func autoSummarizeRecordings(_ recs: [RecordingMetadata]) {
         guard let settings = makeSettingsProvider() else { return }
 
-        let templateName = UserDefaults.standard.string(forKey: "autoSummarizeTemplate") ?? "recording"
-        let template = SummaryTemplate(rawValue: templateName) ?? .recording
-        for rec in recs {
-            let effectiveTemplate = template == .recording ? SummaryTemplate.forMode(rec.mode) : template
-            summarizeRecordings([rec], template: effectiveTemplate, provider: settings.provider, model: settings.model)
+        Task {
+            let templateID = UserDefaults.standard.string(forKey: "autoSummarizeTemplate") ?? "meeting"
+            for rec in recs {
+                let template: Template
+                if let stored = await templateStore.template(forID: templateID) {
+                    template = stored
+                } else {
+                    template = await templateStore.defaultTemplate(forMode: rec.mode)
+                }
+                summarizeRecordings([rec], template: template, provider: settings.provider, model: settings.model)
+            }
         }
     }
 

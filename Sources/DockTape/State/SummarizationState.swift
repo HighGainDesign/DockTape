@@ -22,7 +22,7 @@ final class SummarizationState {
 
     private struct QueueEntry {
         let recording: RecordingMetadata
-        let template: SummaryTemplate
+        let template: Template
         let customPrompt: String?
     }
 
@@ -32,7 +32,7 @@ final class SummarizationState {
 
     func summarize(
         recordings: [RecordingMetadata],
-        template: SummaryTemplate,
+        template: Template,
         customPrompt: String?,
         provider: any LLMProvider,
         model: String,
@@ -65,10 +65,10 @@ final class SummarizationState {
 
                     let transcriptText = transcript.plainText(includeSpeakers: true)
                     let systemPrompt: String
-                    if entry.template == .custom {
-                        systemPrompt = SummaryTemplate.buildCustomPrompt(entry.customPrompt ?? "")
+                    if let customPrompt = entry.customPrompt {
+                        systemPrompt = Template.buildCustomPrompt(customPrompt)
                     } else {
-                        systemPrompt = entry.template.systemPrompt { UserDefaults.standard.string(forKey: $0) }
+                        systemPrompt = entry.template.systemPrompt
                     }
 
                     let responseText = try await provider.summarize(
@@ -79,13 +79,13 @@ final class SummarizationState {
 
                     try Task.checkCancellation()
 
-                    let sections = try SummaryTemplate.parseSections(from: responseText)
+                    let sections = Template.parseSections(from: responseText)
                     let summary = Summary(
                         recordingFilename: rec.filename,
                         model: model,
                         provider: provider.name.lowercased(),
-                        templateUsed: entry.template.rawValue,
-                        customPrompt: entry.template == .custom ? entry.customPrompt : nil,
+                        templateUsed: entry.template.id,
+                        customPrompt: entry.customPrompt,
                         sections: sections
                     )
 

@@ -10,7 +10,8 @@ struct SummaryTabView: View {
 
     @State private var summary: Summary?
     @State private var hasTranscript: Bool = false
-    @State private var selectedTemplate: SummaryTemplate
+    @State private var selectedTemplate: Template?
+    @State private var templates: [Template] = []
     @State private var showCustomPromptSheet = false
     @State private var customPromptText = ""
     @State private var showAPIKeySetup = false
@@ -20,7 +21,6 @@ struct SummaryTabView: View {
     init(state: AppState, recording: RecordingMetadata) {
         self.state = state
         self.recording = recording
-        self._selectedTemplate = State(initialValue: SummaryTemplate.forMode(recording.mode))
     }
 
     var body: some View {
@@ -38,15 +38,43 @@ struct SummaryTabView: View {
         .task(id: recording.filename) {
             summary = await state.summarization.summaryStore.summary(for: recording.filename)
             hasTranscript = await state.transcription.transcriptStore.hasTranscript(for: recording.filename)
+            templates = await state.templateStore.allTemplates()
+            selectedTemplate = await state.templateStore.defaultTemplate(forMode: recording.mode)
+
+            // If re-summarizing, map old template IDs to new ones
+            if let existing = summary {
+                let mapped = mapLegacyTemplateID(existing.templateUsed)
+                if let t = await state.templateStore.template(forID: mapped) {
+                    selectedTemplate = t
+                }
+            }
         }
         .onChange(of: state.summarization.summarizingFile) { old, new in
-            // Reload summary when summarization completes for this recording
             if old == recording.filename && new != recording.filename {
                 Task {
                     summary = await state.summarization.summaryStore.summary(for: recording.filename)
                 }
             }
         }
+    }
+
+    /// Map old SummaryTemplate rawValues to new Template IDs.
+    private func mapLegacyTemplateID(_ id: String) -> String {
+        switch id {
+        case "call": return "consultation"
+        case "recording": return "meeting"
+        default: return id
+        }
+    }
+
+    // MARK: - Built-in / User template split
+
+    private var builtInTemplates: [Template] {
+        templates.filter { $0.isBuiltIn }
+    }
+
+    private var userTemplates: [Template] {
+        templates.filter { !$0.isBuiltIn }
     }
 
     // MARK: - No Summary
@@ -63,24 +91,23 @@ struct SummaryTabView: View {
                 .font(.title3.weight(.medium))
 
             if hasTranscript {
-                HStack(spacing: 12) {
-                    Picker("Template", selection: $selectedTemplate) {
-                        Text("Meeting").tag(SummaryTemplate.meeting)
-                        Text("Call").tag(SummaryTemplate.call)
-                        Text("Memo").tag(SummaryTemplate.memo)
-                        Text("Recording").tag(SummaryTemplate.recording)
-                        Divider()
-                        Text("Custom...").tag(SummaryTemplate.custom)
-                    }
-                    .frame(width: 160)
+                VStack(spacing: 8) {
+                    HStack(spacing: 12) {
+                        templatePicker
 
-                    Button("Summarize") {
-                        handleSummarize()
+                        Button("Summarize") {
+                            handleSummarize()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(selectedTemplate == nil && customPromptText.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
-                    .buttonStyle(.borderedProminent)
+
+                    if let t = selectedTemplate {
+                        templateDescriptionBar(t.description)
+                    }
                 }
                 .onChange(of: selectedTemplate) { _, newValue in
-                    if newValue == .custom {
+                    if newValue == nil {
                         showCustomPromptSheet = true
                     }
                 }
@@ -96,6 +123,41 @@ struct SummaryTabView: View {
         .sheet(isPresented: $showCustomPromptSheet) {
             customPromptSheet
         }
+    }
+
+    private var templatePicker: some View {
+        Picker("Template", selection: $selectedTemplate) {
+            Section("Built-in") {
+                ForEach(builtInTemplates) { t in
+                    Text(t.name).tag(Optional(t))
+                }
+            }
+            if !userTemplates.isEmpty {
+                Section("My Templates") {
+                    ForEach(userTemplates) { t in
+                        Text(t.name).tag(Optional(t))
+                    }
+                }
+            }
+            Divider()
+            Text("Custom prompt...").tag(Template?.none)
+        }
+        .frame(width: 180)
+    }
+
+    private func templateDescriptionBar(_ description: String) -> some View {
+        HStack(spacing: 0) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(Color.accentColor)
+                .frame(width: 3)
+
+            Text(description)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+        }
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
     }
 
     // MARK: - Custom Prompt Sheet
@@ -127,7 +189,10 @@ struct SummaryTabView: View {
                 Spacer()
                 Button("Cancel") {
                     showCustomPromptSheet = false
-                    selectedTemplate = SummaryTemplate.forMode(recording.mode)
+                    // Restore to default template
+                    Task {
+                        selectedTemplate = await state.templateStore.defaultTemplate(forMode: recording.mode)
+                    }
                 }
                 .keyboardShortcut(.cancelAction)
 
@@ -184,34 +249,6 @@ struct SummaryTabView: View {
                     }
 
                     Spacer()
-
-                    Menu {
-                        Button("Meeting") {
-                            selectedTemplate = .meeting
-                            handleSummarize()
-                        }
-                        Button("Call") {
-                            selectedTemplate = .call
-                            handleSummarize()
-                        }
-                        Button("Memo") {
-                            selectedTemplate = .memo
-                            handleSummarize()
-                        }
-                        Button("Recording") {
-                            selectedTemplate = .recording
-                            handleSummarize()
-                        }
-                        Divider()
-                        Button("Custom...") {
-                            customPromptText = summary.customPrompt ?? ""
-                            showCustomPromptSheet = true
-                        }
-                    } label: {
-                        Label("Re-summarize", systemImage: "arrow.clockwise")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .controlSize(.small)
                 }
 
                 Divider()
@@ -276,7 +313,7 @@ struct SummaryTabView: View {
                         }
                     } else {
                         HStack(alignment: .top, spacing: 8) {
-                            Text("•")
+                            Text("\u{2022}")
                                 .foregroundStyle(.secondary)
                             Text(item.text)
                                 .font(.body)
@@ -326,10 +363,27 @@ struct SummaryTabView: View {
         guard let provider = makeLLMProvider(name: providerName, apiKey: apiKey, baseURL: customBaseURL) else { return }
 
         let effectiveModel = providerName == "custom" ? customModel : selectedModel
+
+        // Custom prompt mode (selectedTemplate is nil)
+        if selectedTemplate == nil {
+            // Use a fallback template for the Summary record, but pass customPrompt
+            Task {
+                let fallback = await state.templateStore.defaultTemplate(forMode: recording.mode)
+                state.summarizeRecordings(
+                    [recording],
+                    template: fallback,
+                    customPrompt: customPromptText,
+                    provider: provider,
+                    model: effectiveModel
+                )
+            }
+            return
+        }
+
         state.summarizeRecordings(
             [recording],
-            template: selectedTemplate,
-            customPrompt: selectedTemplate == .custom ? customPromptText : nil,
+            template: selectedTemplate!,
+            customPrompt: nil,
             provider: provider,
             model: effectiveModel
         )

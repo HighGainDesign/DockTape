@@ -9,7 +9,10 @@ struct DetailPane: View {
     @State private var renamingRecording: RecordingMetadata?
     @State private var renameText: String = ""
     @State private var confirmRetranscribe: RecordingMetadata?
-    @State private var confirmResummarize: RecordingMetadata?
+    @State private var userTemplates: [Template] = []
+    @State private var customPromptText: String = ""
+    @State private var showCustomPromptSheet: Bool = false
+    @State private var customPromptRecording: RecordingMetadata?
 
     enum DetailTab: String, CaseIterable {
         case info = "Info"
@@ -28,6 +31,10 @@ struct DetailPane: View {
 
             if state.transcription.transcribingFile != nil {
                 TranscriptionBar(state: state)
+            }
+
+            if state.summarization.isSummarizing {
+                SummarizationBar(state: state)
             }
         }
     }
@@ -114,16 +121,37 @@ struct DetailPane: View {
                         }
                     }
 
-                    toolbarButton("sparkles", "Summarize") {
-                        Task {
-                            let hasSummary = await state.summarization.summaryStore.hasSummary(for: rec.filename)
-                            if hasSummary {
-                                confirmResummarize = rec
-                            } else {
-                                state.contextMenuSummarize(rec)
+                    Menu {
+                        Section("Built-in") {
+                            ForEach(TemplateStore.builtInDefaults) { template in
+                                Button(template.name) {
+                                    state.summarizeWithTemplate(rec, template: template)
+                                }
                             }
                         }
+                        if !userTemplates.isEmpty {
+                            Section("My Templates") {
+                                ForEach(userTemplates) { template in
+                                    Button(template.name) {
+                                        state.summarizeWithTemplate(rec, template: template)
+                                    }
+                                }
+                            }
+                        }
+                        Divider()
+                        Button("Custom prompt...") {
+                            customPromptRecording = rec
+                            customPromptText = ""
+                            showCustomPromptSheet = true
+                        }
+                    } label: {
+                        Label("Summarize", systemImage: "sparkles")
+                            .font(.caption)
                     }
+                    .menuStyle(.borderedButton)
+                    .controlSize(.small)
+                    .fixedSize()
+                    .help("Summarize with template")
                     .disabled(!hasTranscript)
 
                     Spacer()
@@ -192,6 +220,7 @@ struct DetailPane: View {
         }
         .task(id: rec.filename) {
             transcript = await state.library.transcript(for: rec.filename)
+            userTemplates = await state.templateStore.userCreatedTemplates()
             syncSegmentTimestamps(for: rec.filename)
             if !userHasPickedTab {
                 // First load: auto-select best tab
@@ -256,19 +285,42 @@ struct DetailPane: View {
         } message: {
             Text("This recording already has a transcript. Re-transcribing will replace it.")
         }
-        .alert("Re-summarize?", isPresented: Binding(
-            get: { confirmResummarize != nil },
-            set: { if !$0 { confirmResummarize = nil } }
-        )) {
-            Button("Cancel", role: .cancel) { confirmResummarize = nil }
-            Button("Re-summarize") {
-                if let rec = confirmResummarize {
-                    state.contextMenuSummarize(rec)
+        .sheet(isPresented: $showCustomPromptSheet) {
+            VStack(spacing: 16) {
+                Text("Custom Prompt")
+                    .font(.headline)
+                Text("Enter instructions for how to summarize this recording.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $customPromptText)
+                    .font(.body.monospaced())
+                    .frame(minWidth: 400, minHeight: 120)
+                    .border(.separator)
+                HStack {
+                    Button("Cancel") {
+                        showCustomPromptSheet = false
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Summarize") {
+                        if let rec = customPromptRecording {
+                            let customTemplate = Template(
+                                id: "custom",
+                                name: "Custom",
+                                description: "One-shot custom prompt",
+                                promptText: "",
+                                isBuiltIn: false
+                            )
+                            state.summarizeWithTemplate(rec, template: customTemplate, customPrompt: customPromptText)
+                        }
+                        showCustomPromptSheet = false
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(customPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                confirmResummarize = nil
             }
-        } message: {
-            Text("This recording already has a summary. Re-summarizing will replace it.")
+            .padding()
+            .frame(minWidth: 450)
         }
     }
 
@@ -599,5 +651,59 @@ struct TranscriptionBar: View {
         let m = total / 60
         let s = total % 60
         return String(format: "%d:%02d", m, s)
+    }
+}
+
+// MARK: - Summarization Progress Bar
+
+struct SummarizationBar: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 12) {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Summarizing")
+
+                if let file = state.summarization.summarizingFile {
+                    let rec = state.library.recordings.first { $0.filename == file }
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 6) {
+                            Text(state.summarization.phase)
+                                .font(.caption.weight(.medium))
+                            if state.summarization.queueCount > 1 {
+                                Text("\(state.summarization.queueIndex + 1) of \(state.summarization.queueCount)")
+                                    .font(.caption.monospacedDigit())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 1)
+                                    .background(.purple.opacity(0.15))
+                                    .clipShape(Capsule())
+                            }
+                        }
+                        if let rec {
+                            Text(rec.displayTitle)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Spacer()
+
+                Button {
+                    state.summarization.cancel()
+                } label: {
+                    Label("Cancel", systemImage: "xmark.circle.fill")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(.bar)
+        }
     }
 }

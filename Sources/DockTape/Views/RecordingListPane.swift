@@ -201,8 +201,12 @@ struct RecordingListPane: View {
 
         let hasTranscript = (state.transcription.statuses[rec.filename] ?? .none) == .done
         let hasSummary = state.summarization.hasSummary.contains(rec.filename)
-        Button {
-            state.contextMenuSummarize(rec)
+        Menu {
+            ForEach(TemplateStore.builtInDefaults) { template in
+                Button(template.name) {
+                    state.summarizeWithTemplate(rec, template: template)
+                }
+            }
         } label: {
             Label(hasSummary ? "Re-summarize" : "Summarize", systemImage: "sparkles")
         }
