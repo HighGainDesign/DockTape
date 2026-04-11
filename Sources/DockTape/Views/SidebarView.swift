@@ -89,6 +89,16 @@ struct SidebarView: View {
                             return true
                         }
                     }
+
+                    Button {
+                        isCreatingFolder = true
+                        newFolderName = ""
+                    } label: {
+                        Label("New Folder", systemImage: "folder.badge.plus")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("New Folder")
                 }
 
                 if state.device.isConnected, let device = state.device.model {
@@ -131,24 +141,15 @@ struct SidebarView: View {
         } message: {
             Text("Enter a name for the new folder.")
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            Task { await state.refreshAll() }
+        .sheet(isPresented: $state.device.showDeviceInfo) {
+            NavigationStack {
+                DeviceInfoView(state: state)
+            }
         }
     }
 
     private var libraryHeader: some View {
-        HStack {
-            Text("Library")
-            Spacer()
-            Button {
-                isCreatingFolder = true
-                newFolderName = ""
-            } label: {
-                Image(systemName: "plus")
-            }
-            .buttonStyle(.borderless)
-            .help("New Folder")
-        }
+        Text("Library")
     }
 
     private func commitRename(oldName: String) {

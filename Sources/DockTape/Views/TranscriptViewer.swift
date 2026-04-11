@@ -3,6 +3,7 @@ import HiDockKit
 
 struct TranscriptViewer: View {
     let transcript: Transcript
+    var playbackState: PlaybackState?
     var activeSegmentIndex: Int? = nil
     var onSeek: ((TimeInterval) -> Void)?
     var onSaveSpeakerNames: (([String: String]) -> Void)?
@@ -89,9 +90,10 @@ struct TranscriptViewer: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
+                        let currentActive = playbackState?.activeSegmentIndex ?? activeSegmentIndex
                         ForEach(Array(filteredSegments.enumerated()), id: \.element.id) { index, segment in
                             let globalIndex = transcript.segments.firstIndex(where: { $0.id == segment.id })
-                            let isActive = globalIndex != nil && globalIndex == activeSegmentIndex
+                            let isActive = globalIndex != nil && globalIndex == currentActive
 
                             SegmentRow(
                                 segment: segment,
@@ -111,7 +113,7 @@ struct TranscriptViewer: View {
                     }
                     .padding()
                 }
-                .onChange(of: activeSegmentIndex) { _, newIndex in
+                .onChange(of: playbackState?.activeSegmentIndex ?? activeSegmentIndex) { _, newIndex in
                     guard let newIndex, newIndex < transcript.segments.count else { return }
                     let segmentID = transcript.segments[newIndex].id
                     withAnimation(.easeInOut(duration: 0.3)) {
@@ -322,7 +324,7 @@ private struct SegmentRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.vertical, 2)
-        .background(isActive ? Color.accentColor.opacity(0.06) : Color.clear)
+        .background(isActive ? Color.accentColor.opacity(0.15) : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture {
             onSeek?(segment.startTime)

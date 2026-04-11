@@ -1,31 +1,33 @@
 import SwiftUI
 import AVFoundation
 
-/// Simple audio playback state — play, pause, stop, and speed control.
-///
-/// Progress tracking and transcript highlighting are intentionally disabled.
-/// macOS App Nap throttles all timer mechanisms (TimelineView, periodic time
-/// observers, Timer) making reliable progress updates infeasible without a
-/// deeper architectural fix. The scrubber and highlighting will be revisited
-/// in a future release.
 @Observable
 @MainActor
 final class PlaybackState {
     var playingFile: String?
     var isPlaying: Bool = false
     var rate: Float = 1.0
-
-    // Retained for API compatibility but not actively updated.
     var progress: Double = 0
     var duration: Double = 0
     var activeSegmentIndex: Int?
 
-    private var avPlayer: AVPlayer?
+    private(set) var avPlayer: AVPlayer?
     private var endOfPlaybackObserver: NSObjectProtocol?
+    private var timeObserver: Any?
+    private var boundaryObserver: Any?
+    private var appNapActivity: NSObjectProtocol?
+
+    var segmentTimestamps: [(start: Double, end: Double)] = [] {
+        didSet { setupBoundaryObserver() }
+    }
+
+    /// Read current playback position directly from AVPlayer (for TimelineView-driven UI).
+    var currentTime: Double {
+        avPlayer?.currentTime().seconds ?? 0
+    }
 
     static let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
-    /// Start playing a file at the given URL.
     func play(file: String, url: URL) {
         if playingFile == file, avPlayer != nil {
             togglePlayPause()
@@ -43,6 +45,28 @@ final class PlaybackState {
         playingFile = file
         isPlaying = true
 
+        // Load duration
+        Task {
+            if let d = try? await playerItem.asset.load(.duration) {
+                self.duration = d.seconds
+            }
+        }
+
+        // Prevent App Nap during playback
+        appNapActivity = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiated,
+            reason: "Audio playback"
+        )
+
+        // Periodic time observer — caches progress for seek-on-pause, etc.
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.progress = time.seconds
+            }
+        }
+
         // End-of-playback
         endOfPlaybackObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
@@ -55,6 +79,7 @@ final class PlaybackState {
         }
 
         player.rate = rate
+        setupBoundaryObserver()
     }
 
     func togglePlayPause() {
@@ -73,6 +98,18 @@ final class PlaybackState {
             NotificationCenter.default.removeObserver(obs)
             endOfPlaybackObserver = nil
         }
+        if let obs = timeObserver {
+            avPlayer?.removeTimeObserver(obs)
+            timeObserver = nil
+        }
+        if let obs = boundaryObserver {
+            avPlayer?.removeTimeObserver(obs)
+            boundaryObserver = nil
+        }
+        if let activity = appNapActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            appNapActivity = nil
+        }
         avPlayer?.pause()
         avPlayer = nil
         playingFile = nil
@@ -80,11 +117,16 @@ final class PlaybackState {
         progress = 0
         duration = 0
         activeSegmentIndex = nil
+        // segmentTimestamps is managed by the view layer (set when transcript loads)
+        // — don't clear it here, or play() → stop() destroys timestamps before
+        // setupBoundaryObserver() can use them
     }
 
     func seek(to time: Double) {
         let cmTime = CMTime(seconds: time, preferredTimescale: 600)
         avPlayer?.seek(to: cmTime)
+        progress = time
+        updateActiveSegment()
     }
 
     func setRate(_ newRate: Float) {
@@ -92,5 +134,42 @@ final class PlaybackState {
         if let player = avPlayer, isPlaying {
             player.rate = newRate
         }
+    }
+
+    private func setupBoundaryObserver() {
+        // Remove old observer
+        if let obs = boundaryObserver {
+            avPlayer?.removeTimeObserver(obs)
+            boundaryObserver = nil
+        }
+
+        guard let player = avPlayer, !segmentTimestamps.isEmpty else { return }
+
+        let times = segmentTimestamps.map {
+            NSValue(time: CMTime(seconds: $0.start, preferredTimescale: 600))
+        }
+
+        boundaryObserver = player.addBoundaryTimeObserver(
+            forTimes: times, queue: .main
+        ) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.updateActiveSegment()
+            }
+        }
+
+        // Set initial active segment for current position (boundary observer
+        // only fires on future crossings, not retroactively)
+        updateActiveSegment()
+    }
+
+    func updateActiveSegment() {
+        guard !segmentTimestamps.isEmpty else {
+            activeSegmentIndex = nil
+            return
+        }
+        let t = currentTime
+        activeSegmentIndex = segmentTimestamps.lastIndex { t >= $0.start && t < $0.end }
+            ?? segmentTimestamps.lastIndex { t >= $0.start }
+            ?? 0 // Before first segment — highlight it as "up next"
     }
 }

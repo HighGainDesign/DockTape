@@ -7,6 +7,12 @@ enum SidebarSelection: Hashable {
     case device
 }
 
+enum DetailTab: String, CaseIterable {
+    case info = "Info"
+    case transcript = "Transcript"
+    case summary = "Summary"
+}
+
 enum TranscriptStatus {
     case none
     case inProgress
@@ -27,8 +33,9 @@ final class AppState {
     var templateStore: TemplateStore
 
     var selectedView: SidebarSelection = .allRecordings
-    var selectedDetailTab: DetailPane.DetailTab = .info
+    var selectedDetailTab: DetailTab = .info
     var triggerRename: Bool = false
+    var triggerCustomPrompt: Bool = false
     var errorMessage: String?
     var statusMessage: String = "No device connected"
 

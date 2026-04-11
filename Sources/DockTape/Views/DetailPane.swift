@@ -14,12 +14,6 @@ struct DetailPane: View {
     @State private var showCustomPromptSheet: Bool = false
     @State private var customPromptRecording: RecordingMetadata?
 
-    enum DetailTab: String, CaseIterable {
-        case info = "Info"
-        case transcript = "Transcript"
-        case summary = "Summary"
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             detailContent
@@ -36,6 +30,14 @@ struct DetailPane: View {
             if state.summarization.isSummarizing {
                 SummarizationBar(state: state)
             }
+        }
+        .alert("Error", isPresented: Binding(
+            get: { state.errorMessage != nil },
+            set: { if !$0 { state.errorMessage = nil } }
+        )) {
+            Button("Dismiss", role: .cancel) { state.errorMessage = nil }
+        } message: {
+            Text(state.errorMessage ?? "")
         }
     }
 
@@ -65,18 +67,7 @@ struct DetailPane: View {
             MultiSelectSummary(
                 recordings: recs,
                 transcriptionStatuses: state.transcription.statuses,
-                onTranscribe: {
-                    let toTranscribe = recs.filter {
-                        (state.transcription.statuses[$0.filename] ?? .none) != .done
-                    }
-                    Task { await state.transcribeRecordings(toTranscribe) }
-                },
-                onDelete: {
-                    Task {
-                        for rec in recs { await state.deleteLocalRecording(rec) }
-                        state.library.selectedRecordings.removeAll()
-                    }
-                }
+                summaryStatuses: state.summarization.hasSummary
             )
         } else if let filename = state.library.selectedRecording,
                   let rec = state.library.recordings.first(where: { $0.filename == filename }) {
@@ -91,76 +82,7 @@ struct DetailPane: View {
     }
 
     private func singleRecordingDetail(_ rec: RecordingMetadata) -> some View {
-        let isPlaying = state.playback.playingFile == rec.filename && state.playback.isPlaying
-        let hasTranscript = (state.transcription.statuses[rec.filename] ?? .none) == .done || transcript != nil
-
-        return VStack(spacing: 0) {
-            // Detail toolbar
-            VStack(spacing: 0) {
-                HStack(spacing: 12) {
-                    toolbarButton(isPlaying ? "pause.fill" : "play.fill", isPlaying ? "Pause" : "Play") {
-                        state.playRecording(rec)
-                    }
-
-                    toolbarButton("text.badge.plus", "Transcribe") {
-                        if hasTranscript {
-                            confirmRetranscribe = rec
-                        } else {
-                            Task { await state.transcribeRecordings([rec]) }
-                        }
-                    }
-
-                    Menu {
-                        Section("Built-in") {
-                            ForEach(TemplateStore.builtInDefaults) { template in
-                                Button(template.name) {
-                                    state.summarizeWithTemplate(rec, template: template)
-                                }
-                            }
-                        }
-                        if !userTemplates.isEmpty {
-                            Section("My Templates") {
-                                ForEach(userTemplates) { template in
-                                    Button(template.name) {
-                                        state.summarizeWithTemplate(rec, template: template)
-                                    }
-                                }
-                            }
-                        }
-                        Divider()
-                        Button("Custom prompt...") {
-                            customPromptRecording = rec
-                            customPromptText = ""
-                            showCustomPromptSheet = true
-                        }
-                    } label: {
-                        Label("Summarize", systemImage: "sparkles")
-                            .font(.caption)
-                    }
-                    .menuStyle(.borderedButton)
-                    .controlSize(.small)
-                    .fixedSize()
-                    .help("Summarize with template")
-                    .disabled(!hasTranscript)
-
-                    Spacer()
-
-                    toolbarButton("pencil", "Rename") {
-                        renameText = (rec.filename as NSString).deletingPathExtension
-                        renamingRecording = rec
-                    }
-
-                    toolbarButton("folder", "Reveal") {
-                        state.library.revealInFinder(rec)
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .frame(minHeight: 28)
-                .background(.bar)
-                Divider()
-            }
-
+        VStack(spacing: 0) {
             // Header with title
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
@@ -208,6 +130,11 @@ struct DetailPane: View {
         }
         .task(id: rec.filename) {
             transcript = await state.library.transcript(for: rec.filename)
+            if let t = transcript {
+                state.playback.segmentTimestamps = t.segments.map { (start: $0.startTime, end: $0.endTime) }
+            } else {
+                state.playback.segmentTimestamps = []
+            }
             userTemplates = await state.templateStore.userCreatedTemplates()
 
             if !userHasPickedTab {
@@ -234,6 +161,14 @@ struct DetailPane: View {
                 renameText = (rec.filename as NSString).deletingPathExtension
                 renamingRecording = rec
                 state.triggerRename = false
+            }
+        }
+        .onChange(of: state.triggerCustomPrompt) { _, trigger in
+            if trigger, let rec = state.library.recordings.first(where: { $0.filename == state.library.selectedRecording }) {
+                customPromptRecording = rec
+                customPromptText = ""
+                showCustomPromptSheet = true
+                state.triggerCustomPrompt = false
             }
         }
         .alert("Rename Recording", isPresented: Binding(
@@ -325,6 +260,7 @@ struct DetailPane: View {
             if let transcript {
                 TranscriptViewer(
                     transcript: transcript,
+                    playbackState: state.playback,
                     activeSegmentIndex: state.playback.activeSegmentIndex,
                     onSeek: { time in
                         if state.playback.playingFile == rec.filename {
@@ -419,26 +355,6 @@ struct DetailPane: View {
                 .font(.title2.weight(.medium))
             Text("Total size: \(ByteCountFormatter.string(fromByteCount: Int64(totalSize), countStyle: .file))")
                 .foregroundStyle(.secondary)
-            HStack(spacing: 12) {
-                Button {
-                    Task {
-                        for file in files { await state.downloadFile(file) }
-                    }
-                } label: {
-                    Label("Import All", systemImage: "arrow.down.circle")
-                }
-                .buttonStyle(.bordered)
-
-                Button(role: .destructive) {
-                    Task {
-                        for file in files { await state.deleteFromDevice(file) }
-                        state.device.selectedDeviceFiles.removeAll()
-                    }
-                } label: {
-                    Label("Delete All", systemImage: "trash")
-                }
-                .buttonStyle(.bordered)
-            }
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -488,57 +404,98 @@ struct DetailPane: View {
 
 struct NowPlayingBar: View {
     @Bindable var state: AppState
+    @State private var isDragging: Bool = false
+    @State private var dragValue: Double = 0
 
     var body: some View {
         VStack(spacing: 0) {
             Divider()
-            HStack(spacing: 12) {
-                Button {
-                    state.playback.togglePlayPause()
-                } label: {
-                    Image(systemName: state.playback.isPlaying ? "pause.fill" : "play.fill")
-                        .frame(width: 20)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel(state.playback.isPlaying ? "Pause" : "Play")
+            VStack(spacing: 6) {
+                HStack(spacing: 12) {
+                    Button {
+                        state.playback.togglePlayPause()
+                    } label: {
+                        Image(systemName: state.playback.isPlaying ? "pause.fill" : "play.fill")
+                            .frame(width: 20)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel(state.playback.isPlaying ? "Pause" : "Play")
 
-                if let file = state.playback.playingFile {
-                    let rec = state.library.recordings.first { $0.filename == file }
-                    Text(rec?.displayTitle ?? file)
-                        .font(.caption)
-                        .lineLimit(1)
-                }
+                    if let file = state.playback.playingFile {
+                        let rec = state.library.recordings.first { $0.filename == file }
+                        Text(rec?.displayTitle ?? file)
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                    }
 
-                Spacer()
+                    Spacer()
 
-                Menu {
-                    ForEach(PlaybackState.speeds, id: \.self) { speed in
-                        Button {
-                            state.playback.setRate(speed)
-                        } label: {
-                            HStack {
-                                Text(speedLabel(speed))
-                                if state.playback.rate == speed { Image(systemName: "checkmark") }
+                    // Time display driven by TimelineView for smooth updates
+                    TimelineView(.animation(minimumInterval: 1.0 / 10, paused: !state.playback.isPlaying)) { _ in
+                        let currentTime = isDragging ? dragValue : state.playback.currentTime
+                        let duration = state.playback.duration
+
+                        Text("\(formatTime(currentTime)) / \(formatTime(duration))")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Menu {
+                        ForEach(PlaybackState.speeds, id: \.self) { speed in
+                            Button {
+                                state.playback.setRate(speed)
+                            } label: {
+                                HStack {
+                                    Text(speedLabel(speed))
+                                    if state.playback.rate == speed { Image(systemName: "checkmark") }
+                                }
                             }
                         }
+                    } label: {
+                        Text(speedLabel(state.playback.rate))
+                            .font(.caption.monospacedDigit().weight(.medium))
+                            .frame(minWidth: 30)
                     }
-                } label: {
-                    Text(speedLabel(state.playback.rate))
-                        .font(.caption.monospacedDigit().weight(.medium))
-                        .frame(minWidth: 30)
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Playback speed")
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("Playback speed")
 
-                Button {
-                    state.playback.stop()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+                    Button {
+                        state.playback.stop()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Stop playback")
                 }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Stop playback")
+
+                // Scrubber driven by TimelineView for smooth updates
+                if state.playback.duration > 0 {
+                    TimelineView(.animation(minimumInterval: 1.0 / 10, paused: !state.playback.isPlaying)) { _ in
+                        let currentTime = isDragging ? dragValue : state.playback.currentTime
+                        let duration = state.playback.duration
+
+                        Slider(
+                            value: Binding(
+                                get: { currentTime },
+                                set: { newValue in
+                                    isDragging = true
+                                    dragValue = newValue
+                                    state.playback.seek(to: newValue)
+                                }
+                            ),
+                            in: 0...max(duration, 0.01)
+                        )
+                        .controlSize(.mini)
+                        .accessibilityLabel("Playback position")
+                        .accessibilityValue(formatTime(currentTime))
+                    }
+                    .onChange(of: state.playback.isPlaying) { _, isPlaying in
+                        // When playback resumes, stop overriding with drag value
+                        if isPlaying { isDragging = false }
+                    }
+                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
@@ -547,9 +504,17 @@ struct NowPlayingBar: View {
     }
 
     private func speedLabel(_ rate: Float) -> String {
-        if rate == 1.0 { return "1x" }
-        if rate == floor(rate) { return "\(Int(rate))x" }
-        return String(format: "%.2gx", rate)
+        if rate == 1.0 { return "1\u{00D7}" }
+        if rate == floor(rate) { return "\(Int(rate))\u{00D7}" }
+        return String(format: "%.2g\u{00D7}", rate)
+    }
+
+    private func formatTime(_ seconds: Double) -> String {
+        guard seconds.isFinite && seconds >= 0 else { return "0:00" }
+        let total = Int(seconds)
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%d:%02d", m, s)
     }
 }
 

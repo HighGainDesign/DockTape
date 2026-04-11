@@ -11,6 +11,7 @@ final class LibraryState {
     var selectedRecording: String? = nil
     var selectedRecordings: Set<String> = []
     var downloadedFilenames: Set<String> = []
+    var searchText: String = ""
     var isSearchFocused: Bool = false
 
     let store: RecordingStore

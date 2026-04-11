@@ -4,7 +4,6 @@ import HiDockKit
 /// Column 2: Shows recording list or device file list depending on sidebar selection.
 struct RecordingListPane: View {
     @Bindable var state: AppState
-    @State private var searchText = ""
     @AppStorage("librarySortBy") private var sortBy: LibrarySort = .dateNewest
     @AppStorage("libraryFilterMode") private var filterMode: String = ""
     @AppStorage("libraryFilterPeriod") private var filterPeriod: TimePeriod = .anyTime
@@ -22,46 +21,46 @@ struct RecordingListPane: View {
 
     // MARK: - Recordings Content
 
-    @ViewBuilder
     private var recordingsContent: some View {
-        let recs = filteredRecordings
-        List(selection: $state.library.selectedRecordings) {
-            if state.library.recordings.isEmpty {
-                // Empty library — no recordings at all
-            } else {
-                ForEach(recs) { rec in
-                    RecordingRow(
-                        recording: rec,
-                        transcriptStatus: state.transcription.statuses[rec.filename] ?? .none,
-                        isTranscribing: state.transcription.transcribingFile == rec.filename,
-                        isCurrentlyPlaying: state.playback.playingFile == rec.filename && state.playback.isPlaying,
-                        hasSummary: state.summarization.hasSummary.contains(rec.filename)
-                    )
-                    .tag(rec.filename)
-                    .contextMenu { recordingContextMenu(for: rec) }
-                    .draggable(rec.filename)
-                }
-            }
-        }
-        .listStyle(.inset(alternatesRowBackgrounds: true))
-        .overlay {
-            if state.library.recordings.isEmpty {
-                ContentUnavailableView {
-                    Label("No Recordings", systemImage: "waveform.slash")
-                } description: {
-                    if state.device.isConnected {
-                        Text("Download recordings from your device to see them here.")
-                    } else {
-                        Text("Connect your HiDock and download recordings to get started.")
+        VStack(spacing: 0) {
+            let recs = filteredRecordings
+            List(selection: $state.library.selectedRecordings) {
+                if state.library.recordings.isEmpty {
+                    // Empty library — no recordings at all
+                } else {
+                    ForEach(recs) { rec in
+                        RecordingRow(
+                            recording: rec,
+                            transcriptStatus: state.transcription.statuses[rec.filename] ?? .none,
+                            isTranscribing: state.transcription.transcribingFile == rec.filename,
+                            isCurrentlyPlaying: state.playback.playingFile == rec.filename && state.playback.isPlaying,
+                            hasSummary: state.summarization.hasSummary.contains(rec.filename)
+                        )
+                        .tag(rec.filename)
+                        .contextMenu { recordingContextMenu(for: rec) }
+                        .draggable(rec.filename)
                     }
                 }
-            } else if recs.isEmpty {
-                ContentUnavailableView.search(text: searchText)
             }
+            .listStyle(.inset(alternatesRowBackgrounds: true))
+            .overlay {
+                if state.library.recordings.isEmpty {
+                    ContentUnavailableView {
+                        Label("No Recordings", systemImage: "waveform.slash")
+                    } description: {
+                        if state.device.isConnected {
+                            Text("Download recordings from your device to see them here.")
+                        } else {
+                            Text("Connect your HiDock and download recordings to get started.")
+                        }
+                    }
+                } else if recs.isEmpty {
+                    ContentUnavailableView.search(text: state.library.searchText)
+                }
+            }
+            .searchable(text: $state.library.searchText, prompt: "Search recordings")
+            .modifier(SearchFocusModifier(trigger: $state.library.isSearchFocused))
         }
-        .searchable(text: $searchText, prompt: "Search recordings")
-        .modifier(SearchFocusModifier(trigger: $state.library.isSearchFocused))
-        .safeAreaInset(edge: .top, spacing: 0) { recordingListToolbar }
         .navigationTitle(recordingTitle)
         .onChange(of: state.selectedView) { _, _ in
             // Clear selection when switching sidebar sections
@@ -120,28 +119,29 @@ struct RecordingListPane: View {
                 }
             }
         } else if files.isEmpty {
-            ContentUnavailableView.search(text: searchText)
+            ContentUnavailableView.search(text: state.library.searchText)
         } else {
             deviceFileList(files)
         }
     }
 
     private func deviceFileList(_ files: [FileEntry]) -> some View {
-        List(selection: $state.device.selectedDeviceFiles) {
-            ForEach(files) { file in
-                DeviceFileRow(
-                    file: file,
-                    isDownloaded: state.library.isDownloaded(file.filename),
-                    isDownloading: state.device.downloadingFiles.contains(file.filename),
-                    isDeleting: state.device.deletingFiles.contains(file.filename)
-                )
-                .tag(file.filename)
-                .contextMenu { deviceFileContextMenu(for: file) }
+        VStack(spacing: 0) {
+            List(selection: $state.device.selectedDeviceFiles) {
+                ForEach(files) { file in
+                    DeviceFileRow(
+                        file: file,
+                        isDownloaded: state.library.isDownloaded(file.filename),
+                        isDownloading: state.device.downloadingFiles.contains(file.filename),
+                        isDeleting: state.device.deletingFiles.contains(file.filename)
+                    )
+                    .tag(file.filename)
+                    .contextMenu { deviceFileContextMenu(for: file) }
+                }
             }
+            .listStyle(.inset(alternatesRowBackgrounds: true))
+            .searchable(text: $state.library.searchText, prompt: "Search files")
         }
-        .listStyle(.inset(alternatesRowBackgrounds: true))
-        .searchable(text: $searchText, prompt: "Search files")
-        .safeAreaInset(edge: .top, spacing: 0) { deviceListToolbar }
         .navigationTitle(state.device.model.map { "HiDock \($0.model.rawValue)" } ?? "On Device")
         .onChange(of: state.device.selectedDeviceFiles) { _, newValue in
             if newValue.count == 1 {
@@ -278,114 +278,6 @@ struct RecordingListPane: View {
         }
     }
 
-    // MARK: - Inline Toolbars (per-pane, not window toolbar)
-
-    /// Recordings list toolbar — sort/filter on left, refresh on right.
-    private var recordingListToolbar: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                sortFilterMenu
-                Spacer()
-                toolbarButton("arrow.clockwise", "Refresh") {
-                    Task { await state.library.refresh() }
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .frame(minHeight: 28)
-            .background(.bar)
-            Divider()
-        }
-    }
-
-    /// Device list toolbar — sort/filter on left, device actions on right.
-    private var deviceListToolbar: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                sortFilterMenu
-                Spacer()
-                toolbarButton("arrow.down.circle", "Import") {
-                    Task {
-                        for file in selectedDeviceFiles { await state.downloadFile(file) }
-                    }
-                }
-                .disabled(state.device.selectedDeviceFiles.isEmpty || state.device.isSyncing)
-
-                toolbarButton("trash", "Delete") {
-                    Task {
-                        for file in selectedDeviceFiles { await state.deleteFromDevice(file) }
-                        state.device.selectedDeviceFiles.removeAll()
-                    }
-                }
-                .disabled(state.device.selectedDeviceFiles.isEmpty)
-
-                toolbarButton("arrow.clockwise", "Refresh") {
-                    Task { await state.device.refreshDevice() }
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .frame(minHeight: 28)
-            .background(.bar)
-            Divider()
-        }
-    }
-
-    private var sortFilterMenu: some View {
-        HStack(spacing: 12) {
-            Menu {
-                ForEach(LibrarySort.allCases, id: \.self) { sort in
-                    Button {
-                        sortBy = sort
-                    } label: {
-                        HStack {
-                            Text(sort.rawValue)
-                            if sortBy == sort { Image(systemName: "checkmark") }
-                        }
-                    }
-                }
-            } label: {
-                Label("Sort", systemImage: "arrow.up.arrow.down")
-                    .font(.caption)
-            }
-            .menuStyle(.borderedButton)
-            .fixedSize()
-            .controlSize(.small)
-            .help("Sort")
-
-            Menu {
-                Section("Type") {
-                    Button("All") { filterMode = "" }
-                    Button("Recording") { filterMode = "Rec" }
-                    Button("Phone") { filterMode = "Pho" }
-                    Button("Meeting") { filterMode = "Mee" }
-                    Button("WIP") { filterMode = "Wip" }
-                }
-                Section("Date") {
-                    ForEach(TimePeriod.allCases, id: \.self) { period in
-                        Button {
-                            filterPeriod = period
-                        } label: {
-                            HStack {
-                                Text(period.rawValue)
-                                if filterPeriod == period { Image(systemName: "checkmark") }
-                            }
-                        }
-                    }
-                }
-            } label: {
-                let isActive = !filterMode.isEmpty || filterPeriod != .anyTime
-                Label("Filter",
-                      systemImage: isActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
-                    .font(.caption)
-            }
-            .menuStyle(.borderedButton)
-            .fixedSize()
-            .controlSize(.small)
-            .help("Filter")
-        }
-    }
-
     // MARK: - Helpers
 
     private var selectedRecordings: [RecordingMetadata] {
@@ -412,8 +304,8 @@ struct RecordingListPane: View {
         if let startDate = filterPeriod.startDate {
             recs = recs.filter { ($0.recordedAt ?? .distantPast) >= startDate }
         }
-        if !searchText.isEmpty {
-            let query = searchText.lowercased()
+        if !state.library.searchText.isEmpty {
+            let query = state.library.searchText.lowercased()
             recs = recs.filter {
                 $0.filename.lowercased().contains(query) ||
                 $0.displayTitle.lowercased().contains(query)
@@ -447,8 +339,8 @@ struct RecordingListPane: View {
         if let startDate = filterPeriod.startDate {
             result = result.filter { (parsed[$0.filename]?.date ?? .distantPast) >= startDate }
         }
-        if !searchText.isEmpty {
-            let query = searchText.lowercased()
+        if !state.library.searchText.isEmpty {
+            let query = state.library.searchText.lowercased()
             result = result.filter { $0.filename.lowercased().contains(query) }
         }
 

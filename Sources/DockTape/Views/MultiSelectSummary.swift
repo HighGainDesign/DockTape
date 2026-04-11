@@ -5,8 +5,7 @@ import HiDockKit
 struct MultiSelectSummary: View {
     let recordings: [RecordingMetadata]
     let transcriptionStatuses: [String: TranscriptStatus]
-    var onTranscribe: (() -> Void)?
-    var onDelete: (() -> Void)?
+    var summaryStatuses: Set<String> = []
 
     private var totalSize: UInt64 {
         recordings.reduce(0) { $0 + $1.fileSizeBytes }
@@ -20,8 +19,8 @@ struct MultiSelectSummary: View {
         recordings.filter { (transcriptionStatuses[$0.filename] ?? .none) == .done }.count
     }
 
-    private var untranscribedCount: Int {
-        recordings.count - transcribedCount
+    private var summarizedCount: Int {
+        recordings.filter { summaryStatuses.contains($0.filename) }.count
     }
 
     var body: some View {
@@ -49,27 +48,12 @@ struct MultiSelectSummary: View {
                     Text("Transcribed").foregroundStyle(.secondary)
                     Text("\(transcribedCount) of \(recordings.count)")
                 }
+                GridRow {
+                    Text("Summarized").foregroundStyle(.secondary)
+                    Text("\(summarizedCount) of \(recordings.count)")
+                }
             }
             .font(.body)
-
-            // Actions
-            HStack(spacing: 12) {
-                if untranscribedCount > 0 {
-                    Button {
-                        onTranscribe?()
-                    } label: {
-                        Label("Transcribe \(untranscribedCount)", systemImage: "text.badge.plus")
-                    }
-                    .buttonStyle(.bordered)
-                }
-
-                Button(role: .destructive) {
-                    onDelete?()
-                } label: {
-                    Label("Delete All", systemImage: "trash")
-                }
-                .buttonStyle(.bordered)
-            }
 
             Spacer()
         }

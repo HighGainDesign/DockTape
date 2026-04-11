@@ -3,8 +3,8 @@
 Native macOS app for managing HiDock recordings (P1, P1 Mini, H1, H1E).
 Download, transcribe, diarize, and export — entirely on-device. Tested with P1.
 
-**Stack:** Swift 5.10+, SwiftUI, SPM, macOS 14+, Apple Silicon required
-**Status:** Three-pane redesign, AI summaries, and template redesign merged. Playback progress deferred (needs AppKit window host).
+**Stack:** Swift 5.10+, AppKit (NSSplitViewController, NSToolbar) + SwiftUI (hosted views), SPM, macOS 14+, Apple Silicon required
+**Status:** AppKit window host migration complete. Playback progress and transcript highlighting active.
 
 ## Commands
 
@@ -28,7 +28,7 @@ The Xcode project is generated from `project.yml` — never edit `.xcodeproj` di
 Three SPM targets sharing one library:
 
 - **HiDockKit** (library) — all core logic
-- **DockTape** (SwiftUI app) — UI shell, depends on HiDockKit
+- **DockTape** (AppKit + SwiftUI app) — AppKit window shell hosting SwiftUI views, depends on HiDockKit
 - **HiDockCLI** (executable) — CLI, depends on HiDockKit
 
 ### HiDockKit Modules
@@ -55,14 +55,14 @@ USB device → Jensen protocol frames → DeviceManager → SyncEngine → Recor
 3. **Protocol-driven USB** — `USBConnectionProtocol` enables full mock testing of the protocol layer without hardware.
 4. **Graceful degradation** — diarization is optional; transcription models download on-demand (FluidAudio caches them).
 5. **Self-contained app** — all logic lives in HiDockKit. No scattered CLI tools or external services.
-6. **Per-pane inline toolbars** — SwiftUI NavigationSplitView can't do per-column NSToolbar. We use `.safeAreaInset(edge: .top)` with `.background(.bar)`. Window toolbar is hidden. Real fix requires AppKit NSSplitViewController + NSTrackingSeparatorToolbarItem.
+6. **AppKit window host (Notes-style)** — Full AppKit shell: `NSSplitViewController` with three panes (sidebar, content list, detail) + `NSToolbar` with `NSTrackingSeparatorToolbarItem`. Sidebar is full-height into the titlebar. Toolbar spans only the detail pane. SwiftUI views hosted via `NSHostingController`. Context-sensitive toolbar items (library vs. device). Toolbar density toggle via View menu.
 7. **LLM API keys in Keychain** — user brings their own key (Anthropic/OpenAI/OpenRouter/custom). Stored via Security.framework, no third-party wrapper. Custom provider reuses OpenAIProvider with configurable baseURL (Ollama, LM Studio, vLLM).
-8. **Three-pane layout** — NavigationSplitView: sidebar (folders/devices), recording list, detail pane with tabbed Info/Transcript/Summary.
-9. **Playback progress deferred** — macOS App Nap throttles all timer mechanisms (TimelineView, periodic observers, Timer). Reliable progress tracking requires an AppKit window host. Scrubber and transcript highlighting are intentionally disabled until then.
+8. **Three-pane layout** — NSSplitViewController: sidebar (folders/devices), recording list, detail pane with tabbed Info/Transcript/Summary. Two tracking separators: sidebar|list and list|detail. Sort/filter in NSToolbar left of detail zone. All item actions (play, transcribe, summarize, import, delete, refresh) in detail zone toolbar, context-sensitive (library vs. device).
+9. **Playback progress** — `TimelineView(.animation)` reads `AVPlayer.currentTime()` directly each display frame, bypassing `@Observable` coalescing. `addBoundaryTimeObserver` fires at exact segment start times for transcript highlighting. `addPeriodicTimeObserver` (0.25s) only caches `progress` for seek-on-pause. Interactive scrubber in Now Playing bar (pinned to detail pane bottom). Auto-scroll to active segment.
 10. **"Import" not "Download"** — user-facing label for bringing recordings from device into the library. Internal method names still use `downloadFile`.
 11. **Keychain service** = `KeychainHelper.aiService` (`design.highgain.docktape.ai`). All callers use this constant.
 12. **Data-driven templates** — `Template` struct + `TemplateStore` actor replace the old `SummaryTemplate` enum. 7 built-in templates, user-created templates persisted as `.templates.json`, one-shot custom prompts. Smart quote sanitization handles malformed JSON from local LLMs.
-13. **UI consistency** — all toolbar buttons must use the same style (bordered, icon+text, `.controlSize(.small)`). Never ship mismatched button styles.
+13. **UI consistency** — NSToolbar items use `isBordered = true` with SF Symbols and accessibility descriptions. Toolbar density (icon only, text only, icon+text) toggled via View > Toolbar Style.
 
 ## Code Conventions
 
@@ -95,3 +95,5 @@ USB device → Jensen protocol frames → DeviceManager → SyncEngine → Recor
 - Transcription models are large (~1.5 GB) and download on first use — `prepare()` is async
 - Device commands are strictly sequential (one in-flight at a time via JensenTransport actor)
 - `project.yml` is the source for the Xcode project; regenerate after changing targets/settings
+- NSSplitView panes may not be resizable immediately after launch (known intermittent issue); resizing works after interacting with the window
+- `TimelineView` is the only reliable way to drive continuous UI updates from AVPlayer in SwiftUI — `@Observable` property mutation at >2Hz gets coalesced/dropped
