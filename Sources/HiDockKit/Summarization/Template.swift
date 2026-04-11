@@ -40,7 +40,7 @@ public struct Template: Codable, Identifiable, Sendable, Equatable, Hashable {
 
     /// Parse the LLM response into Summary.Section array.
     /// Falls back to a single "Summary" section if JSON parsing fails.
-    public static func parseSections(from response: String) throws -> [Summary.Section] {
+    public static func parseSections(from response: String) -> [Summary.Section] {
         let jsonString = extractJSON(from: response)
 
         if let data = jsonString.data(using: .utf8) {
@@ -86,14 +86,22 @@ public struct Template: Codable, Identifiable, Sendable, Equatable, Hashable {
     Use "items" array for list-style sections (action items, key points). Use "content" for narrative sections. Set items to null when using content.
     """
 
-    /// Extract the JSON object from an LLM response.
+    /// Extract the JSON object from an LLM response, sanitizing smart quotes
+    /// that local models (Gemma, etc.) insert into JSON string values.
     static func extractJSON(from text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let start = trimmed.firstIndex(of: "{"),
               let end = trimmed.lastIndex(of: "}") else {
             return trimmed
         }
-        return String(trimmed[start...end])
+        var json = String(trimmed[start...end])
+        // Replace smart quotes with straight quotes — LLMs often mix them,
+        // producing invalid JSON (e.g., "He said "hello"" with mismatched delimiters)
+        json = json.replacingOccurrences(of: "\u{201C}", with: "\\\"")  // left double smart quote
+        json = json.replacingOccurrences(of: "\u{201D}", with: "\\\"")  // right double smart quote
+        json = json.replacingOccurrences(of: "\u{2018}", with: "'")     // left single smart quote
+        json = json.replacingOccurrences(of: "\u{2019}", with: "'")     // right single smart quote
+        return json
     }
 }
 

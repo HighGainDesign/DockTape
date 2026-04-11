@@ -151,14 +151,14 @@ public actor TemplateStore {
     // MARK: - Mutations
 
     /// Add a new user-created template.
-    public func addUserTemplate(_ template: Template) {
+    public func addUserTemplate(_ template: Template) async {
         userTemplates.append(template)
-        Task { await save() }
+        await save()
     }
 
     /// Update an existing template.
     /// For built-ins, stores as an override. For user templates, replaces in place.
-    public func update(_ template: Template) {
+    public func update(_ template: Template) async {
         if template.isBuiltIn {
             builtInOverrides[template.id] = template
         } else {
@@ -166,19 +166,19 @@ public actor TemplateStore {
                 userTemplates[index] = template
             }
         }
-        Task { await save() }
+        await save()
     }
 
     /// Delete a user-created template by ID. No-op for built-ins.
-    public func delete(id: String) {
+    public func delete(id: String) async {
         userTemplates.removeAll { $0.id == id }
-        Task { await save() }
+        await save()
     }
 
     /// Reset a built-in template to its default prompt, removing any override.
-    public func resetToDefault(id: String) {
+    public func resetToDefault(id: String) async {
         builtInOverrides.removeValue(forKey: id)
-        Task { await save() }
+        await save()
     }
 
     // MARK: - Persistence

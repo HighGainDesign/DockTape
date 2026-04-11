@@ -237,13 +237,13 @@ final class AppState {
         }
     }
 
-    /// Summarize with a specific template.
-    func summarizeWithTemplate(_ rec: RecordingMetadata, template: Template) {
+    /// Summarize with a specific template and optional custom prompt.
+    func summarizeWithTemplate(_ rec: RecordingMetadata, template: Template, customPrompt: String? = nil) {
         guard let settings = makeSettingsProvider() else {
             errorMessage = "No API key configured. Go to Settings > AI to add one."
             return
         }
-        summarizeRecordings([rec], template: template, provider: settings.provider, model: settings.model)
+        summarizeRecordings([rec], template: template, customPrompt: customPrompt, provider: settings.provider, model: settings.model)
     }
 
     /// Auto-summarize recordings using Settings provider/model/template.

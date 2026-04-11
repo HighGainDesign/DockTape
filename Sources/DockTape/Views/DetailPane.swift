@@ -304,15 +304,14 @@ struct DetailPane: View {
                     Spacer()
                     Button("Summarize") {
                         if let rec = customPromptRecording {
-                            let prompt = Template.buildCustomPrompt(customPromptText)
                             let customTemplate = Template(
                                 id: "custom",
                                 name: "Custom",
                                 description: "One-shot custom prompt",
-                                promptText: customPromptText,
+                                promptText: "",
                                 isBuiltIn: false
                             )
-                            state.summarizeWithTemplate(rec, template: customTemplate)
+                            state.summarizeWithTemplate(rec, template: customTemplate, customPrompt: customPromptText)
                         }
                         showCustomPromptSheet = false
                     }

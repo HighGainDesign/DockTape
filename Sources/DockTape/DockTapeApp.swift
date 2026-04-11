@@ -61,8 +61,10 @@ struct AppCommands: Commands {
             Menu("Summarize") {
                 ForEach(TemplateStore.builtInDefaults) { template in
                     Button(template.name) {
-                        guard let state, let rec = selectedRecordings.first else { return }
-                        state.summarizeWithTemplate(rec, template: template)
+                        guard let state else { return }
+                        for rec in selectedRecordings {
+                            state.summarizeWithTemplate(rec, template: template)
+                        }
                     }
                 }
             }

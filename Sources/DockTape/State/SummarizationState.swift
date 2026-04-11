@@ -79,7 +79,7 @@ final class SummarizationState {
 
                     try Task.checkCancellation()
 
-                    let sections = try Template.parseSections(from: responseText)
+                    let sections = Template.parseSections(from: responseText)
                     let summary = Summary(
                         recordingFilename: rec.filename,
                         model: model,

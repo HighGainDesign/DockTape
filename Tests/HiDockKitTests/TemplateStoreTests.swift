@@ -194,7 +194,7 @@ final class TemplateStoreTests: XCTestCase {
             ]
         }
         """
-        let sections = try Template.parseSections(from: json)
+        let sections = Template.parseSections(from: json)
         XCTAssertEqual(sections.count, 2)
         XCTAssertEqual(sections[0].heading, "Summary")
         XCTAssertEqual(sections[1].items?.count, 1)
@@ -208,7 +208,7 @@ final class TemplateStoreTests: XCTestCase {
         ```
         Some trailing text.
         """
-        let sections = try Template.parseSections(from: response)
+        let sections = Template.parseSections(from: response)
         XCTAssertEqual(sections.count, 1)
         XCTAssertEqual(sections[0].content, "Fenced.")
     }
@@ -221,7 +221,7 @@ final class TemplateStoreTests: XCTestCase {
 
     func testParseSectionsFallbackOnInvalidJSON() throws {
         let rawText = "This is just plain text, not JSON."
-        let sections = try Template.parseSections(from: rawText)
+        let sections = Template.parseSections(from: rawText)
         XCTAssertEqual(sections.count, 1)
         XCTAssertEqual(sections[0].heading, "Summary")
         XCTAssertEqual(sections[0].content, rawText)
@@ -237,7 +237,7 @@ final class TemplateStoreTests: XCTestCase {
             ]
         }
         """
-        let sections = try Template.parseSections(from: json)
+        let sections = Template.parseSections(from: json)
         XCTAssertEqual(sections.count, 2)
         XCTAssertEqual(sections[0].heading, "Topics")
         XCTAssertEqual(sections[0].items?.count, 3)
