@@ -109,7 +109,26 @@ private struct TemplateRawSection: Decodable {
     let items: [TemplateRawItem]?
 }
 
+/// Accepts both `{"text": "...", "isCompleted": false}` objects and plain `"string"` values.
+/// LLMs (especially local models like Gemma) sometimes return string arrays instead of objects.
 private struct TemplateRawItem: Decodable {
     let text: String
     let isCompleted: Bool?
+
+    init(from decoder: Decoder) throws {
+        // Try decoding as an object first
+        if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+            self.text = try container.decode(String.self, forKey: .text)
+            self.isCompleted = try container.decodeIfPresent(Bool.self, forKey: .isCompleted)
+        } else {
+            // Fall back to a plain string
+            let container = try decoder.singleValueContainer()
+            self.text = try container.decode(String.self)
+            self.isCompleted = nil
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case text, isCompleted
+    }
 }

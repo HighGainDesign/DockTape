@@ -227,6 +227,24 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertEqual(sections[0].content, rawText)
     }
 
+    func testParseSectionsWithStringItems() throws {
+        // LLMs sometimes return items as plain strings instead of objects
+        let json = """
+        {
+            "sections": [
+                {"heading": "Topics", "content": null, "items": ["Topic A", "Topic B", "Topic C"]},
+                {"heading": "Perspectives", "content": null, "items": ["View 1", "View 2"]}
+            ]
+        }
+        """
+        let sections = try Template.parseSections(from: json)
+        XCTAssertEqual(sections.count, 2)
+        XCTAssertEqual(sections[0].heading, "Topics")
+        XCTAssertEqual(sections[0].items?.count, 3)
+        XCTAssertEqual(sections[0].items?[0].text, "Topic A")
+        XCTAssertFalse(sections[0].items?[0].isCompleted ?? true)
+    }
+
     func testBuildCustomPrompt() {
         let prompt = Template.buildCustomPrompt("Extract customer objections")
         XCTAssertTrue(prompt.contains("Extract customer objections"))
