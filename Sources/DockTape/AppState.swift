@@ -1,6 +1,36 @@
 import SwiftUI
 import HiDockKit
 
+// MARK: - AI Provider Configuration
+
+/// Reads AI provider settings from UserDefaults + Keychain.
+struct AIProviderConfig {
+    let providerName: String
+    let apiKey: String
+    let baseURL: String
+    let model: String
+
+    static func fromUserDefaults(_ defaults: UserDefaults = .standard) -> AIProviderConfig {
+        let name = defaults.string(forKey: "aiProvider") ?? "anthropic"
+        let key = KeychainHelper.read(service: KeychainHelper.aiService, account: name) ?? ""
+        let base = defaults.string(forKey: "aiCustomBaseURL") ?? "http://localhost:11434/v1"
+        let model: String
+        if name == "custom" {
+            model = defaults.string(forKey: "aiCustomModel") ?? ""
+        } else {
+            model = defaults.string(forKey: "aiModel") ?? "claude-sonnet-4-6"
+        }
+        return AIProviderConfig(providerName: name, apiKey: key, baseURL: base, model: model)
+    }
+
+    func makeProvider() -> (any LLMProvider)? {
+        if providerName != "custom" && apiKey.isEmpty { return nil }
+        return makeLLMProvider(name: providerName, apiKey: apiKey, baseURL: baseURL)
+    }
+}
+
+// MARK: - Sidebar & Detail Tab
+
 enum SidebarSelection: Hashable {
     case allRecordings
     case folder(String)
@@ -212,22 +242,9 @@ final class AppState {
 
     /// Create an LLM provider from current Settings.
     private func makeSettingsProvider() -> (provider: any LLMProvider, model: String)? {
-        let providerName = UserDefaults.standard.string(forKey: "aiProvider") ?? "anthropic"
-        let apiKey = KeychainHelper.read(service: KeychainHelper.aiService, account: providerName) ?? ""
-
-        if providerName != "custom" && apiKey.isEmpty { return nil }
-
-        let baseURL = UserDefaults.standard.string(forKey: "aiCustomBaseURL") ?? "http://localhost:11434/v1"
-        guard let provider = makeLLMProvider(name: providerName, apiKey: apiKey, baseURL: baseURL) else { return nil }
-
-        let model: String
-        if providerName == "custom" {
-            model = UserDefaults.standard.string(forKey: "aiCustomModel") ?? ""
-        } else {
-            model = UserDefaults.standard.string(forKey: "aiModel") ?? "claude-sonnet-4-6"
-        }
-
-        return (provider, model)
+        let config = AIProviderConfig.fromUserDefaults()
+        guard let provider = config.makeProvider() else { return nil }
+        return (provider, config.model)
     }
 
     /// Summarize with the default template for the recording's mode.

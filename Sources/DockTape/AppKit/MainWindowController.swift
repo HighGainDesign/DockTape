@@ -44,6 +44,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
 
         super.init(window: window)
         setupToolbar()
+        setupMenuDelegates()
         startObservingState()
     }
 
@@ -51,6 +52,20 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
     required init?(coder: NSCoder) { fatalError() }
 
     deinit { stateObservationTask?.cancel() }
+
+    /// Set this controller as NSMenuDelegate for all "Summarize" submenus in the menu bar.
+    private func setupMenuDelegates() {
+        guard let mainMenu = NSApp.mainMenu else { return }
+        for item in mainMenu.items {
+            if let submenu = item.submenu {
+                for subItem in submenu.items {
+                    if subItem.submenu?.title == "Summarize" {
+                        subItem.submenu?.delegate = self
+                    }
+                }
+            }
+        }
+    }
 
     private func setupToolbar() {
         let toolbar = NSToolbar(identifier: "MainToolbar")
@@ -258,17 +273,45 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
 
     private func buildSummarizeMenu() -> NSMenu {
         let menu = NSMenu(title: "Summarize")
-        for template in TemplateStore.builtInDefaults {
-            let item = NSMenuItem(title: template.name, action: #selector(summarizeWithTemplate(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = template
-            menu.addItem(item)
-        }
-        menu.addItem(.separator())
-        let customItem = NSMenuItem(title: "Custom prompt...", action: #selector(summarizeCustomPrompt(_:)), keyEquivalent: "")
-        customItem.target = self
-        menu.addItem(customItem)
+        menu.delegate = self
         return menu
+    }
+
+    /// Rebuild summarize menu contents on open — picks up user-created templates at runtime.
+    private func populateSummarizeMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        let builtIn = TemplateStore.builtInDefaults
+        if !builtIn.isEmpty {
+            for template in builtIn {
+                let item = NSMenuItem(title: template.name, action: #selector(summarizeWithTemplate(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = template
+                menu.addItem(item)
+            }
+        }
+
+        // Load user templates asynchronously — populate synchronously from cache
+        Task { @MainActor in
+            let userTemplates = await appState.templateStore.userCreatedTemplates()
+            if !userTemplates.isEmpty {
+                menu.addItem(.separator())
+                let header = NSMenuItem(title: "My Templates", action: nil, keyEquivalent: "")
+                header.isEnabled = false
+                menu.addItem(header)
+                for template in userTemplates {
+                    let item = NSMenuItem(title: template.name, action: #selector(self.summarizeWithTemplate(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = template
+                    menu.addItem(item)
+                }
+            }
+
+            menu.addItem(.separator())
+            let customItem = NSMenuItem(title: "Custom prompt...", action: #selector(self.summarizeCustomPrompt(_:)), keyEquivalent: "")
+            customItem.target = self
+            menu.addItem(customItem)
+        }
     }
 
     @objc func summarizeWithTemplate(_ sender: NSMenuItem) {
@@ -408,6 +451,16 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
 // MARK: - Menu Actions (responder chain)
 
 extension MainWindowController: MainMenuActions {}
+
+// MARK: - NSMenuDelegate (dynamic summarize menu)
+
+extension MainWindowController: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu.title == "Summarize" {
+            populateSummarizeMenu(menu)
+        }
+    }
+}
 
 extension MainWindowController: NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {

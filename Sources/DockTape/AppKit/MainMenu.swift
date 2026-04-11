@@ -52,12 +52,8 @@ enum MainMenu {
         let fileMenu = NSMenu(title: "File")
         addItem(fileMenu, "Transcribe", action: #selector(MainMenuActions.transcribe(_:)), key: "t", modifiers: [.command, .shift])
 
+        // Summarize submenu — populated dynamically via NSMenuDelegate on MainWindowController
         let summarizeMenu = NSMenu(title: "Summarize")
-        for template in TemplateStore.builtInDefaults {
-            let item = NSMenuItem(title: template.name, action: #selector(MainMenuActions.summarizeTemplate(_:)), keyEquivalent: "")
-            item.representedObject = template
-            summarizeMenu.addItem(item)
-        }
         let summarizeItem = NSMenuItem(title: "Summarize", action: nil, keyEquivalent: "")
         summarizeItem.submenu = summarizeMenu
         fileMenu.addItem(summarizeItem)
