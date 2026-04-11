@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// High-level async API for communicating with a HiDock device.

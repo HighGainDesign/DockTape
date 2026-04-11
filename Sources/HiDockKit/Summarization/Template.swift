@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// A summary template with a name, description, and LLM prompt.

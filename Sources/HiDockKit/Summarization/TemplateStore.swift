@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// Actor that manages built-in and user-created summary templates.

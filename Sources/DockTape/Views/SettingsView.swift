@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import SwiftUI
 import HiDockKit
 
@@ -89,11 +91,20 @@ struct SettingsView: View {
             Text("HiDock Manager")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            Text("Download, transcribe, and manage recordings from your HiDock device.")
+            Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+            Text("Download, transcribe, diarize, and summarize recordings from your HiDock device — entirely on-device.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 300)
+
+            Spacer().frame(height: 8)
+
+            Text("© 2026 High Gain Design. All rights reserved.")
+                .font(.caption2)
+                .foregroundStyle(.quaternary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

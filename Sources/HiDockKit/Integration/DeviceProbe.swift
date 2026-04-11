@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// Quick integration probe — connects to a real HiDock device and dumps info.

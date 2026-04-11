@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// Errors from the USB transport layer.

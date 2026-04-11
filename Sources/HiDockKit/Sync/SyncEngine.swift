@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// Orchestrates file synchronization between a HiDock device and local storage.

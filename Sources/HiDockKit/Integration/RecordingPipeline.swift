@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// End-to-end pipeline: download files from device → convert HDA → transcribe + diarize.

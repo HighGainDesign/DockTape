@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// Converts .hda files to .mp3 by stripping the proprietary header.

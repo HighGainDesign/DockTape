@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import SwiftUI
 
 /// Toolbar button with icon + text label, bordered style.

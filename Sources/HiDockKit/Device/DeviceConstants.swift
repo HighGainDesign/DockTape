@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// Known HiDock device vendor/product IDs and USB endpoint addresses.

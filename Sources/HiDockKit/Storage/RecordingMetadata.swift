@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// Metadata for a recording, derived entirely from the MP3 file on disk.

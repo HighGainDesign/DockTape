@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 // Tests/HiDockKitTests/SummaryStoreTests.swift
 import XCTest
 @testable import HiDockKit

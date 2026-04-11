@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import SwiftUI
 
 /// Shared color helpers for device battery and storage indicators.

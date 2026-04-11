@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// A complete transcript of a recording, with speaker-labeled segments.

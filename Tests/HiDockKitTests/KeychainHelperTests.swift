@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 // Tests/HiDockKitTests/KeychainHelperTests.swift
 import XCTest
 @testable import HiDockKit

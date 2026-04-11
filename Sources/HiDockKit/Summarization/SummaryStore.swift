@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 // Sources/HiDockKit/Summarization/SummaryStore.swift
 import Foundation
 

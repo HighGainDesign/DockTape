@@ -1,3 +1,5 @@
+// © 2026 High Gain Design. All rights reserved.
+
 import Foundation
 
 /// BCD (Binary-Coded Decimal) encoding/decoding for HiDock time fields.
