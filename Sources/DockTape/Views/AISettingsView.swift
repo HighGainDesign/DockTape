@@ -7,7 +7,7 @@ struct AISettingsView: View {
     @AppStorage("aiCustomBaseURL") private var customBaseURL: String = "http://localhost:11434/v1"
     @AppStorage("aiCustomModel") private var customModel: String = ""
     @AppStorage("autoSummarize") private var autoSummarize: Bool = false
-    @AppStorage("autoSummarizeTemplate") private var autoSummarizeTemplate: String = "recording"
+    @AppStorage("autoSummarizeTemplate") private var autoSummarizeTemplate: String = "meeting"
 
     @State private var apiKey: String = ""
     @State private var isVerifying: Bool = false
@@ -166,11 +166,6 @@ struct AISettingsView: View {
             }
             isVerifying = false
         }
-    }
-
-    /// The effective model name — custom provider uses free-text field.
-    var effectiveModel: String {
-        providerName == "custom" ? customModel : selectedModel
     }
 
     private func fetchCustomModels() {

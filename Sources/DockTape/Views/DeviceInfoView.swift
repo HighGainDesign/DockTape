@@ -109,7 +109,7 @@ struct DeviceInfoView: View {
                 }
 
                 ProgressView(value: card.usagePercent, total: 100)
-                    .tint(storageColor(card.usagePercent))
+                    .tint(DeviceColors.storageColor(card.usagePercent))
             } else {
                 Text("No card inserted")
                     .foregroundStyle(.secondary)
@@ -150,34 +150,14 @@ struct DeviceInfoView: View {
 
     // MARK: - Settings
 
+    @ViewBuilder
     private func settingsSection(_ device: DeviceModel) -> some View {
-        Section("Device Settings") {
-            if let settings = device.settings {
-                Toggle("Auto-record on power", isOn: Binding(
-                    get: { settings.autoRecord },
-                    set: { newValue in
-                        var updated = settings
-                        updated.autoRecord = newValue
-                        Task { await state.updateDeviceSettings(updated) }
-                    }
-                ))
-                Toggle("Auto-play on connect", isOn: Binding(
-                    get: { settings.autoPlay },
-                    set: { newValue in
-                        var updated = settings
-                        updated.autoPlay = newValue
-                        Task { await state.updateDeviceSettings(updated) }
-                    }
-                ))
-                Toggle("Notification sounds", isOn: Binding(
-                    get: { settings.notification },
-                    set: { newValue in
-                        var updated = settings
-                        updated.notification = newValue
-                        Task { await state.updateDeviceSettings(updated) }
-                    }
-                ))
-            } else {
+        if let settings = device.settings {
+            DeviceSettingsSection(settings: settings) { updated in
+                Task { await state.updateDeviceSettings(updated) }
+            }
+        } else {
+            Section("Device Settings") {
                 Text("Not available")
                     .foregroundStyle(.secondary)
             }
@@ -223,7 +203,7 @@ struct DeviceInfoView: View {
             else { "battery.25" }
         }
         Image(systemName: icon)
-            .foregroundStyle(batteryColor(battery.level))
+            .foregroundStyle(DeviceColors.batteryColor(battery.level))
     }
 
     private func batteryStatusText(_ battery: BatteryInfo) -> String {
@@ -231,22 +211,6 @@ struct DeviceInfoView: View {
         case .idle: "On Battery"
         case .charging: "Charging"
         case .full: "Fully Charged"
-        }
-    }
-
-    private func batteryColor(_ level: Int) -> Color {
-        switch level {
-        case 51...100: .green
-        case 21...50: .yellow
-        default: .red
-        }
-    }
-
-    private func storageColor(_ percent: Double) -> Color {
-        switch percent {
-        case 90...: .red
-        case 75..<90: .orange
-        default: .green
         }
     }
 

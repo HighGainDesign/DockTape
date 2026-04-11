@@ -72,31 +72,8 @@ struct SettingsView: View {
 
     private func deviceSettings(_ settings: DeviceSettings) -> some View {
         Form {
-            Section("Device Settings") {
-                Toggle("Auto-record on power", isOn: Binding(
-                    get: { settings.autoRecord },
-                    set: { newValue in
-                        var updated = settings
-                        updated.autoRecord = newValue
-                        Task { await state.updateDeviceSettings(updated) }
-                    }
-                ))
-                Toggle("Auto-play on connect", isOn: Binding(
-                    get: { settings.autoPlay },
-                    set: { newValue in
-                        var updated = settings
-                        updated.autoPlay = newValue
-                        Task { await state.updateDeviceSettings(updated) }
-                    }
-                ))
-                Toggle("Notification sounds", isOn: Binding(
-                    get: { settings.notification },
-                    set: { newValue in
-                        var updated = settings
-                        updated.notification = newValue
-                        Task { await state.updateDeviceSettings(updated) }
-                    }
-                ))
+            DeviceSettingsSection(settings: settings) { updated in
+                Task { await state.updateDeviceSettings(updated) }
             }
         }
         .formStyle(.grouped)

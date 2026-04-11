@@ -35,6 +35,9 @@ struct SummaryTabView: View {
                 noSummaryView
             }
         }
+        .sheet(isPresented: $showCustomPromptSheet) {
+            customPromptSheet
+        }
         .task(id: recording.filename) {
             summary = await state.summarization.summaryStore.summary(for: recording.filename)
             hasTranscript = await state.transcription.transcriptStore.hasTranscript(for: recording.filename)
@@ -58,7 +61,7 @@ struct SummaryTabView: View {
         }
     }
 
-    /// Map old SummaryTemplate rawValues to new Template IDs.
+    /// Map legacy template IDs to current Template IDs.
     private func mapLegacyTemplateID(_ id: String) -> String {
         switch id {
         case "call": return "consultation"
@@ -120,9 +123,6 @@ struct SummaryTabView: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .sheet(isPresented: $showCustomPromptSheet) {
-            customPromptSheet
-        }
     }
 
     private var templatePicker: some View {
@@ -259,9 +259,6 @@ struct SummaryTabView: View {
                 }
             }
             .padding()
-        }
-        .sheet(isPresented: $showCustomPromptSheet) {
-            customPromptSheet
         }
     }
 

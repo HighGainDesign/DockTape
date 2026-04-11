@@ -12,7 +12,8 @@ struct MenuBarView: View {
 
                 if let battery = device.battery {
                     HStack {
-                        Image(systemName: battery.isCharging ? "battery.100.bolt" : "battery.75")
+                        Image(systemName: DeviceColors.batteryIcon(level: battery.level, isCharging: battery.isCharging))
+                            .foregroundStyle(DeviceColors.batteryColor(battery.level))
                         Text("\(battery.level)%")
                     }
                 }
@@ -29,7 +30,11 @@ struct MenuBarView: View {
                     } else {
                         NSApp.activate(ignoringOtherApps: true)
                     }
-                    NSApp.windows.first { $0.isVisible || $0.canBecomeKey }?.makeKeyAndOrderFront(nil)
+                    // Prefer the key window, then the main window, then any orderable window
+                    let window = NSApp.keyWindow
+                        ?? NSApp.mainWindow
+                        ?? NSApp.windows.first { $0.canBecomeKey && !$0.isKind(of: NSPanel.self) }
+                    window?.makeKeyAndOrderFront(nil)
                 }
             } else {
                 Label("No Device", systemImage: "cable.connector.horizontal")

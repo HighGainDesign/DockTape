@@ -331,18 +331,6 @@ struct RecordingListPane: View {
         }
     }
 
-    /// Toolbar button with icon + text label, matching Sort/Filter style.
-    private func toolbarButton(_ systemImage: String, _ label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(label, systemImage: systemImage)
-                .font(.caption)
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .fixedSize()
-        .help(label)
-    }
-
     private var sortFilterMenu: some View {
         HStack(spacing: 12) {
             Menu {
@@ -412,7 +400,8 @@ struct RecordingListPane: View {
         var recs: [RecordingMetadata]
         switch state.selectedView {
         case .folder(let folder):
-            recs = state.library.recordings.filter { $0.folder == folder }
+            // Include recordings in subfolders, matching LibraryState.filteredByFolder
+            recs = state.library.recordings.filter { $0.folder == folder || ($0.folder?.hasPrefix(folder + "/") == true) }
         default:
             recs = state.library.recordings
         }
@@ -724,5 +713,27 @@ struct DeviceFileRow: View {
 
     private var formattedDuration: String {
         DurationCalculator.formatDuration(DurationCalculator.estimateDuration(fileSize: UInt64(file.size)))
+    }
+}
+
+// MARK: - Search Focus Modifier (macOS 15+ conditional)
+
+struct SearchFocusModifier: ViewModifier {
+    @Binding var trigger: Bool
+    @FocusState private var isSearchFocused: Bool
+
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content
+                .searchFocused($isSearchFocused)
+                .onChange(of: trigger) { _, focused in
+                    if focused {
+                        isSearchFocused = true
+                        trigger = false
+                    }
+                }
+        } else {
+            content
+        }
     }
 }

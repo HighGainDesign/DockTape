@@ -187,13 +187,13 @@ struct SidebarView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack {
                             Image(systemName: battery.isCharging ? "bolt.fill" : "battery.100")
-                                .font(.caption2).foregroundStyle(batteryColor(battery.level))
+                                .font(.caption2).foregroundStyle(DeviceColors.batteryColor(battery.level))
                             Text("Battery").font(.caption2).foregroundStyle(.secondary)
                             Spacer()
                             Text("\(battery.level)%").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                         }
                         ProgressView(value: Double(battery.level), total: 100)
-                            .tint(batteryColor(battery.level)).controlSize(.small)
+                            .tint(DeviceColors.batteryColor(battery.level)).controlSize(.small)
                             .accessibilityLabel("Battery level")
                             .accessibilityValue("\(battery.level) percent")
                     }
@@ -203,7 +203,7 @@ struct SidebarView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack {
                             Image(systemName: "internaldrive")
-                                .font(.caption2).foregroundStyle(storageColor(card.usagePercent))
+                                .font(.caption2).foregroundStyle(DeviceColors.storageColor(card.usagePercent))
                             Text("Storage").font(.caption2).foregroundStyle(.secondary)
                             Spacer()
                             let freeGB = Double(card.freeBytes) / 1_073_741_824
@@ -212,7 +212,7 @@ struct SidebarView: View {
                                 .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                         }
                         ProgressView(value: card.usagePercent, total: 100)
-                            .tint(storageColor(card.usagePercent)).controlSize(.small)
+                            .tint(DeviceColors.storageColor(card.usagePercent)).controlSize(.small)
                             .accessibilityLabel("Storage used")
                             .accessibilityValue(String(format: "%.0f percent", card.usagePercent))
                     }
@@ -229,19 +229,4 @@ struct SidebarView: View {
         }
     }
 
-    private func batteryColor(_ level: Int) -> Color {
-        switch level {
-        case 51...100: .green
-        case 21...50: .yellow
-        default: .red
-        }
-    }
-
-    private func storageColor(_ percent: Double) -> Color {
-        switch percent {
-        case 90...: .red
-        case 75..<90: .orange
-        default: .green
-        }
-    }
 }

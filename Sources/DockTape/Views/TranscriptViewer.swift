@@ -264,11 +264,14 @@ struct TranscriptViewer: View {
         NSPasteboard.general.setString(text, forType: .string)
     }
 
-    private func speakerColor(_ sid: String) -> Color {
-        let colors: [Color] = [.blue, .green, .purple, .orange, .pink, .cyan]
-        let hash = abs(sid.utf8.reduce(0) { ($0 &* 31) &+ Int($1) })
-        return colors[hash % colors.count]
-    }
+}
+
+// MARK: - Speaker Color
+
+private func speakerColor(_ sid: String) -> Color {
+    let colors: [Color] = [.blue, .green, .purple, .orange, .pink, .cyan]
+    let hash = abs(sid.utf8.reduce(0) { ($0 &* 31) &+ Int($1) })
+    return colors[hash % colors.count]
 }
 
 // MARK: - Segment Row
@@ -375,9 +378,4 @@ private struct SegmentRow: View {
         return String(format: "%d:%02d", m, s)
     }
 
-    private func speakerColor(_ sid: String) -> Color {
-        let colors: [Color] = [.blue, .green, .purple, .orange, .pink, .cyan]
-        let hash = abs(sid.utf8.reduce(0) { ($0 &* 31) &+ Int($1) })
-        return colors[hash % colors.count]
-    }
 }

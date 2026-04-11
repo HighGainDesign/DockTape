@@ -33,25 +33,3 @@ struct ContentView: View {
         }
     }
 }
-
-// MARK: - Search Focus Modifier (macOS 15+ conditional)
-
-struct SearchFocusModifier: ViewModifier {
-    @Binding var trigger: Bool
-    @FocusState private var isSearchFocused: Bool
-
-    func body(content: Content) -> some View {
-        if #available(macOS 15.0, *) {
-            content
-                .searchFocused($isSearchFocused)
-                .onChange(of: trigger) { _, focused in
-                    if focused {
-                        isSearchFocused = true
-                        trigger = false
-                    }
-                }
-        } else {
-            content
-        }
-    }
-}

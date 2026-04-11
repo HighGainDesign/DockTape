@@ -90,17 +90,6 @@ struct DetailPane: View {
         }
     }
 
-    /// Toolbar button with icon + text label, bordered.
-    private func toolbarButton(_ systemImage: String, _ label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(label, systemImage: systemImage)
-                .font(.caption)
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .help(label)
-    }
-
     private func singleRecordingDetail(_ rec: RecordingMetadata) -> some View {
         let isPlaying = state.playback.playingFile == rec.filename && state.playback.isPlaying
         let hasTranscript = (state.transcription.statuses[rec.filename] ?? .none) == .done || transcript != nil
