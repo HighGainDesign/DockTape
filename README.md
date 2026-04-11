@@ -11,7 +11,7 @@ Download, transcribe, diarize, and manage recordings entirely on-device. No clou
 - **Import recordings** — import from device with auto HDA-to-MP3 conversion
 - **Local transcription** — speech-to-text using Parakeet ASR via [FluidAudio](https://github.com/FluidInference/FluidAudio), runs on Apple Silicon
 - **Speaker diarization** — identify and label different speakers using Sortformer via FluidAudio
-- **AI summaries** — summarize transcripts via Anthropic, OpenAI, OpenRouter, or local models (Ollama, LM Studio). Mode-adaptive templates, editable prompts, action item checkboxes
+- **AI summaries** — summarize transcripts via Anthropic, OpenAI, OpenRouter, or local models (Ollama, LM Studio). 7 built-in templates (Meeting, Lecture, Interview, Memo, Discussion, Consultation, Coaching/Counseling), custom templates, action item checkboxes
 - **Multiple export formats** — plain text, SRT subtitles, JSONL, JSON
 - **Audio playback** — built-in player with variable speed (0.5x–3x)
 - **Library management** — folders, search, sort, filter by recording type and date

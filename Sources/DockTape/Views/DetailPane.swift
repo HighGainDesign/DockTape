@@ -210,18 +210,17 @@ struct DetailPane: View {
             if let filename = newFilename {
                 Task {
                     self.transcript = await state.library.transcript(for: filename)
-                    syncSegmentTimestamps(for: filename)
+
                     ensureTabAvailable(for: rec)
                 }
             } else {
-                state.playback.setSegmentTimestamps([])
                 state.selectedDetailTab = .info
             }
         }
         .task(id: rec.filename) {
             transcript = await state.library.transcript(for: rec.filename)
             userTemplates = await state.templateStore.userCreatedTemplates()
-            syncSegmentTimestamps(for: rec.filename)
+
             if !userHasPickedTab {
                 // First load: auto-select best tab
                 state.selectedDetailTab = transcript != nil ? .transcript : .info
@@ -237,16 +236,8 @@ struct DetailPane: View {
             if newStatus == .done {
                 Task {
                     self.transcript = await state.library.transcript(for: rec.filename)
-                    syncSegmentTimestamps(for: rec.filename)
+        
                 }
-            }
-        }
-        .onChange(of: state.playback.playingFile) { _, newFile in
-            // Sync timestamps when playback starts/stops for this recording
-            if newFile == rec.filename {
-                syncSegmentTimestamps(for: rec.filename)
-            } else {
-                state.playback.setSegmentTimestamps([])
             }
         }
         .onChange(of: state.triggerRename) { _, trigger in
@@ -391,16 +382,6 @@ struct DetailPane: View {
         let available = availableTabs(for: rec)
         if !available.contains(state.selectedDetailTab) {
             state.selectedDetailTab = available.last ?? .info
-        }
-    }
-
-    // TODO: Currently a no-op — setSegmentTimestamps is stubbed out while progress
-    // tracking is disabled. Re-enable when playback progress is fixed (AppKit migration).
-    private func syncSegmentTimestamps(for filename: String) {
-        if let transcript, state.playback.playingFile == nil || state.playback.playingFile == filename {
-            state.playback.setSegmentTimestamps(transcript.segments.map(\.startTime))
-        } else {
-            state.playback.setSegmentTimestamps([])
         }
     }
 

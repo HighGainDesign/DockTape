@@ -4,7 +4,7 @@ Native macOS app for managing HiDock recordings (P1, P1 Mini, H1, H1E).
 Download, transcribe, diarize, and export — entirely on-device. Tested with P1.
 
 **Stack:** Swift 5.10+, SwiftUI, SPM, macOS 14+, Apple Silicon required
-**Status:** Three-pane redesign and AI summaries merged. Playback progress/highlighting deferred (needs AppKit).
+**Status:** Three-pane redesign, AI summaries, and template redesign merged. Playback progress deferred (needs AppKit window host).
 
 ## Commands
 
@@ -13,7 +13,7 @@ Download, transcribe, diarize, and export — entirely on-device. Tested with P1
 swift build
 swift run hidock help
 
-# Tests (135 unit tests; 3 Keychain tests need unlocked keychain)
+# Tests (145 unit tests; 3 Keychain tests need unlocked keychain)
 swift test
 
 # macOS app (requires: brew install xcodegen)
@@ -40,7 +40,7 @@ Three SPM targets sharing one library:
 | Device | `DeviceManager` actor — high-level queries, file transfer, state via `@Observable DeviceModel` |
 | Storage | `RecordingStore` (filesystem scan), HDA→MP3 conversion, metadata from filenames |
 | Transcription | Parakeet ASR via FluidAudio, Sortformer diarization, pipeline merging, JSON persistence |
-| Summarization | LLM-powered summaries via cloud API (Anthropic/OpenAI/OpenRouter/custom). `Summary` model, `SummaryStore` actor, `LLMProvider` protocol, mode-adaptive `SummaryTemplate` prompts |
+| Summarization | LLM-powered summaries via cloud API (Anthropic/OpenAI/OpenRouter/custom). `Summary` model, `SummaryStore` actor, `LLMProvider` protocol, `Template` struct, `TemplateStore` actor (7 built-in + user-created templates) |
 | Sync | `SyncEngine` actor — file sync orchestration; `RecordingPipeline` — end-to-end download→convert→transcribe |
 | Utilities | Filename parsing, duration estimation, endian helpers |
 
@@ -61,6 +61,8 @@ USB device → Jensen protocol frames → DeviceManager → SyncEngine → Recor
 9. **Playback progress deferred** — macOS App Nap throttles all timer mechanisms (TimelineView, periodic observers, Timer). Reliable progress tracking requires an AppKit window host. Scrubber and transcript highlighting are intentionally disabled until then.
 10. **"Import" not "Download"** — user-facing label for bringing recordings from device into the library. Internal method names still use `downloadFile`.
 11. **Keychain service** = `KeychainHelper.aiService` (`design.highgain.docktape.ai`). All callers use this constant.
+12. **Data-driven templates** — `Template` struct + `TemplateStore` actor replace the old `SummaryTemplate` enum. 7 built-in templates, user-created templates persisted as `.templates.json`, one-shot custom prompts. Smart quote sanitization handles malformed JSON from local LLMs.
+13. **UI consistency** — all toolbar buttons must use the same style (bordered, icon+text, `.controlSize(.small)`). Never ship mismatched button styles.
 
 ## Code Conventions
 

@@ -25,9 +25,6 @@ final class PlaybackState {
 
     static let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
-    /// Accept segment timestamps (no-op until highlighting is re-enabled).
-    func setSegmentTimestamps(_ timestamps: [TimeInterval]) {}
-
     /// Start playing a file at the given URL.
     func play(file: String, url: URL) {
         if playingFile == file, avPlayer != nil {
