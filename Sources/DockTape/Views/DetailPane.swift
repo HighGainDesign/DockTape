@@ -9,6 +9,10 @@ struct DetailPane: View {
     @State private var renamingRecording: RecordingMetadata?
     @State private var renameText: String = ""
     @State private var confirmRetranscribe: RecordingMetadata?
+    @State private var userTemplates: [Template] = []
+    @State private var customPromptText: String = ""
+    @State private var showCustomPromptSheet: Bool = false
+    @State private var customPromptRecording: RecordingMetadata?
 
     enum DetailTab: String, CaseIterable {
         case info = "Info"
@@ -118,10 +122,27 @@ struct DetailPane: View {
                     }
 
                     Menu {
-                        ForEach(TemplateStore.builtInDefaults) { template in
-                            Button(template.name) {
-                                state.summarizeWithTemplate(rec, template: template)
+                        Section("Built-in") {
+                            ForEach(TemplateStore.builtInDefaults) { template in
+                                Button(template.name) {
+                                    state.summarizeWithTemplate(rec, template: template)
+                                }
                             }
+                        }
+                        if !userTemplates.isEmpty {
+                            Section("My Templates") {
+                                ForEach(userTemplates) { template in
+                                    Button(template.name) {
+                                        state.summarizeWithTemplate(rec, template: template)
+                                    }
+                                }
+                            }
+                        }
+                        Divider()
+                        Button("Custom prompt...") {
+                            customPromptRecording = rec
+                            customPromptText = ""
+                            showCustomPromptSheet = true
                         }
                     } label: {
                         Label("Summarize", systemImage: "sparkles")
@@ -199,6 +220,7 @@ struct DetailPane: View {
         }
         .task(id: rec.filename) {
             transcript = await state.library.transcript(for: rec.filename)
+            userTemplates = await state.templateStore.userCreatedTemplates()
             syncSegmentTimestamps(for: rec.filename)
             if !userHasPickedTab {
                 // First load: auto-select best tab
@@ -262,6 +284,44 @@ struct DetailPane: View {
             }
         } message: {
             Text("This recording already has a transcript. Re-transcribing will replace it.")
+        }
+        .sheet(isPresented: $showCustomPromptSheet) {
+            VStack(spacing: 16) {
+                Text("Custom Prompt")
+                    .font(.headline)
+                Text("Enter instructions for how to summarize this recording.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $customPromptText)
+                    .font(.body.monospaced())
+                    .frame(minWidth: 400, minHeight: 120)
+                    .border(.separator)
+                HStack {
+                    Button("Cancel") {
+                        showCustomPromptSheet = false
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Summarize") {
+                        if let rec = customPromptRecording {
+                            let prompt = Template.buildCustomPrompt(customPromptText)
+                            let customTemplate = Template(
+                                id: "custom",
+                                name: "Custom",
+                                description: "One-shot custom prompt",
+                                promptText: customPromptText,
+                                isBuiltIn: false
+                            )
+                            state.summarizeWithTemplate(rec, template: customTemplate)
+                        }
+                        showCustomPromptSheet = false
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(customPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding()
+            .frame(minWidth: 450)
         }
     }
 
