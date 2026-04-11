@@ -39,24 +39,23 @@ public struct Template: Codable, Identifiable, Sendable, Equatable, Hashable {
     }
 
     /// Parse the LLM response into Summary.Section array.
-    /// Falls back to a single "Summary" section if JSON parsing fails.
+    /// Sanitizes smart quotes first (local models mix them with straight quotes),
+    /// then tries JSON decode, falls back to raw text.
     public static func parseSections(from response: String) -> [Summary.Section] {
-        let jsonString = extractJSON(from: response)
+        // Sanitize BEFORE extracting JSON — smart quotes can appear as JSON delimiters
+        let sanitized = sanitizeSmartQuotes(response)
+        let jsonString = extractJSON(from: sanitized)
 
-        if let data = jsonString.data(using: .utf8) {
-            do {
-                let parsed = try JSONDecoder().decode(TemplateSectionsResponse.self, from: data)
-                return parsed.sections.map { raw in
-                    Summary.Section(
-                        heading: raw.heading,
-                        content: raw.content ?? "",
-                        items: raw.items?.map { item in
-                            Summary.Item(text: item.text, isCompleted: item.isCompleted ?? false)
-                        }
-                    )
-                }
-            } catch {
-                // Fall through to fallback
+        if let data = jsonString.data(using: .utf8),
+           let parsed = try? JSONDecoder().decode(TemplateSectionsResponse.self, from: data) {
+            return parsed.sections.map { raw in
+                Summary.Section(
+                    heading: raw.heading,
+                    content: raw.content ?? "",
+                    items: raw.items?.map { item in
+                        Summary.Item(text: item.text, isCompleted: item.isCompleted ?? false)
+                    }
+                )
             }
         }
 
@@ -87,21 +86,88 @@ public struct Template: Codable, Identifiable, Sendable, Equatable, Hashable {
     """
 
     /// Extract the JSON object from an LLM response, sanitizing smart quotes
-    /// that local models (Gemma, etc.) insert into JSON string values.
+    /// that local models (Gemma, etc.) use as JSON delimiters.
     static func extractJSON(from text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let start = trimmed.firstIndex(of: "{"),
               let end = trimmed.lastIndex(of: "}") else {
-            return trimmed
+            // Smart quote might be used as opening brace context — try with sanitized text
+            let sanitized = sanitizeSmartQuotes(trimmed)
+            guard let s2 = sanitized.firstIndex(of: "{"),
+                  let e2 = sanitized.lastIndex(of: "}") else { return trimmed }
+            return String(sanitized[s2...e2])
         }
-        var json = String(trimmed[start...end])
-        // Replace smart quotes with straight quotes — LLMs often mix them,
-        // producing invalid JSON (e.g., "He said "hello"" with mismatched delimiters)
-        json = json.replacingOccurrences(of: "\u{201C}", with: "\\\"")  // left double smart quote
-        json = json.replacingOccurrences(of: "\u{201D}", with: "\\\"")  // right double smart quote
-        json = json.replacingOccurrences(of: "\u{2018}", with: "'")     // left single smart quote
-        json = json.replacingOccurrences(of: "\u{2019}", with: "'")     // right single smart quote
-        return json
+        return sanitizeSmartQuotes(String(trimmed[start...end]))
+    }
+
+    /// Normalize all quote-like characters to straight ASCII quotes.
+    /// Smart double quotes become straight double quotes, smart singles become apostrophes.
+    /// After normalization, any unescaped inner quotes within JSON strings are escaped.
+    private static func sanitizeSmartQuotes(_ text: String) -> String {
+        var result = text
+        // Replace smart quotes with their straight equivalents
+        result = result.replacingOccurrences(of: "\u{201C}", with: "\"")
+        result = result.replacingOccurrences(of: "\u{201D}", with: "\"")
+        result = result.replacingOccurrences(of: "\u{2018}", with: "'")
+        result = result.replacingOccurrences(of: "\u{2019}", with: "'")
+
+        // Now fix doubled straight quotes that result from inner quotes
+        // colliding with delimiters. A sequence like "" inside a JSON array
+        // element means an inner quote bumped into the delimiter.
+        // Strategy: try parsing as-is; if it fails, escape inner quotes.
+        if let data = result.data(using: .utf8),
+           let _ = try? JSONSerialization.jsonObject(with: data) {
+            return result  // Already valid JSON
+        }
+
+        // Escape inner double quotes: within items arrays, strings often have
+        // unescaped quotes from the LLM. Replace sequences where a quote follows
+        // a non-delimiter character (not : , [ { whitespace) with an escaped quote.
+        var chars = Array(result)
+        var fixed: [Character] = []
+        var inString = false
+        var i = 0
+
+        while i < chars.count {
+            let ch = chars[i]
+
+            if ch == "\\" && inString && i + 1 < chars.count {
+                // Escaped character — pass through both
+                fixed.append(ch)
+                fixed.append(chars[i + 1])
+                i += 2
+                continue
+            }
+
+            if ch == "\"" {
+                if !inString {
+                    inString = true
+                    fixed.append(ch)
+                } else {
+                    // Is this the end of the string, or an unescaped inner quote?
+                    // Look ahead: if next non-whitespace is , ] } : it's a delimiter
+                    var j = i + 1
+                    while j < chars.count && (chars[j] == " " || chars[j] == "\n" || chars[j] == "\r" || chars[j] == "\t") {
+                        j += 1
+                    }
+                    let nextSignificant: Character? = j < chars.count ? chars[j] : nil
+                    if nextSignificant == "," || nextSignificant == "]" || nextSignificant == "}" || nextSignificant == ":" || nextSignificant == nil {
+                        // This is a string terminator
+                        inString = false
+                        fixed.append(ch)
+                    } else {
+                        // This is an inner quote — escape it
+                        fixed.append("\\")
+                        fixed.append(ch)
+                    }
+                }
+            } else {
+                fixed.append(ch)
+            }
+            i += 1
+        }
+
+        return String(fixed)
     }
 }
 

@@ -245,6 +245,16 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertFalse(sections[0].items?[0].isCompleted ?? true)
     }
 
+    func testParseSectionsWithSmartQuotes() {
+        // Gemma-style output: smart quotes used as JSON delimiters AND inside strings
+        let response = "```json\n{\n    \u{201C}sections\u{201D}: [\n        {\n            \u{201C}heading\u{201D}: \u{201C}Quotes\u{201D},\n            \u{201C}content\u{201D}: \u{201C}\u{201D},\n            \u{201C}items\u{201D}: [\n                \u{201C}\u{201C}Hello world\u{201D} - Alice\u{201D},\n                \u{201C}Simple item\u{201D}\n            ]\n        }\n    ]\n}\n```"
+        let sections = Template.parseSections(from: response)
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertEqual(sections[0].heading, "Quotes")
+        XCTAssertEqual(sections[0].items?.count, 2)
+        XCTAssertTrue(sections[0].items?[0].text.contains("Hello world") ?? false)
+    }
+
     func testBuildCustomPrompt() {
         let prompt = Template.buildCustomPrompt("Extract customer objections")
         XCTAssertTrue(prompt.contains("Extract customer objections"))
