@@ -186,8 +186,11 @@ Two commits, structured so playback can be backed off independently:
 
 If App Nap still fights us after commit 2, revert to commit 1 — the AppKit shell and toolbar improvements stand on their own.
 
+### Commit 1 also includes
+
+- **Toolbar density toggle** — View menu item to switch `NSToolbar.displayMode` between `.iconOnly`, `.labelOnly`, and `.iconAndLabel`. One line of code plus a menu item.
+
 ## Out of Scope
 
 - Transcription model selection (alternative ASR models)
-- Toolbar density toggle (Icon Only / Text Only / Icon and Text) — can be added later via `NSToolbar.displayMode` but not in this migration
 - Drag and drop reordering of toolbar items (NSToolbar supports this natively, comes for free)
