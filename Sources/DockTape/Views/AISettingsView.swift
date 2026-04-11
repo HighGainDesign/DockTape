@@ -9,11 +9,6 @@ struct AISettingsView: View {
     @AppStorage("autoSummarize") private var autoSummarize: Bool = false
     @AppStorage("autoSummarizeTemplate") private var autoSummarizeTemplate: String = "recording"
 
-    @AppStorage("templatePrompt_meeting") private var templateMeeting: String = ""
-    @AppStorage("templatePrompt_call") private var templateCall: String = ""
-    @AppStorage("templatePrompt_memo") private var templateMemo: String = ""
-    @AppStorage("templatePrompt_recording") private var templateRecording: String = ""
-
     @State private var apiKey: String = ""
     @State private var isVerifying: Bool = false
     @State private var verifyResult: VerifyResult?
@@ -127,27 +122,15 @@ struct AISettingsView: View {
                 }
             }
 
-            Section("Templates") {
-                Text("These prompts are sent to the LLM along with your transcript. The JSON output format is appended automatically.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                templateEditor("Meeting", template: .meeting, storage: $templateMeeting)
-                templateEditor("Call", template: .call, storage: $templateCall)
-                templateEditor("Memo", template: .memo, storage: $templateMemo)
-                templateEditor("Recording", template: .recording, storage: $templateRecording)
-            }
-
             Section("Automation") {
                 Toggle("Auto-summarize after transcription", isOn: $autoSummarize)
                     .disabled(providerName != "custom" && apiKey.isEmpty)
 
                 if autoSummarize {
                     Picker("Default template", selection: $autoSummarizeTemplate) {
-                        Text("Meeting").tag("meeting")
-                        Text("Call").tag("call")
-                        Text("Memo").tag("memo")
-                        Text("Recording").tag("recording")
+                        ForEach(TemplateStore.builtInDefaults) { t in
+                            Text(t.name).tag(t.id)
+                        }
                     }
                 }
             }
@@ -182,40 +165,6 @@ struct AISettingsView: View {
                 verifyResult = .failure(error.localizedDescription)
             }
             isVerifying = false
-        }
-    }
-
-    private func templateEditor(_ label: String, template: SummaryTemplate, storage: Binding<String>) -> some View {
-        DisclosureGroup(label) {
-            ZStack(alignment: .topLeading) {
-                if storage.wrappedValue.isEmpty {
-                    Text(template.defaultPromptText)
-                        .font(.body.monospaced())
-                        .foregroundStyle(.tertiary)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 6)
-                }
-                TextEditor(text: storage)
-                    .font(.body.monospaced())
-                    .scrollContentBackground(.hidden)
-                    .opacity(storage.wrappedValue.isEmpty ? 0.25 : 1)
-            }
-            .frame(minHeight: 80)
-            .border(.separator)
-
-            HStack {
-                Spacer()
-                if !storage.wrappedValue.isEmpty {
-                    Button("Reset to Default") {
-                        storage.wrappedValue = ""
-                    }
-                    .font(.caption)
-                } else {
-                    Text("Using default")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                }
-            }
         }
     }
 
