@@ -114,16 +114,20 @@ struct DetailPane: View {
                         }
                     }
 
-                    toolbarButton("sparkles", "Summarize") {
-                        Task {
-                            let hasSummary = await state.summarization.summaryStore.hasSummary(for: rec.filename)
-                            if hasSummary {
-                                confirmResummarize = rec
-                            } else {
-                                state.contextMenuSummarize(rec)
+                    Menu {
+                        ForEach(TemplateStore.builtInDefaults) { template in
+                            Button(template.name) {
+                                state.summarizeWithTemplate(rec, template: template)
                             }
                         }
+                    } label: {
+                        Label("Summarize", systemImage: "sparkles")
+                            .font(.caption)
                     }
+                    .menuStyle(.borderedButton)
+                    .controlSize(.small)
+                    .fixedSize()
+                    .help("Summarize with template")
                     .disabled(!hasTranscript)
 
                     Spacer()

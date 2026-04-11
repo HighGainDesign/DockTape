@@ -224,7 +224,7 @@ final class AppState {
         return (provider, model)
     }
 
-    /// Summarize from context menu using current Settings provider/model.
+    /// Summarize with the default template for the recording's mode.
     func contextMenuSummarize(_ rec: RecordingMetadata) {
         guard let settings = makeSettingsProvider() else {
             errorMessage = "No API key configured. Go to Settings > AI to add one."
@@ -235,6 +235,15 @@ final class AppState {
             let template = await templateStore.defaultTemplate(forMode: rec.mode)
             summarizeRecordings([rec], template: template, provider: settings.provider, model: settings.model)
         }
+    }
+
+    /// Summarize with a specific template.
+    func summarizeWithTemplate(_ rec: RecordingMetadata, template: Template) {
+        guard let settings = makeSettingsProvider() else {
+            errorMessage = "No API key configured. Go to Settings > AI to add one."
+            return
+        }
+        summarizeRecordings([rec], template: template, provider: settings.provider, model: settings.model)
     }
 
     /// Auto-summarize recordings using Settings provider/model/template.
