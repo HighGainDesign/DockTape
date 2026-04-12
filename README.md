@@ -18,6 +18,10 @@ Download, transcribe, diarize, and manage recordings entirely on-device. No clou
 - **Menu bar extra** — quick device status from the menu bar
 - **CLI tool** — `hidock` command for headless operation
 
+## Download
+
+**[Download DockTape v1.0.0](https://github.com/HighGainDesign/docktape/releases/latest)** — signed and notarized `.dmg`, ready to use.
+
 ## Requirements
 
 - macOS 14 (Sonoma) or later
