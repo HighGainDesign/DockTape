@@ -274,8 +274,10 @@ struct DetailPane: View {
                         }
                     },
                     onSaveSpeakerNames: { names in
-                        Task { try? await state.updateSpeakerNames(for: rec.filename, names: names) }
-                        Task { self.transcript = await state.library.transcript(for: rec.filename) }
+                        Task {
+                            try? await state.updateSpeakerNames(for: rec.filename, names: names)
+                            self.transcript = await state.library.transcript(for: rec.filename)
+                        }
                     },
                     onSplitSpeaker: { segID, allFollowing in
                         Task {
