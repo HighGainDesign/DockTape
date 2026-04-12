@@ -20,7 +20,6 @@ final class MainSplitViewController: NSSplitViewController {
 
         // Sidebar
         let sidebarHost = NSHostingController(rootView: SidebarView(state: appState))
-        sidebarHost.sizingOptions = .preferredContentSize
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarHost)
         sidebarItem.canCollapse = true
         sidebarItem.minimumThickness = 180
@@ -29,21 +28,16 @@ final class MainSplitViewController: NSSplitViewController {
 
         // Content list
         let listHost = NSHostingController(rootView: RecordingListPane(state: appState))
-        listHost.sizingOptions = .preferredContentSize
         let listItem = NSSplitViewItem(contentListWithViewController: listHost)
         listItem.minimumThickness = 280
-        listItem.holdingPriority = .defaultLow + 1
         addSplitViewItem(listItem)
 
-        // Detail pane — lowest holding priority so it absorbs resize
+        // Detail pane
         let detailHost = NSHostingController(rootView: DetailPane(state: appState))
-        detailHost.sizingOptions = .preferredContentSize
         let detailItem = NSSplitViewItem(viewController: detailHost)
         detailItem.minimumThickness = 360
-        detailItem.holdingPriority = .defaultLow
         addSplitViewItem(detailItem)
 
         splitView.dividerStyle = .thin
-        splitView.isVertical = true
     }
 }
