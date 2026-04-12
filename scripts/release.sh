@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Prerequisites:
 #   - Developer ID Application certificate installed
-#   - App-specific password stored: xcrun notarytool store-credentials "DockTape-Notarize"
+#   - App-specific password stored: xcrun notarytool store-credentials "Notarize"
 #   - xcodegen installed (brew install xcodegen)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -61,34 +61,31 @@ codesign --force --deep --options runtime \
 codesign --verify --verbose "$APP_PATH"
 echo "   Signed OK"
 
-# Step 4: Create DMG
+# Step 4: Create DMG with installer layout (app left, Applications right)
 echo "4/6 Packaging DMG..."
 mkdir -p "$RELEASE_DIR"
 DMG_PATH="$RELEASE_DIR/$DMG_NAME"
 rm -f "$DMG_PATH"
 
-# Create a temporary folder for DMG contents
-DMG_STAGING="$RELEASE_DIR/dmg-staging"
-rm -rf "$DMG_STAGING"
-mkdir -p "$DMG_STAGING"
-cp -R "$APP_PATH" "$DMG_STAGING/"
-ln -s /Applications "$DMG_STAGING/Applications"
-
-hdiutil create -volname "DockTape" \
-    -srcfolder "$DMG_STAGING" \
-    -ov -format UDZO \
-    "$DMG_PATH"
-
-rm -rf "$DMG_STAGING"
-
-# Sign the DMG too
-codesign --sign "$SIGNING_IDENTITY" "$DMG_PATH"
+create-dmg \
+    --volname "DockTape" \
+    --volicon "Sources/DockTape/Resources/Assets.xcassets/AppIcon.appiconset/icon_512x512.png" \
+    --window-pos 200 120 \
+    --window-size 600 400 \
+    --icon-size 100 \
+    --icon "DockTape.app" 150 185 \
+    --app-drop-link 450 185 \
+    --codesign "$SIGNING_IDENTITY" \
+    --no-internet-enable \
+    "$DMG_PATH" \
+    "$APP_PATH" \
+    || true  # create-dmg returns non-zero if background image is missing, but DMG is still created
 echo "   DMG: $DMG_PATH"
 
 # Step 5: Notarize
 echo "5/6 Notarizing (this may take a few minutes)..."
 xcrun notarytool submit "$DMG_PATH" \
-    --keychain-profile "DockTape-Notarize" \
+    --keychain-profile "Notarize" \
     --wait
 
 # Step 6: Staple the notarization ticket

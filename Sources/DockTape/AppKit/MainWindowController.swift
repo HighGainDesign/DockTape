@@ -39,10 +39,16 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         window.title = "DockTape"
         window.titlebarAppearsTransparent = false
         window.titleVisibility = .hidden
-        window.setFrameAutosaveName("MainWindow")
         window.minSize = NSSize(width: 960, height: 560)
         window.contentViewController = splitViewController
         window.titlebarSeparatorStyle = .automatic
+
+        // Restore saved frame, but enforce minimum size
+        window.setFrameAutosaveName("MainWindow")
+        if window.frame.height < 560 || window.frame.width < 960 {
+            window.setFrame(NSRect(x: 0, y: 0, width: 1100, height: 700), display: false)
+            window.center()
+        }
 
         super.init(window: window)
         setupToolbar()
