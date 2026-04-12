@@ -69,7 +69,6 @@ rm -f "$DMG_PATH"
 
 create-dmg \
     --volname "DockTape" \
-    --volicon "Sources/DockTape/Resources/Assets.xcassets/AppIcon.appiconset/icon_512x512.png" \
     --window-pos 200 120 \
     --window-size 600 400 \
     --icon-size 100 \
@@ -78,8 +77,12 @@ create-dmg \
     --codesign "$SIGNING_IDENTITY" \
     --no-internet-enable \
     "$DMG_PATH" \
-    "$APP_PATH" \
-    || true  # create-dmg returns non-zero if background image is missing, but DMG is still created
+    "$APP_PATH"
+
+if [ ! -f "$DMG_PATH" ]; then
+    echo "ERROR: DMG creation failed"
+    exit 1
+fi
 echo "   DMG: $DMG_PATH"
 
 # Step 5: Notarize
