@@ -359,7 +359,7 @@ final class AppState {
 
             do {
                 let conn = USBConnection(vendorID: usbDevice.vendorID, productID: usbDevice.productID)
-                try conn.open()
+                try await conn.open()
                 device.usbConnection = conn
 
                 let mgr = DeviceManager(device: model)

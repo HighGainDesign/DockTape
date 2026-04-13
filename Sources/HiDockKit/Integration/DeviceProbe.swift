@@ -32,7 +32,7 @@ public enum DeviceProbe {
 
         let connection = USBConnection(vendorID: target.vendorID, productID: target.productID)
         do {
-            try connection.open()
+            try await connection.open()
             print("    USB connection opened successfully!")
         } catch {
             print("    FAILED to open: \(error)")
