@@ -5,11 +5,11 @@ import Foundation
 /// Orchestrates Jensen command/response over a USB connection.
 /// Actor ensures only one command is in flight at a time.
 public actor JensenTransport {
-    private let connection: any USBConnectionProtocol
+    private let connection: any DeviceTransport
     private var nextSequence: UInt32 = 1
     private let readSize = 512
 
-    public init(connection: any USBConnectionProtocol) {
+    public init(connection: any DeviceTransport) {
         self.connection = connection
     }
 

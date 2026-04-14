@@ -35,7 +35,7 @@ Three SPM targets sharing one library:
 
 | Module | Responsibility |
 |---|---|
-| USB | libusb wrapper, IOKit hotplug monitor, `USBConnectionProtocol` for mocking |
+| USB | libusb wrapper, IOKit hotplug monitor, `DeviceTransport` protocol for mocking |
 | Protocol | Jensen wire format: frame codec, 18 commands, async transport with sequence tracking |
 | Device | `DeviceManager` actor — high-level queries, file transfer, state via `@Observable DeviceModel` |
 | Storage | `RecordingStore` (filesystem scan), HDA→MP3 conversion, metadata from filenames |
@@ -52,7 +52,7 @@ USB device → Jensen protocol frames → DeviceManager → SyncEngine → Recor
 
 1. **Filesystem as source of truth** — no database. MP3 files in `~/Documents/HiDock Recordings/` are canonical. Transcripts as `{basename}.transcript.json`, summaries as `{basename}.summary.json` alongside.
 2. **Actors for concurrency** — DeviceManager, SyncEngine, RecordingPipeline, TranscriptStore, JensenTransport are all actors. No manual locks.
-3. **Protocol-driven USB** — `USBConnectionProtocol` enables full mock testing of the protocol layer without hardware.
+3. **Protocol-driven transport** — `DeviceTransport` protocol enables full mock testing of the protocol layer without hardware. Platform implementations: `USBConnection` (macOS), `EAConnection` (iOS, future).
 4. **Graceful degradation** — diarization is optional; transcription models download on-demand (FluidAudio caches them).
 5. **Self-contained app** — all logic lives in HiDockKit. No scattered CLI tools or external services.
 6. **AppKit window host (Notes-style)** — Full AppKit shell: `NSSplitViewController` with three panes (sidebar, content list, detail) + `NSToolbar` with `NSTrackingSeparatorToolbarItem`. Sidebar is full-height into the titlebar. Toolbar spans only the detail pane. SwiftUI views hosted via `NSHostingController`. Context-sensitive toolbar items (library vs. device). Toolbar density toggle via View menu.
@@ -67,7 +67,7 @@ USB device → Jensen protocol frames → DeviceManager → SyncEngine → Recor
 ## Code Conventions
 
 - **Actors** for shared mutable state, `@Observable` for view state
-- **Protocol suffix** for abstractions (`USBConnectionProtocol`, `TranscriptionEngine`)
+- **Protocol suffix** for abstractions (`DeviceTransport`, `TranscriptionEngine`)
 - **Manager/Store/Engine** suffixes for coordinators
 - Three error hierarchies: `USBError` → `ProtocolError` → `HiDockError`
 - `@Sendable` closures for async callbacks

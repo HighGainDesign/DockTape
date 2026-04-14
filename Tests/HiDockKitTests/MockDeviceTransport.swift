@@ -3,8 +3,8 @@
 import Foundation
 @testable import HiDockKit
 
-/// Mock USB connection for testing. Returns canned responses in order.
-final class MockUSBConnection: USBConnectionProtocol, @unchecked Sendable {
+/// Mock device transport for testing. Returns canned responses in order.
+final class MockDeviceTransport: DeviceTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var _sentData: [Data] = []
     private var _responses: [Data] = []
@@ -38,6 +38,8 @@ final class MockUSBConnection: USBConnectionProtocol, @unchecked Sendable {
         let frame = JensenFrame(command: command, sequence: sequence, body: body)
         queueResponse(frame.encode())
     }
+
+    func open() async throws {}
 
     func send(_ data: Data) async throws {
         lock.lock()

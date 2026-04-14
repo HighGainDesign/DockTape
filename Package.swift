@@ -3,16 +3,17 @@ import PackageDescription
 
 let package = Package(
     name: "DockTape",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
         .executable(name: "hidock", targets: ["HiDockCLI"]),
         .library(name: "HiDockKit", targets: ["HiDockKit"]),
+        .library(name: "HiDockKitUSB", targets: ["HiDockKitUSB"]),
     ],
     dependencies: [
         .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.4"),
     ],
     targets: [
-        // Vendored libusb-1.0 (static library, no Homebrew needed at runtime)
+        // Vendored libusb-1.0 (static library, macOS only)
         .target(
             name: "CLibUSB",
             path: "Sources/CLibUSB",
@@ -28,24 +29,31 @@ let package = Package(
                 .linkedLibrary("objc"),
             ]
         ),
-        // Core library — protocol, USB, device management, storage
+        // Core library — protocol, device management, storage, transcription, summarization
+        // Cross-platform (macOS + iOS)
         .target(
             name: "HiDockKit",
             dependencies: [
-                "CLibUSB",
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
-            path: "Sources/HiDockKit",
+            path: "Sources/HiDockKit"
+        ),
+        // macOS-only USB transport — USBConnection, USBDeviceMonitor, DeviceProbe
+        .target(
+            name: "HiDockKitUSB",
+            dependencies: [
+                "HiDockKit",
+                "CLibUSB",
+            ],
+            path: "Sources/HiDockKitUSB",
             linkerSettings: [
                 .linkedFramework("IOKit"),
             ]
         ),
-        // macOS SwiftUI app (built via Xcode project for .app bundle)
-        // Sources live in Sources/DockTape/ but the app target is in the .xcodeproj
-        // CLI tool — same capabilities as the SwiftUI app, headless
+        // CLI tool — macOS only, uses USB transport
         .executableTarget(
             name: "HiDockCLI",
-            dependencies: ["HiDockKit"],
+            dependencies: ["HiDockKit", "HiDockKitUSB"],
             path: "Sources/HiDockCLI"
         ),
         // Tests

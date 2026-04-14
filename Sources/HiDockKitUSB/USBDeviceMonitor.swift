@@ -4,6 +4,7 @@ import Foundation
 import CLibUSB
 import IOKit
 import IOKit.usb
+import HiDockKit
 
 // Non-capturing C callbacks for IOKit notifications
 private func ioKitMatchCallback(refcon: UnsafeMutableRawPointer?, iterator: io_iterator_t) {

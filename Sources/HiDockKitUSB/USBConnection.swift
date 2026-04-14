@@ -2,11 +2,12 @@
 
 import Foundation
 import CLibUSB
+import HiDockKit
 
 /// Real USB connection to a HiDock device using libusb-1.0.
 /// This matches the approach used by all working HiDock tools
 /// (pyusb, node-usb — both libusb backends).
-public final class USBConnection: USBConnectionProtocol, @unchecked Sendable {
+public final class USBConnection: DeviceTransport, @unchecked Sendable {
     private var context: OpaquePointer?      // libusb_context*
     private var handle: OpaquePointer?       // libusb_device_handle*
     private let vendorID: UInt16
@@ -21,7 +22,7 @@ public final class USBConnection: USBConnectionProtocol, @unchecked Sendable {
     }
 
     /// Open the device, detach kernel driver if needed, claim interface.
-    public func open() throws {
+    public func open() async throws {
         // Init libusb
         var ctx: OpaquePointer?
         let initResult = libusb_init(&ctx)

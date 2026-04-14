@@ -2,6 +2,7 @@
 
 import SwiftUI
 import HiDockKit
+import HiDockKitUSB
 
 /// Device connection and file management state.
 @Observable

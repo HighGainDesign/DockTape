@@ -6,7 +6,7 @@ import XCTest
 final class JensenTransportTests: XCTestCase {
 
     func testSendCommandBasic() async throws {
-        let mock = MockUSBConnection()
+        let mock = MockDeviceTransport()
         let responseBody = Data([0x01, 0x02, 0x03])
         mock.queueFrameResponse(command: .deviceInfo, sequence: 1, body: responseBody)
 
@@ -26,7 +26,7 @@ final class JensenTransportTests: XCTestCase {
     }
 
     func testSequenceIncrementsAcrossCommands() async throws {
-        let mock = MockUSBConnection()
+        let mock = MockDeviceTransport()
         mock.queueFrameResponse(command: .deviceInfo, sequence: 1)
         mock.queueFrameResponse(command: .battery, sequence: 2)
 
@@ -44,7 +44,7 @@ final class JensenTransportTests: XCTestCase {
     }
 
     func testSendCommandWithBody() async throws {
-        let mock = MockUSBConnection()
+        let mock = MockDeviceTransport()
         mock.queueFrameResponse(command: .setTime, sequence: 1)
 
         let transport = JensenTransport(connection: mock)
@@ -58,14 +58,14 @@ final class JensenTransportTests: XCTestCase {
     }
 
     func testClose() async throws {
-        let mock = MockUSBConnection()
+        let mock = MockDeviceTransport()
         let transport = JensenTransport(connection: mock)
         await transport.close()
         XCTAssertTrue(mock.isClosed)
     }
 
     func testResponseWithPadding() async throws {
-        let mock = MockUSBConnection()
+        let mock = MockDeviceTransport()
         // Simulate a device response with padding in length field
         var responseData = Data()
         responseData.appendUInt16BE(0x1234)
@@ -85,7 +85,7 @@ final class JensenTransportTests: XCTestCase {
     }
 
     func testMultiPacketResponse() async throws {
-        let mock = MockUSBConnection()
+        let mock = MockDeviceTransport()
         // Build a response frame with a 600-byte body
         let body = Data(repeating: 0xAA, count: 600)
         let frame = JensenFrame(command: .fileList, sequence: 1, body: body)
