@@ -2,6 +2,7 @@
 
 import Foundation
 import CLibUSB
+import HiDockKit
 
 /// Real USB connection to a HiDock device using libusb-1.0.
 /// This matches the approach used by all working HiDock tools

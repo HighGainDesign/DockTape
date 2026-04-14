@@ -2,6 +2,7 @@
 
 import SwiftUI
 import HiDockKit
+import HiDockKitUSB
 
 // MARK: - AI Provider Configuration
 

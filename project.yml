@@ -40,6 +40,8 @@ targets:
     dependencies:
       - package: DockTape
         product: HiDockKit
+      - package: DockTape
+        product: HiDockKitUSB
     entitlements:
       path: Sources/DockTape/Resources/DockTape.entitlements
       properties:

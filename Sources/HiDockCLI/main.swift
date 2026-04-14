@@ -1,6 +1,7 @@
 // © 2026 High Gain Design. All rights reserved.
 
 import HiDockKit
+import HiDockKitUSB
 import Foundation
 
 // hidock — unified CLI for HiDock device management
