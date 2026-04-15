@@ -46,7 +46,7 @@ public struct RecordingMetadata: Sendable, Identifiable {
         if let date = recordedAt, !mode.isEmpty {
             return Self.displayFormatter.string(from: date)
         }
-        return (filename as NSString).deletingPathExtension
+        return ((filename as NSString).lastPathComponent as NSString).deletingPathExtension
     }
 
     private static let displayFormatter: DateFormatter = {
