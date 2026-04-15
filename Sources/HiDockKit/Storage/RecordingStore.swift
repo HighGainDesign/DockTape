@@ -217,10 +217,15 @@ public actor RecordingStore {
         )
     }
 
-    /// Delete a local recording.
+    /// Delete a local recording and its plain-text sidecar.
     public func deleteRecording(filename: String) throws {
         let url = baseDirectory.appendingPathComponent(filename)
         try? FileManager.default.removeItem(at: url)
+
+        // Remove .txt sidecar (best effort)
+        let basename = (filename as NSString).deletingPathExtension
+        let txtURL = baseDirectory.appendingPathComponent("\(basename).txt")
+        try? FileManager.default.removeItem(at: txtURL)
     }
 
     /// Rename a recording file on disk, plus the associated transcript file.

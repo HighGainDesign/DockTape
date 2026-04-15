@@ -238,6 +238,8 @@ final class AppState {
         }
         do {
             try await library.deleteRecording(rec)
+            try? await summarization.summaryStore.delete(for: rec.filename)
+            summarization.hasSummary.remove(rec.filename)
         } catch {
             errorMessage = "Delete failed: \(error.localizedDescription)"
         }
