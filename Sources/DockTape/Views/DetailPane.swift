@@ -7,6 +7,7 @@ import HiDockKit
 struct DetailPane: View {
     @Bindable var state: AppState
     @State private var userHasPickedTab: Bool = false
+    @State private var isProgrammaticTabSwitch: Bool = false
     @State private var transcript: Transcript?
     @State private var renamingRecording: RecordingMetadata?
     @State private var renameText: String = ""
@@ -141,21 +142,35 @@ struct DetailPane: View {
 
             if !userHasPickedTab {
                 // First load: auto-select best tab
+                isProgrammaticTabSwitch = true
                 state.selectedDetailTab = transcript != nil ? .transcript : .info
+                isProgrammaticTabSwitch = false
             } else {
                 ensureTabAvailable(for: rec)
             }
         }
-        .onChange(of: state.selectedDetailTab) { _, _ in
-            userHasPickedTab = true
+        .onChange(of: state.selectedDetailTab) { old, new in
+            // Only mark as user-picked if this wasn't a programmatic switch
+            if !isProgrammaticTabSwitch {
+                userHasPickedTab = true
+            }
         }
         .onChange(of: state.transcription.statuses[rec.filename]) { _, newStatus in
-            // Reload transcript when transcription completes for this recording
+            // Reload transcript and auto-switch when transcription completes
             if newStatus == .done {
                 Task {
                     self.transcript = await state.library.transcript(for: rec.filename)
-        
+                    isProgrammaticTabSwitch = true
+                    state.selectedDetailTab = .transcript
+                    isProgrammaticTabSwitch = false
                 }
+            }
+        }
+        .onChange(of: state.summarization.hasSummary.contains(rec.filename)) { _, hasSummary in
+            if hasSummary {
+                isProgrammaticTabSwitch = true
+                state.selectedDetailTab = .summary
+                isProgrammaticTabSwitch = false
             }
         }
         .onChange(of: state.triggerRename) { _, trigger in
