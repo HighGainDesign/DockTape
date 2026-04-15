@@ -206,7 +206,6 @@ final class AppState {
     }
 
     func syncAll() async {
-        device.isSyncing = true
         do {
             let result = try await device.syncAll(
                 deleteAfterDownload: autoDeleteAfterDownload
@@ -215,7 +214,6 @@ final class AppState {
                     self?.statusMessage = "Downloading \(progress.currentFile)..."
                 }
             }
-            device.isSyncing = false
             await library.refresh()
 
             if result.downloaded.isEmpty && result.failed.isEmpty {
@@ -226,8 +224,7 @@ final class AppState {
                 statusMessage = msg
             }
         } catch {
-            device.isSyncing = false
-            errorMessage = error.localizedDescription
+            errorMessage = "Sync failed: \(error.localizedDescription)"
             statusMessage = "Sync failed"
         }
     }
