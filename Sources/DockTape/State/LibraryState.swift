@@ -30,9 +30,13 @@ final class LibraryState {
         await refresh()
     }
 
+    /// Set of device filenames that have been imported (from library.json).
+    var importedDeviceFilenames: Set<String> = []
+
     func refresh() async {
         recordings = await store.allRecordings()
         downloadedFilenames = Set(recordings.map(\.filename))
+        importedDeviceFilenames = await store.allImportedDeviceFilenames()
         folders = await store.folders()
         try? await transcriptStore.loadAll()
     }
@@ -41,7 +45,9 @@ final class LibraryState {
         let mp3Name = filename.hasSuffix(".hda")
             ? filename.replacingOccurrences(of: ".hda", with: ".mp3", options: .caseInsensitive)
             : filename
-        return downloadedFilenames.contains(mp3Name)
+        if downloadedFilenames.contains(mp3Name) { return true }
+        // Check library.json for renamed recordings
+        return importedDeviceFilenames.contains(filename)
     }
 
     /// Recordings filtered by the currently selected folder.

@@ -41,12 +41,14 @@ public struct RecordingMetadata: Sendable, Identifiable {
         self.folder = folder
     }
 
-    /// Display title: formatted date if the filename parses as a device name, otherwise filename without extension.
+    /// Display title: formatted date if the filename is still in device format, otherwise the user's chosen name.
     public var displayTitle: String {
-        if let date = recordedAt, !mode.isEmpty {
+        let basename = (filename as NSString).lastPathComponent
+        let parsed = FilenameParsing.parse(basename)
+        if parsed.mode != .unknown, let date = parsed.date {
             return Self.displayFormatter.string(from: date)
         }
-        return ((filename as NSString).lastPathComponent as NSString).deletingPathExtension
+        return (basename as NSString).deletingPathExtension
     }
 
     private static let displayFormatter: DateFormatter = {

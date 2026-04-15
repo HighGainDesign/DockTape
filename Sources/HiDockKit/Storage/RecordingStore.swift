@@ -16,10 +16,10 @@ public actor RecordingStore {
         }
     }
 
-    /// Ensure the storage directory exists and load persisted modes.
+    /// Ensure the storage directory exists and load persisted metadata.
     public func setup() throws {
         try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
-        loadModes()
+        loadLibraryMeta()
     }
 
     // MARK: - Folder CRUD
@@ -186,7 +186,7 @@ public actor RecordingStore {
             if parsed.mode != .unknown {
                 mode = parsed.mode.rawValue
             } else {
-                mode = modes[url.lastPathComponent] ?? ""
+                mode = meta[url.lastPathComponent]?.mode ?? ""
             }
 
             results.append(RecordingMetadata(
@@ -215,10 +215,8 @@ public actor RecordingStore {
         let parsed = FilenameParsing.parse(mp3Filename)
         let mode = parsed.mode != .unknown ? parsed.mode.rawValue : ""
 
-        // Persist mode so it survives renames
-        if !mode.isEmpty {
-            setMode(mode, for: mp3Filename)
-        }
+        // Persist mode and original device filename so they survive renames
+        setMeta(mode: mode, deviceFilename: entry.filename, for: mp3Filename)
 
         return RecordingMetadata(
             filename: mp3Filename,
@@ -239,7 +237,7 @@ public actor RecordingStore {
         let txtURL = baseDirectory.appendingPathComponent("\(basename).txt")
         try? FileManager.default.removeItem(at: txtURL)
 
-        removeMode(for: filename)
+        removeMeta(for: filename)
     }
 
     /// Rename a recording file on disk, plus the associated transcript file.
@@ -270,7 +268,7 @@ public actor RecordingStore {
             try? fm.moveItem(at: oldAssoc, to: newAssoc)
         }
 
-        renameMode(from: filename, to: newFilename)
+        renameMeta(from: filename, to: newFilename)
         return newFilename
     }
 
@@ -279,56 +277,91 @@ public actor RecordingStore {
         baseDirectory.appendingPathComponent(metadata.filename)
     }
 
-    // MARK: - Mode persistence (modes.json)
+    // MARK: - Recording metadata (library.json)
 
-    /// In-memory cache of filename → recording mode.
-    private var modes: [String: String] = [:]
-
-    /// Load modes.json from disk.
-    public func loadModes() {
-        let url = baseDirectory.appendingPathComponent("modes.json")
-        guard let data = try? Data(contentsOf: url),
-              let dict = try? JSONDecoder().decode([String: String].self, from: data) else {
-            return
-        }
-        modes = dict
+    /// Per-recording metadata that survives renames. Keyed by current filename.
+    public struct RecordingMeta: Codable {
+        public var mode: String?
+        public var deviceFilename: String?
     }
 
-    /// Save modes.json to disk.
-    private func saveModes() {
-        let url = baseDirectory.appendingPathComponent("modes.json")
-        guard let data = try? JSONEncoder().encode(modes) else { return }
+    /// In-memory cache of filename → metadata.
+    private var meta: [String: RecordingMeta] = [:]
+
+    /// Load library.json from disk. Also migrates modes.json if present.
+    public func loadLibraryMeta() {
+        // Migrate from modes.json if it exists
+        let modesURL = baseDirectory.appendingPathComponent("modes.json")
+        if let data = try? Data(contentsOf: modesURL),
+           let dict = try? JSONDecoder().decode([String: String].self, from: data) {
+            for (key, mode) in dict {
+                meta[key] = RecordingMeta(mode: mode, deviceFilename: nil)
+            }
+            saveLibraryMeta()
+            try? FileManager.default.removeItem(at: modesURL)
+        }
+
+        let url = baseDirectory.appendingPathComponent("library.json")
+        guard let data = try? Data(contentsOf: url),
+              let dict = try? JSONDecoder().decode([String: RecordingMeta].self, from: data) else {
+            return
+        }
+        meta = dict
+    }
+
+    /// Save library.json to disk.
+    private func saveLibraryMeta() {
+        let url = baseDirectory.appendingPathComponent("library.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(meta) else { return }
         try? data.write(to: url, options: .atomic)
     }
 
-    /// Record the mode for a filename. Persists to modes.json.
-    public func setMode(_ mode: String, for filename: String) {
+    /// Record metadata for a downloaded file. Call after storeRecording.
+    public func setMeta(mode: String, deviceFilename: String, for filename: String) {
         let key = (filename as NSString).lastPathComponent
-        modes[key] = mode
-        saveModes()
+        meta[key] = RecordingMeta(mode: mode.isEmpty ? nil : mode, deviceFilename: deviceFilename)
+        saveLibraryMeta()
     }
 
     /// Look up the persisted mode for a filename.
     public func mode(for filename: String) -> String? {
         let key = (filename as NSString).lastPathComponent
-        return modes[key]
+        return meta[key]?.mode
     }
 
-    /// Update modes.json when a recording is renamed.
-    public func renameMode(from oldFilename: String, to newFilename: String) {
+    /// All device filenames that have been imported (for synchronous download checks).
+    public func allImportedDeviceFilenames() -> Set<String> {
+        Set(meta.values.compactMap(\.deviceFilename))
+    }
+
+    /// Check if a device filename has been imported (even if later renamed).
+    public func isImported(deviceFilename: String) -> Bool {
+        let mp3Name = deviceFilename.hasSuffix(".hda")
+            ? deviceFilename.replacingOccurrences(of: ".hda", with: ".mp3")
+            : deviceFilename
+        // Check direct filename match first
+        if meta[mp3Name] != nil { return true }
+        // Check if any recording was imported from this device file
+        return meta.values.contains { $0.deviceFilename == deviceFilename }
+    }
+
+    /// Update library.json when a recording is renamed.
+    public func renameMeta(from oldFilename: String, to newFilename: String) {
         let oldKey = (oldFilename as NSString).lastPathComponent
         let newKey = (newFilename as NSString).lastPathComponent
-        if let m = modes.removeValue(forKey: oldKey) {
-            modes[newKey] = m
-            saveModes()
+        if let m = meta.removeValue(forKey: oldKey) {
+            meta[newKey] = m
+            saveLibraryMeta()
         }
     }
 
-    /// Remove a mode entry when a recording is deleted.
-    public func removeMode(for filename: String) {
+    /// Remove a metadata entry when a recording is deleted.
+    public func removeMeta(for filename: String) {
         let key = (filename as NSString).lastPathComponent
-        modes.removeValue(forKey: key)
-        saveModes()
+        meta.removeValue(forKey: key)
+        saveLibraryMeta()
     }
 
     /// Sanitize a filename by replacing illegal characters.
@@ -341,13 +374,16 @@ public actor RecordingStore {
         return String(sanitized).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Check if a recording has already been downloaded.
+    /// Check if a recording has already been downloaded (even if later renamed).
     /// Accepts either HDA or MP3 filename — converts HDA to MP3 for the check.
     public func isDownloaded(filename: String) -> Bool {
         let mp3Name = filename.hasSuffix(".hda")
             ? filename.replacingOccurrences(of: ".hda", with: ".mp3")
             : filename
+        // Direct file check (fast path for un-renamed recordings)
         let url = baseDirectory.appendingPathComponent(mp3Name)
-        return FileManager.default.fileExists(atPath: url.path)
+        if FileManager.default.fileExists(atPath: url.path) { return true }
+        // Check library.json for renamed recordings
+        return isImported(deviceFilename: filename)
     }
 }
