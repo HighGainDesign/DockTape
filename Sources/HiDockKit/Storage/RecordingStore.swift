@@ -181,7 +181,12 @@ public actor RecordingStore {
             let fileSize = UInt64(attrs.fileSize ?? 0)
             let parsed = FilenameParsing.parse(url.lastPathComponent)
             let recordedAt = parsed.date ?? attrs.creationDate
-            let mode = parsed.mode != .unknown ? parsed.mode.rawValue : ""
+            let mode: String
+            if parsed.mode != .unknown {
+                mode = parsed.mode.rawValue
+            } else {
+                mode = Self.readMode(from: url) ?? ""
+            }
 
             results.append(RecordingMetadata(
                 filename: relativePath,
@@ -207,11 +212,17 @@ public actor RecordingStore {
         let attrs = try outputURL.resourceValues(forKeys: [.fileSizeKey, .creationDateKey])
         let fileSize = UInt64(attrs.fileSize ?? 0)
         let parsed = FilenameParsing.parse(mp3Filename)
+        let mode = parsed.mode != .unknown ? parsed.mode.rawValue : ""
+
+        // Persist mode as extended attribute so it survives renames
+        if !mode.isEmpty {
+            Self.writeMode(mode, to: outputURL)
+        }
 
         return RecordingMetadata(
             filename: mp3Filename,
             recordedAt: parsed.date ?? attrs.creationDate,
-            mode: parsed.mode != .unknown ? parsed.mode.rawValue : "",
+            mode: mode,
             fileSizeBytes: fileSize,
             estimatedDuration: DurationCalculator.estimateDuration(fileSize: fileSize)
         )
@@ -262,6 +273,28 @@ public actor RecordingStore {
     /// Get the file URL for a recording's MP3.
     public func mp3URL(for metadata: RecordingMetadata) -> URL {
         baseDirectory.appendingPathComponent(metadata.filename)
+    }
+
+    // MARK: - Mode extended attribute
+
+    private static let modeXattrName = "com.highgain.docktape.mode"
+
+    static func writeMode(_ mode: String, to url: URL) {
+        guard let data = mode.data(using: .utf8) else { return }
+        _ = data.withUnsafeBytes { bytes in
+            setxattr(url.path, modeXattrName, bytes.baseAddress, data.count, 0, 0)
+        }
+    }
+
+    static func readMode(from url: URL) -> String? {
+        let length = getxattr(url.path, modeXattrName, nil, 0, 0, 0)
+        guard length > 0 else { return nil }
+        var data = Data(count: length)
+        let result = data.withUnsafeMutableBytes { bytes in
+            getxattr(url.path, modeXattrName, bytes.baseAddress, length, 0, 0)
+        }
+        guard result > 0 else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     /// Sanitize a filename by replacing illegal characters.
