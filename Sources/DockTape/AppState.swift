@@ -300,6 +300,7 @@ final class AppState {
     }
 
     /// Summarize with the default template for the recording's mode.
+    /// Auto-transcribes first if needed.
     func contextMenuSummarize(_ rec: RecordingMetadata) {
         guard let settings = makeSettingsProvider() else {
             errorMessage = "No API key configured. Go to Settings > AI to add one."
@@ -308,17 +309,37 @@ final class AppState {
 
         Task {
             let template = await templateStore.defaultTemplate(forMode: rec.mode)
-            summarizeRecordings([rec], template: template, provider: settings.provider, model: settings.model)
+            summarizeWithTemplate(rec, template: template)
         }
     }
 
     /// Summarize with a specific template and optional custom prompt.
+    /// Auto-transcribes first if the recording has no transcript.
     func summarizeWithTemplate(_ rec: RecordingMetadata, template: Template, customPrompt: String? = nil) {
         guard let settings = makeSettingsProvider() else {
             errorMessage = "No API key configured. Go to Settings > AI to add one."
             return
         }
-        summarizeRecordings([rec], template: template, customPrompt: customPrompt, provider: settings.provider, model: settings.model)
+
+        let needsTranscript = (transcription.statuses[rec.filename] ?? .none) != .done
+
+        if needsTranscript {
+            // Transcribe first, then summarize on completion
+            Task {
+                await transcription.transcribe(
+                    recordings: [rec],
+                    baseDirectory: library.store.baseDirectory,
+                    onStatusMessage: { [weak self] msg in self?.statusMessage = msg },
+                    onError: { [weak self] msg in self?.errorMessage = msg },
+                    onComplete: { [weak self] in
+                        await self?.library.refresh()
+                        self?.summarizeRecordings([rec], template: template, customPrompt: customPrompt, provider: settings.provider, model: settings.model)
+                    }
+                )
+            }
+        } else {
+            summarizeRecordings([rec], template: template, customPrompt: customPrompt, provider: settings.provider, model: settings.model)
+        }
     }
 
     /// Auto-summarize recordings using Settings provider/model/template.

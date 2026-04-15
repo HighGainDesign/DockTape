@@ -210,11 +210,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         case .transcribe:
             return !isDevice && hasSelection
         case .summarize:
-            if !isDevice && hasSelection {
-                let recs = appState.library.recordings.filter { appState.library.selectedRecordings.contains($0.filename) }
-                return recs.contains { (appState.transcription.statuses[$0.filename] ?? .none) == .done }
-            }
-            return false
+            return !isDevice && hasSelection
         case .importFile:
             return isDevice && hasSelection
         case .delete:
