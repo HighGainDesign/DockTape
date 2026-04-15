@@ -52,11 +52,16 @@ struct SettingsView: View {
                     Text("This Mac").tag(StorageMode.local)
                     Text("This Mac (Custom\u{2026})").tag(StorageMode.custom)
                 }
+                .disabled(isProcessing)
                 .onChange(of: storageMode) { _, newMode in
                     handleStorageModeChange(newMode)
                 }
 
-                if state.isICloudUnavailable {
+                if isProcessing {
+                    Label("Can't change while processing is in progress.", systemImage: "hourglass")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if state.isICloudUnavailable {
                     Label("iCloud Drive is not available. Using local storage.", systemImage: "exclamationmark.icloud")
                         .font(.caption)
                         .foregroundStyle(.orange)
@@ -106,6 +111,10 @@ struct SettingsView: View {
                 .foregroundStyle(.quaternary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var isProcessing: Bool {
+        state.transcription.isTranscribing || state.summarization.summarizingFile != nil || state.device.isDeviceBusy
     }
 
     private func handleStorageModeChange(_ mode: StorageMode) {

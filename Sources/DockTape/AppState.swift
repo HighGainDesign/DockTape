@@ -99,7 +99,23 @@ final class AppState {
             mode = migrated
         }
 
-        let customURL = defaults.url(forKey: "libraryLocation")
+        // Resolve custom URL from security-scoped bookmark if available
+        let customURL: URL?
+        if mode == .custom, let bookmarkData = defaults.data(forKey: "libraryLocationBookmark") {
+            var isStale = false
+            if let resolved = try? URL(resolvingBookmarkData: bookmarkData, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale) {
+                _ = resolved.startAccessingSecurityScopedResource()
+                customURL = resolved
+                // Refresh bookmark if stale
+                if isStale, let fresh = try? resolved.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil) {
+                    defaults.set(fresh, forKey: "libraryLocationBookmark")
+                }
+            } else {
+                customURL = defaults.url(forKey: "libraryLocation")
+            }
+        } else {
+            customURL = defaults.url(forKey: "libraryLocation")
+        }
         let baseDir = StorageLocationResolver.resolve(mode: mode, customURL: customURL)
 
         let store = RecordingStore(baseDirectory: baseDir)

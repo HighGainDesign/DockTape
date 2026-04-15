@@ -16,9 +16,10 @@ public actor RecordingStore {
         }
     }
 
-    /// Ensure the storage directory exists.
+    /// Ensure the storage directory exists and load persisted modes.
     public func setup() throws {
         try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
+        loadModes()
     }
 
     // MARK: - Folder CRUD
@@ -127,7 +128,7 @@ public actor RecordingStore {
         try fm.moveItem(at: oldMP3, to: newMP3)
 
         // Move associated sidecar files (best effort)
-        for ext in [".transcript.json", ".txt"] {
+        for ext in [".transcript.json", ".summary.json", ".txt"] {
             let oldSidecar = oldDir.appendingPathComponent("\(basenameNoExt)\(ext)")
             let newSidecar = newDir.appendingPathComponent("\(basenameNoExt)\(ext)")
             if fm.fileExists(atPath: oldSidecar.path) {
@@ -185,7 +186,7 @@ public actor RecordingStore {
             if parsed.mode != .unknown {
                 mode = parsed.mode.rawValue
             } else {
-                mode = Self.readMode(from: url) ?? ""
+                mode = modes[url.lastPathComponent] ?? ""
             }
 
             results.append(RecordingMetadata(
@@ -214,9 +215,9 @@ public actor RecordingStore {
         let parsed = FilenameParsing.parse(mp3Filename)
         let mode = parsed.mode != .unknown ? parsed.mode.rawValue : ""
 
-        // Persist mode as extended attribute so it survives renames
+        // Persist mode so it survives renames
         if !mode.isEmpty {
-            Self.writeMode(mode, to: outputURL)
+            setMode(mode, for: mp3Filename)
         }
 
         return RecordingMetadata(
@@ -237,6 +238,8 @@ public actor RecordingStore {
         let basename = (filename as NSString).deletingPathExtension
         let txtURL = baseDirectory.appendingPathComponent("\(basename).txt")
         try? FileManager.default.removeItem(at: txtURL)
+
+        removeMode(for: filename)
     }
 
     /// Rename a recording file on disk, plus the associated transcript file.
@@ -261,12 +264,13 @@ public actor RecordingStore {
         try fm.moveItem(at: oldURL, to: newURL)
 
         // Rename associated files (best effort)
-        for ext in [".transcript.json", ".txt"] {
+        for ext in [".transcript.json", ".summary.json", ".txt"] {
             let oldAssoc = baseDirectory.appendingPathComponent("\(oldBasename)\(ext)")
             let newAssoc = baseDirectory.appendingPathComponent("\(newBasename)\(ext)")
             try? fm.moveItem(at: oldAssoc, to: newAssoc)
         }
 
+        renameMode(from: filename, to: newFilename)
         return newFilename
     }
 
@@ -275,26 +279,56 @@ public actor RecordingStore {
         baseDirectory.appendingPathComponent(metadata.filename)
     }
 
-    // MARK: - Mode extended attribute
+    // MARK: - Mode persistence (modes.json)
 
-    private static let modeXattrName = "com.highgain.docktape.mode"
+    /// In-memory cache of filename → recording mode.
+    private var modes: [String: String] = [:]
 
-    static func writeMode(_ mode: String, to url: URL) {
-        guard let data = mode.data(using: .utf8) else { return }
-        _ = data.withUnsafeBytes { bytes in
-            setxattr(url.path, modeXattrName, bytes.baseAddress, data.count, 0, 0)
+    /// Load modes.json from disk.
+    public func loadModes() {
+        let url = baseDirectory.appendingPathComponent("modes.json")
+        guard let data = try? Data(contentsOf: url),
+              let dict = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return
+        }
+        modes = dict
+    }
+
+    /// Save modes.json to disk.
+    private func saveModes() {
+        let url = baseDirectory.appendingPathComponent("modes.json")
+        guard let data = try? JSONEncoder().encode(modes) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    /// Record the mode for a filename. Persists to modes.json.
+    public func setMode(_ mode: String, for filename: String) {
+        let key = (filename as NSString).lastPathComponent
+        modes[key] = mode
+        saveModes()
+    }
+
+    /// Look up the persisted mode for a filename.
+    public func mode(for filename: String) -> String? {
+        let key = (filename as NSString).lastPathComponent
+        return modes[key]
+    }
+
+    /// Update modes.json when a recording is renamed.
+    public func renameMode(from oldFilename: String, to newFilename: String) {
+        let oldKey = (oldFilename as NSString).lastPathComponent
+        let newKey = (newFilename as NSString).lastPathComponent
+        if let m = modes.removeValue(forKey: oldKey) {
+            modes[newKey] = m
+            saveModes()
         }
     }
 
-    static func readMode(from url: URL) -> String? {
-        let length = getxattr(url.path, modeXattrName, nil, 0, 0, 0)
-        guard length > 0 else { return nil }
-        var data = Data(count: length)
-        let result = data.withUnsafeMutableBytes { bytes in
-            getxattr(url.path, modeXattrName, bytes.baseAddress, length, 0, 0)
-        }
-        guard result > 0 else { return nil }
-        return String(data: data, encoding: .utf8)
+    /// Remove a mode entry when a recording is deleted.
+    public func removeMode(for filename: String) {
+        let key = (filename as NSString).lastPathComponent
+        modes.removeValue(forKey: key)
+        saveModes()
     }
 
     /// Sanitize a filename by replacing illegal characters.
