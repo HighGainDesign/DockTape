@@ -2,7 +2,7 @@
 
 **HiDock Manager** — a native macOS app for managing recordings from your [HiDock](https://hidock.com) device (P1, P1 Mini, H1, H1E).
 
-Download, transcribe, diarize, and manage recordings entirely on-device. No cloud services required. Tested with HiDock P1.
+Download, transcribe, diarize, and manage recordings entirely on-device. No cloud services required for transcription. Tested with HiDock P1.
 
 ## Features
 
@@ -12,15 +12,17 @@ Download, transcribe, diarize, and manage recordings entirely on-device. No clou
 - **Local transcription** — speech-to-text using Parakeet ASR via [FluidAudio](https://github.com/FluidInference/FluidAudio), runs on Apple Silicon
 - **Speaker diarization** — identify and label different speakers using Sortformer via FluidAudio
 - **AI summaries** — summarize transcripts via Anthropic, OpenAI, OpenRouter, or local models (Ollama, LM Studio). 7 built-in templates (Meeting, Lecture, Interview, Memo, Discussion, Consultation, Coaching/Counseling), custom templates, action item checkboxes
+- **iCloud Drive storage** — recordings sync across Macs via iCloud Drive, visible in Finder. Local and custom storage locations also supported
 - **Multiple export formats** — plain text, SRT subtitles, JSONL, JSON
 - **Audio playback** — built-in player with variable speed (0.5x–3x)
 - **Library management** — folders, search, sort, filter by recording type and date
+- **Smart summarization** — hit Summarize on any recording; auto-transcribes first if needed
 - **Menu bar extra** — quick device status from the menu bar
 - **CLI tool** — `hidock` command for headless operation
 
 ## Download
 
-**[Download DockTape v1.0.0](https://github.com/HighGainDesign/docktape/releases/latest)** — signed and notarized `.dmg`, ready to use.
+**[Download DockTape](https://github.com/HighGainDesign/docktape/releases/latest)** — signed `.dmg`, ready to use.
 
 ## Requirements
 
@@ -60,7 +62,7 @@ swift test
 - **HiDockKit** — shared library: USB communication (Jensen protocol), storage, transcription pipeline
 - **HiDockCLI** — command-line interface using HiDockKit
 
-Recordings are stored in `~/Documents/HiDock Recordings/` with transcripts and summaries as JSON sidecar files. The filesystem is the source of truth — no database.
+Recordings are stored in iCloud Drive (default), `~/Documents/HiDock Recordings/`, or a custom directory — configurable in Settings. Transcripts and summaries live as JSON sidecar files alongside each MP3. The filesystem is the source of truth — no database.
 
 ## Development
 
