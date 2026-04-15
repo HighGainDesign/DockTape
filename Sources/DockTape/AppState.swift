@@ -85,8 +85,24 @@ final class AppState {
     private var pollingTask: Task<Void, Never>?
 
     init() {
-        let customPath = UserDefaults.standard.url(forKey: "libraryLocation")
-        let store = RecordingStore(baseDirectory: customPath)
+        let defaults = UserDefaults.standard
+
+        // One-time migration: determine storage mode for pre-iCloud installs
+        let mode: StorageMode
+        if let stored = defaults.string(forKey: "storageMode"),
+           let parsed = StorageMode(rawValue: stored) {
+            mode = parsed
+        } else {
+            // First launch after iCloud update — migrate
+            let migrated = StorageLocationResolver.migratedMode(from: defaults)
+            defaults.set(migrated.rawValue, forKey: "storageMode")
+            mode = migrated
+        }
+
+        let customURL = defaults.url(forKey: "libraryLocation")
+        let baseDir = StorageLocationResolver.resolve(mode: mode, customURL: customURL)
+
+        let store = RecordingStore(baseDirectory: baseDir)
         let transcriptStore = TranscriptStore(baseDirectory: store.baseDirectory)
 
         self.library = LibraryState(store: store, transcriptStore: transcriptStore)
@@ -97,8 +113,8 @@ final class AppState {
         self.summarization = SummarizationState(summaryStore: summaryStore)
         self.templateStore = TemplateStore(baseDirectory: store.baseDirectory)
 
-        self.autoDeleteAfterDownload = UserDefaults.standard.bool(forKey: "autoDeleteAfterDownload")
-        self.autoSyncClock = UserDefaults.standard.object(forKey: "autoSyncClock") as? Bool ?? true
+        self.autoDeleteAfterDownload = defaults.bool(forKey: "autoDeleteAfterDownload")
+        self.autoSyncClock = defaults.object(forKey: "autoSyncClock") as? Bool ?? true
     }
 
     func setup() async throws {
@@ -141,6 +157,40 @@ final class AppState {
 
         let summarizedFiles = await summarization.summaryStore.allSummarizedFilenames()
         summarization.hasSummary = Set(summarizedFiles)
+    }
+
+    /// Switch storage location and re-initialize all stores.
+    /// Does NOT move files — the user manages that via Finder.
+    func switchStorageLocation(to mode: StorageMode, customURL: URL? = nil) async {
+        let defaults = UserDefaults.standard
+        defaults.set(mode.rawValue, forKey: "storageMode")
+
+        if mode == .custom, let url = customURL {
+            defaults.set(url, forKey: "libraryLocation")
+        }
+
+        let baseDir = StorageLocationResolver.resolve(mode: mode, customURL: customURL)
+
+        let store = RecordingStore(baseDirectory: baseDir)
+        let transcriptStore = TranscriptStore(baseDirectory: store.baseDirectory)
+
+        self.library = LibraryState(store: store, transcriptStore: transcriptStore)
+        self.transcription = TranscriptionState(transcriptStore: transcriptStore)
+        let summaryStore = SummaryStore(baseDirectory: store.baseDirectory)
+        self.summarization = SummarizationState(summaryStore: summaryStore)
+        self.templateStore = TemplateStore(baseDirectory: store.baseDirectory)
+
+        do {
+            try await setup()
+        } catch {
+            errorMessage = "Failed to load library: \(error.localizedDescription)"
+        }
+    }
+
+    /// Whether iCloud was requested but is currently unavailable.
+    var isICloudUnavailable: Bool {
+        let mode = UserDefaults.standard.string(forKey: "storageMode")
+        return mode == "icloud" && !StorageLocationResolver.isICloudAvailable
     }
 
     // MARK: - Cross-cutting actions
