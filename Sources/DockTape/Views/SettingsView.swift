@@ -5,9 +5,8 @@ import HiDockKit
 
 struct SettingsView: View {
     @Bindable var state: AppState
-    @AppStorage("libraryLocation") private var libraryLocationBookmark: Data?
-    @State private var libraryPath: String = ""
-    @State private var showRestartAlert = false
+    @State private var storageMode: StorageMode = .icloud
+    @State private var showLocationChangedAlert = false
 
     var body: some View {
         TabView {
@@ -30,12 +29,13 @@ struct SettingsView: View {
         }
         .frame(width: 450)
         .onAppear {
-            libraryPath = state.library.store.baseDirectory.path(percentEncoded: false)
+            let raw = UserDefaults.standard.string(forKey: "storageMode") ?? "icloud"
+            storageMode = StorageMode(rawValue: raw) ?? .icloud
         }
-        .alert("Restart Required", isPresented: $showRestartAlert) {
+        .alert("Storage Location Changed", isPresented: $showLocationChangedAlert) {
             Button("OK") {}
         } message: {
-            Text("The library location will change when you restart the app.")
+            Text("DockTape will now look for recordings in the new location. Your existing recordings are not moved — use Finder to move them if needed.")
         }
     }
 
@@ -46,27 +46,26 @@ struct SettingsView: View {
                 Toggle("Auto-delete from device after download", isOn: $state.autoDeleteAfterDownload)
             }
 
-            Section("Library Location") {
-                HStack {
-                    Text(libraryPath)
-                        .font(.caption.monospaced())
-                        .lineLimit(2)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    Button("Change...") {
-                        chooseLibraryLocation()
-                    }
-
-                    if libraryLocationBookmark != nil {
-                        Button("Reset") {
-                            libraryLocationBookmark = nil
-                            libraryPath = defaultLibraryPath
-                            showRestartAlert = true
-                        }
-                        .foregroundStyle(.secondary)
-                    }
+            Section("Storage Location") {
+                Picker("Store recordings in", selection: $storageMode) {
+                    Text("iCloud Drive").tag(StorageMode.icloud)
+                    Text("This Mac").tag(StorageMode.local)
+                    Text("This Mac (Custom\u{2026})").tag(StorageMode.custom)
                 }
+                .onChange(of: storageMode) { _, newMode in
+                    handleStorageModeChange(newMode)
+                }
+
+                if state.isICloudUnavailable {
+                    Label("iCloud Drive is not available. Using local storage.", systemImage: "exclamationmark.icloud")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+
+                Text(state.library.store.baseDirectory.path(percentEncoded: false))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
             }
         }
         .formStyle(.grouped)
@@ -109,7 +108,18 @@ struct SettingsView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func chooseLibraryLocation() {
+    private func handleStorageModeChange(_ mode: StorageMode) {
+        if mode == .custom {
+            chooseCustomLocation()
+        } else {
+            Task {
+                await state.switchStorageLocation(to: mode)
+                showLocationChangedAlert = true
+            }
+        }
+    }
+
+    private func chooseCustomLocation() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -124,17 +134,16 @@ struct SettingsView: View {
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             ) {
-                libraryLocationBookmark = bookmark
-                libraryPath = url.path(percentEncoded: false)
-                // Also store the plain URL for AppState init
-                UserDefaults.standard.set(url, forKey: "libraryLocation")
-                showRestartAlert = true
+                UserDefaults.standard.set(bookmark, forKey: "libraryLocationBookmark")
+                Task {
+                    await state.switchStorageLocation(to: .custom, customURL: url)
+                    showLocationChangedAlert = true
+                }
             }
+        } else {
+            // User cancelled — revert picker to previous mode
+            let raw = UserDefaults.standard.string(forKey: "storageMode") ?? "icloud"
+            storageMode = StorageMode(rawValue: raw) ?? .icloud
         }
-    }
-
-    private var defaultLibraryPath: String {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("HiDock Recordings").path(percentEncoded: false)
     }
 }
