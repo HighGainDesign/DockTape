@@ -12,6 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusBarController: StatusBarController?
 
     static func main() {
+        // Sync iCloud settings before AppState reads them
+        SyncedDefaults.shared.start()
+
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
