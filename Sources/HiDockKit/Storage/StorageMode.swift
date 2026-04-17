@@ -44,20 +44,20 @@ public enum StorageLocationResolver {
     }
 
     /// Determine the initial storage mode for a pre-iCloud install.
-    ///
-    /// - Custom path set → `.custom`
-    /// - Default path has recordings → `.local` (don't orphan existing files)
-    /// - Fresh install → `.icloud`
+    /// Always defaults to iCloud. Returns `.custom` only if user had a custom path.
     public static func migratedMode(from defaults: UserDefaults) -> StorageMode {
         if defaults.url(forKey: "libraryLocation") != nil {
             return .custom
         }
-        // If the default local directory already has recordings, keep using it
-        let defaultDir = localDefault
-        if let contents = try? FileManager.default.contentsOfDirectory(atPath: defaultDir.path),
-           contents.contains(where: { $0.hasSuffix(".mp3") }) {
-            return .local
-        }
         return .icloud
+    }
+
+    /// Whether the default local directory has existing recordings that need migration attention.
+    public static var hasLocalRecordings: Bool {
+        let defaultDir = localDefault
+        guard let contents = try? FileManager.default.contentsOfDirectory(atPath: defaultDir.path) else {
+            return false
+        }
+        return contents.contains { $0.hasSuffix(".mp3") }
     }
 }

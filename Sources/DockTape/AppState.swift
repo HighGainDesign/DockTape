@@ -72,6 +72,7 @@ final class AppState {
     var triggerMerge: Bool = false
     var mergeFilenames: [String] = []
     var showMergeDeletePrompt: Bool = false
+    var showMigrationPrompt: Bool = false
     var errorMessage: String?
     var statusMessage: String = "No device connected"
 
@@ -100,6 +101,11 @@ final class AppState {
             let migrated = StorageLocationResolver.migratedMode(from: defaults)
             defaults.set(migrated.rawValue, forKey: "storageMode")
             mode = migrated
+
+            // Show migration prompt if switching to iCloud but local recordings exist
+            if migrated == .icloud && StorageLocationResolver.hasLocalRecordings {
+                showMigrationPrompt = true
+            }
         }
 
         // Resolve custom URL from security-scoped bookmark if available

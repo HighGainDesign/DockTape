@@ -35,6 +35,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 appState.statusMessage = "Storage error: \(error.localizedDescription)"
             }
+
+            if appState.showMigrationPrompt {
+                appState.showMigrationPrompt = false
+                showMigrationAlert()
+            }
         }
         NSApp.activate()
     }
@@ -46,5 +51,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         Task { @MainActor in await appState.refreshAll() }
+    }
+
+    private func showMigrationAlert() {
+        let alert = NSAlert()
+        alert.messageText = "DockTape Now Uses iCloud Drive"
+        alert.informativeText = "Your recordings are now stored in iCloud Drive so they sync across your devices.\n\nYou have existing recordings in ~/Documents/HiDock Recordings/. To access them in DockTape, move them to the iCloud Drive folder using Finder.\n\nYou can change the storage location in Settings → General."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Open in Finder")
+        alert.addButton(withTitle: "OK")
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            // Open both folders in Finder
+            let local = StorageLocationResolver.localDefault
+            let icloud = StorageLocationResolver.resolve(mode: .icloud, customURL: nil)
+            NSWorkspace.shared.activateFileViewerSelecting([local, icloud])
+        }
     }
 }
