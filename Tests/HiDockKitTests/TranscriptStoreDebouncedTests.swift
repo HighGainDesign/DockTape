@@ -54,25 +54,22 @@ final class TranscriptStoreDebouncedTests: XCTestCase {
         XCTAssertTrue(txtContent.contains("Carol"))
     }
 
-    func testStaleTxtDetectedOnLoad() async throws {
+    func testLazyLoadTranscript() async throws {
         let t = makeTranscript()
         try await store.save(t, mp3Filename: "test.mp3")
-        await store.flushPendingTxtWrites()
 
-        let txtURL = tmpDir.appendingPathComponent("test.txt")
-
-        // Make TXT stale by setting its mod time to the past
-        try "".write(to: txtURL, atomically: true, encoding: .utf8)
-        let past = Date().addingTimeInterval(-10)
-        try FileManager.default.setAttributes([.modificationDate: past], ofItemAtPath: txtURL.path)
-
-        // Reload — should detect stale TXT
+        // Create a fresh store — loadAll only scans filenames
         let store2 = TranscriptStore(baseDirectory: tmpDir)
         try await store2.loadAll()
-        await store2.flushPendingTxtWrites()
 
-        let refreshed = try String(contentsOf: txtURL, encoding: .utf8)
-        XCTAssertTrue(refreshed.contains("Alice"))
+        // hasTranscript is fast (filename-based)
+        let has = await store2.hasTranscript(for: "test.mp3")
+        XCTAssertTrue(has)
+
+        // Accessing the transcript triggers on-demand parsing
+        let loaded = await store2.transcript(for: "test.mp3")
+        XCTAssertNotNil(loaded)
+        XCTAssertEqual(loaded?.segments.count, t.segments.count)
     }
 
     func testLoadAllFindsTranscriptsInSubfolders() async throws {

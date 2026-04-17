@@ -13,9 +13,11 @@ public actor SummaryStore {
         self.baseDirectory = baseDirectory
     }
 
-    /// Load all summaries from disk (recursively, including subfolders).
+    /// Set of MP3 filenames that have summary files on disk.
+    private var knownFiles: Set<String> = []
+
+    /// Scan for summary files (existence only, no parsing). Fast startup.
     public func loadAll() throws {
-        cache.removeAll()
         let fm = FileManager.default
         guard fm.fileExists(atPath: baseDirectory.path) else { return }
 
@@ -28,24 +30,30 @@ public actor SummaryStore {
         let basePath = baseDirectory.resolvingSymlinksInPath().path
         let basePrefix = basePath.hasSuffix("/") ? basePath : basePath + "/"
 
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        var found: Set<String> = []
         for case let file as URL in enumerator {
             guard file.pathExtension == "json",
                   file.lastPathComponent.contains(".summary.") else { continue }
-            do {
-                let data = try Data(contentsOf: file)
-                let summary = try decoder.decode(Summary.self, from: data)
-                let resolvedPath = file.resolvingSymlinksInPath().path
-                let relativePath = resolvedPath.hasPrefix(basePrefix)
-                    ? String(resolvedPath.dropFirst(basePrefix.count))
-                    : file.lastPathComponent
-                let mp3Key = relativePath.replacingOccurrences(of: ".summary.json", with: ".mp3")
-                cache[mp3Key] = summary
-            } catch {
-                continue  // skip corrupt files
+            let resolvedPath = file.resolvingSymlinksInPath().path
+            let relativePath = resolvedPath.hasPrefix(basePrefix)
+                ? String(resolvedPath.dropFirst(basePrefix.count))
+                : file.lastPathComponent
+            var mp3Key = relativePath.replacingOccurrences(of: ".summary.json", with: ".mp3")
+            if mp3Key.hasPrefix(".") && mp3Key.hasSuffix(".icloud") {
+                mp3Key = String(mp3Key.dropFirst(1).dropLast(7))
             }
+            found.insert(mp3Key)
         }
+        knownFiles = found
+    }
+
+    /// Load a single summary from disk on demand.
+    private func loadFromDisk(mp3Filename: String) -> Summary? {
+        let url = fileURL(for: mp3Filename)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(Summary.self, from: data)
     }
 
     /// Save a summary, keyed by MP3 filename.
@@ -58,16 +66,22 @@ public actor SummaryStore {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: url)
         cache[mp3Filename] = summary
+        knownFiles.insert(mp3Filename)
     }
 
-    /// Get a summary for a recording.
+    /// Get a summary for a recording (lazy-loads from disk).
     public func summary(for mp3Filename: String) -> Summary? {
-        cache[mp3Filename]
+        if let cached = cache[mp3Filename] { return cached }
+        if let loaded = loadFromDisk(mp3Filename: mp3Filename) {
+            cache[mp3Filename] = loaded
+            return loaded
+        }
+        return nil
     }
 
-    /// Check if a summary exists.
+    /// Check if a summary exists (fast, no parsing).
     public func hasSummary(for mp3Filename: String) -> Bool {
-        cache[mp3Filename] != nil
+        cache[mp3Filename] != nil || knownFiles.contains(mp3Filename)
     }
 
     /// Toggle an action item's completion state and persist.
@@ -94,16 +108,17 @@ public actor SummaryStore {
         let url = fileURL(for: mp3Filename)
         try? FileManager.default.removeItem(at: url)
         cache.removeValue(forKey: mp3Filename)
+        knownFiles.remove(mp3Filename)
     }
 
-    /// All cached summaries.
+    /// All cached summaries (only those already loaded).
     public func allSummaries() -> [Summary] {
         Array(cache.values)
     }
 
-    /// All MP3 filenames that have summaries.
+    /// All MP3 filenames that have summaries (from disk scan, no parsing).
     public func allSummarizedFilenames() -> [String] {
-        Array(cache.keys)
+        Array(knownFiles)
     }
 
     /// Re-key a summary after recording rename, moving the file on disk

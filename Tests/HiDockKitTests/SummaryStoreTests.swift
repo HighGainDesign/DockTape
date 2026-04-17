@@ -66,8 +66,12 @@ final class SummaryStoreTests: XCTestCase {
         let store2 = SummaryStore(baseDirectory: tempDir)
         try await store2.loadAll()
 
-        let all = await store2.allSummaries()
-        XCTAssertEqual(all.count, 2)
+        // loadAll scans filenames only (lazy loading)
+        let filenames = await store2.allSummarizedFilenames()
+        XCTAssertEqual(filenames.count, 2)
+        // Accessing individual summaries triggers on-demand loading
+        let s1Loaded = await store2.summary(for: "a.mp3")
+        XCTAssertNotNil(s1Loaded)
     }
 
     func testUpdateItemCompletion() async throws {

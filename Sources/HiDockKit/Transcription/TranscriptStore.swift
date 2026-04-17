@@ -15,9 +15,11 @@ public actor TranscriptStore {
         self.baseDirectory = baseDirectory
     }
 
-    /// Load all transcripts from disk (recursively, including subfolders).
+    /// Set of MP3 filenames that have transcript files on disk.
+    private var knownFiles: Set<String> = []
+
+    /// Scan for transcript files (existence only, no parsing). Fast startup.
     public func loadAll() throws {
-        cache.removeAll()
         let fm = FileManager.default
         guard fm.fileExists(atPath: baseDirectory.path) else { return }
 
@@ -27,53 +29,34 @@ public actor TranscriptStore {
             options: .skipsHiddenFiles
         ) else { return }
 
-        // Use resolvingSymlinksInPath to handle /var -> /private/var on macOS.
         let basePath = baseDirectory.resolvingSymlinksInPath().path
         let basePrefix = basePath.hasSuffix("/") ? basePath : basePath + "/"
 
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        var found: Set<String> = []
         for case let file as URL in enumerator {
             guard file.pathExtension == "json",
                   file.lastPathComponent.contains(".transcript.") else { continue }
-            do {
-                let data = try Data(contentsOf: file)
-                let transcript = try decoder.decode(Transcript.self, from: data)
-                // Derive folder-relative mp3 key by stripping base directory
-                let resolvedPath = file.resolvingSymlinksInPath().path
-                let relativePath = resolvedPath.hasPrefix(basePrefix)
-                    ? String(resolvedPath.dropFirst(basePrefix.count))
-                    : file.lastPathComponent
-                let mp3Key = relativePath.replacingOccurrences(of: ".transcript.json", with: ".mp3")
-                cache[mp3Key] = transcript
-            } catch {
-                // Skip corrupt transcript files rather than aborting the entire load
-                continue
+            let resolvedPath = file.resolvingSymlinksInPath().path
+            let relativePath = resolvedPath.hasPrefix(basePrefix)
+                ? String(resolvedPath.dropFirst(basePrefix.count))
+                : file.lastPathComponent
+            // Handle iCloud stub files
+            var mp3Key = relativePath.replacingOccurrences(of: ".transcript.json", with: ".mp3")
+            if mp3Key.hasPrefix(".") && mp3Key.hasSuffix(".icloud") {
+                mp3Key = String(mp3Key.dropFirst(1).dropLast(7))
             }
+            found.insert(mp3Key)
         }
+        knownFiles = found
+    }
 
-        // Detect and regenerate stale TXT files
-        for (mp3Key, _) in cache {
-            let basename = (mp3Key as NSString).deletingPathExtension
-            let jsonURL = baseDirectory.appendingPathComponent("\(basename).transcript.json")
-            let txtURL = baseDirectory.appendingPathComponent("\(basename).txt")
-
-            guard fm.fileExists(atPath: txtURL.path) else {
-                dirtyTxtFiles.insert(mp3Key)
-                continue
-            }
-
-            let jsonMod = (try? fm.attributesOfItem(atPath: jsonURL.path)[.modificationDate] as? Date) ?? .distantPast
-            let txtMod = (try? fm.attributesOfItem(atPath: txtURL.path)[.modificationDate] as? Date) ?? .distantFuture
-
-            if jsonMod > txtMod {
-                dirtyTxtFiles.insert(mp3Key)
-            }
-        }
-
-        if !dirtyTxtFiles.isEmpty {
-            flushPendingTxtWrites()
-        }
+    /// Load a single transcript from disk on demand.
+    private func loadFromDisk(mp3Filename: String) -> Transcript? {
+        let url = fileURL(for: mp3Filename)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(Transcript.self, from: data)
     }
 
     /// Save a transcript, keyed by MP3 filename.
@@ -85,16 +68,23 @@ public actor TranscriptStore {
         let data = try encoder.encode(transcript)
         try data.write(to: url)
         cache[mp3Filename] = transcript
+        knownFiles.insert(mp3Filename)
     }
 
     /// Get a transcript for a recording by MP3 filename.
     public func transcript(for mp3Filename: String) -> Transcript? {
-        cache[mp3Filename]
+        if let cached = cache[mp3Filename] { return cached }
+        // Lazy load from disk
+        if let loaded = loadFromDisk(mp3Filename: mp3Filename) {
+            cache[mp3Filename] = loaded
+            return loaded
+        }
+        return nil
     }
 
-    /// Check if a transcript exists for a recording.
+    /// Check if a transcript exists for a recording (fast, no parsing).
     public func hasTranscript(for mp3Filename: String) -> Bool {
-        cache[mp3Filename] != nil
+        cache[mp3Filename] != nil || knownFiles.contains(mp3Filename)
     }
 
     /// Delete a transcript.
@@ -102,6 +92,7 @@ public actor TranscriptStore {
         let url = fileURL(for: mp3Filename)
         try? FileManager.default.removeItem(at: url)
         cache.removeValue(forKey: mp3Filename)
+        knownFiles.remove(mp3Filename)
     }
 
     /// All available transcripts.
@@ -109,9 +100,9 @@ public actor TranscriptStore {
         Array(cache.values)
     }
 
-    /// All MP3 filenames that have transcripts.
+    /// All MP3 filenames that have transcripts (from disk scan, no parsing).
     public func allTranscribedFilenames() -> [String] {
-        Array(cache.keys)
+        Array(knownFiles)
     }
 
     /// Update speaker names in a transcript. JSON is written immediately; TXT regeneration is debounced.
