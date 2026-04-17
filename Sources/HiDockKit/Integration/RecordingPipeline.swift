@@ -115,11 +115,13 @@ public actor RecordingPipeline {
         try await prepareModels()
 
         let mp3URL = await recordingStore.mp3URL(for: meta)
+        // Skip diarization for voice memos (single speaker)
+        let skipDiarization = meta.mode == "Wip"
         let transcript = try await TranscriptionPipeline.transcribe(
             audioURL: mp3URL,
             recordingFilename: filename,
             transcriber: transcriber!,
-            diarizer: diarizer
+            diarizer: skipDiarization ? nil : diarizer
         )
 
         try await transcriptStore.save(transcript, mp3Filename: filename)
@@ -172,12 +174,13 @@ public actor RecordingPipeline {
             let mp3URL = await recordingStore.mp3URL(for: meta)
 
             do {
+                let skipDiarization = meta.mode == "Wip"
                 let transcript = try await TranscriptionPipeline.transcribe(
                     audioURL: mp3URL,
                     recordingFilename: meta.filename,
                     transcriber: transcriber!,
-                    diarizer: diarizer,
-                    numSpeakers: numSpeakers
+                    diarizer: skipDiarization ? nil : diarizer,
+                    numSpeakers: skipDiarization ? 1 : numSpeakers
                 )
 
                 let elapsed = String(format: "%.1f", CFAbsoluteTimeGetCurrent() - startTime)
