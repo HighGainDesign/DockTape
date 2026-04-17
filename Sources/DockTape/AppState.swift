@@ -73,6 +73,7 @@ final class AppState {
     var mergeFilenames: [String] = []
     var showMergeDeletePrompt: Bool = false
     var showMigrationPrompt: Bool = false
+    var syncProgress: Double? = nil  // 0.0–1.0 during sync, nil when idle
     var errorMessage: String?
     var statusMessage: String = "No device connected"
 
@@ -231,14 +232,17 @@ final class AppState {
     }
 
     func syncAll() async {
+        syncProgress = 0
         do {
             let result = try await device.syncAll(
                 deleteAfterDownload: autoDeleteAfterDownload
             ) { [weak self] progress in
                 Task { @MainActor [weak self] in
-                    self?.statusMessage = "Downloading \(progress.currentFile)..."
+                    self?.statusMessage = "Downloading \(progress.currentFile) (\(progress.fileIndex + 1)/\(progress.totalFiles))..."
+                    self?.syncProgress = progress.overallFraction
                 }
             }
+            syncProgress = nil
             await library.refresh()
 
             if result.downloaded.isEmpty && result.failed.isEmpty {
@@ -249,6 +253,7 @@ final class AppState {
                 statusMessage = msg
             }
         } catch {
+            syncProgress = nil
             errorMessage = "Sync failed: \(error.localizedDescription)"
             statusMessage = "Sync failed"
         }

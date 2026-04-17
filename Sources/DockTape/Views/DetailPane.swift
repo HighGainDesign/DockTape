@@ -547,21 +547,37 @@ struct TranscriptionBar: View {
                 context.date.timeIntervalSince($0)
             } ?? 0
 
+            let queueTotal = state.transcription.queue.count
+            let queueIndex = state.transcription.queueIndex
+
             VStack(spacing: 0) {
                 Divider()
-                HStack(spacing: 12) {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel("Transcribing")
 
+                // Progress bar
+                if queueTotal > 1 {
+                    ProgressView(value: Double(queueIndex), total: Double(queueTotal))
+                        .tint(.orange)
+                        .controlSize(.small)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
+                } else {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                        .tint(.orange)
+                        .controlSize(.small)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
+                }
+
+                HStack(spacing: 12) {
                     if let file = state.transcription.transcribingFile {
                         let rec = state.library.recordings.first { $0.filename == file }
                         VStack(alignment: .leading, spacing: 1) {
                             HStack(spacing: 6) {
                                 Text(state.transcription.phase)
                                     .font(.caption.weight(.medium))
-                                if state.transcription.queue.count > 1 {
-                                    Text("\(state.transcription.queueIndex + 1) of \(state.transcription.queue.count)")
+                                if queueTotal > 1 {
+                                    Text("\(queueIndex + 1) of \(queueTotal)")
                                         .font(.caption.monospacedDigit())
                                         .padding(.horizontal, 6)
                                         .padding(.vertical, 1)
@@ -593,7 +609,7 @@ struct TranscriptionBar: View {
                     .controlSize(.small)
                 }
                 .padding(.horizontal, 16)
-                .padding(.vertical, 8)
+                .padding(.vertical, 6)
                 .background(.orange.opacity(0.08))
             }
         }
@@ -613,21 +629,37 @@ struct SummarizationBar: View {
     @Bindable var state: AppState
 
     var body: some View {
+        let queueTotal = state.summarization.queueCount
+        let queueIndex = state.summarization.queueIndex
+
         VStack(spacing: 0) {
             Divider()
-            HStack(spacing: 12) {
-                ProgressView()
-                    .controlSize(.small)
-                    .accessibilityLabel("Summarizing")
 
+            // Progress bar
+            if queueTotal > 1 {
+                ProgressView(value: Double(queueIndex), total: Double(queueTotal))
+                    .tint(.purple)
+                    .controlSize(.small)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+            } else {
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .tint(.purple)
+                    .controlSize(.small)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+            }
+
+            HStack(spacing: 12) {
                 if let file = state.summarization.summarizingFile {
                     let rec = state.library.recordings.first { $0.filename == file }
                     VStack(alignment: .leading, spacing: 1) {
                         HStack(spacing: 6) {
                             Text(state.summarization.phase)
                                 .font(.caption.weight(.medium))
-                            if state.summarization.queueCount > 1 {
-                                Text("\(state.summarization.queueIndex + 1) of \(state.summarization.queueCount)")
+                            if queueTotal > 1 {
+                                Text("\(queueIndex + 1) of \(queueTotal)")
                                     .font(.caption.monospacedDigit())
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 1)
@@ -655,7 +687,7 @@ struct SummarizationBar: View {
                 .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .padding(.vertical, 6)
             .background(.bar)
         }
     }

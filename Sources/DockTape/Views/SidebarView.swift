@@ -126,6 +126,22 @@ struct SidebarView: View {
             }
             .listStyle(.sidebar)
 
+            if let progress = state.syncProgress {
+                Divider()
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: progress)
+                        .tint(.blue)
+                        .controlSize(.small)
+                    Text(state.statusMessage)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.blue.opacity(0.05))
+            }
+
             Divider()
             deviceStatusBar
         }
