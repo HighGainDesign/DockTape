@@ -87,9 +87,9 @@ struct SettingsView: View {
 
     private var aboutView: some View {
         VStack(spacing: 12) {
-            Image(systemName: "cable.connector.horizontal")
-                .font(.system(size: 48))
-                .foregroundStyle(Color.accentColor)
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .frame(width: 96, height: 96)
             Text("DockTape")
                 .font(.title.bold())
             Text("HiDock Manager")
