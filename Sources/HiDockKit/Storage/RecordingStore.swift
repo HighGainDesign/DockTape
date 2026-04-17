@@ -160,19 +160,45 @@ public actor RecordingStore {
         for case let url as URL in enumerator {
             let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
             if isDir { continue }
-            guard url.pathExtension.lowercased() == "mp3" else { continue }
+
+            // Handle both local MP3s and iCloud placeholder files (.filename.mp3.icloud)
+            let isMP3 = url.pathExtension.lowercased() == "mp3"
+            let isICloudStub = url.lastPathComponent.hasSuffix(".mp3.icloud") && url.lastPathComponent.hasPrefix(".")
+            guard isMP3 || isICloudStub else { continue }
+
+            // Trigger download for iCloud stubs
+            if isICloudStub {
+                try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+            }
 
             guard let attrs = try? url.resourceValues(forKeys: [.fileSizeKey, .creationDateKey]) else {
                 continue
             }
 
+            // Convert iCloud stub filename to real filename
+            // .filename.mp3.icloud → filename.mp3
+            let realLastComponent: String
+            if isICloudStub {
+                var name = url.lastPathComponent
+                name = String(name.dropFirst(1))   // remove leading "."
+                name = String(name.dropLast(7))    // remove trailing ".icloud"
+                realLastComponent = name
+            } else {
+                realLastComponent = url.lastPathComponent
+            }
+
             // Compute relative path from base; resolve symlinks to match /var -> /private/var
             let normalizedPath = url.resolvingSymlinksInPath().path
-            let relativePath: String
+            var relativePath: String
             if normalizedPath.hasPrefix(basePrefix) {
                 relativePath = String(normalizedPath.dropFirst(basePrefix.count))
             } else {
                 relativePath = url.lastPathComponent
+            }
+            // Fix relative path for iCloud stubs
+            if isICloudStub {
+                let dir = (relativePath as NSString).deletingLastPathComponent
+                relativePath = dir == "." || dir.isEmpty ? realLastComponent : "\(dir)/\(realLastComponent)"
             }
 
             // Determine folder from relative path (first path component if nested)
@@ -180,13 +206,13 @@ public actor RecordingStore {
             let recordingFolder: String? = components.count > 1 ? String(components[0]) : nil
 
             let fileSize = UInt64(attrs.fileSize ?? 0)
-            let parsed = FilenameParsing.parse(url.lastPathComponent)
+            let parsed = FilenameParsing.parse(realLastComponent)
             let recordedAt = parsed.date ?? attrs.creationDate
             let mode: String
             if parsed.mode != .unknown {
                 mode = parsed.mode.rawValue
             } else {
-                mode = meta[url.lastPathComponent]?.mode ?? ""
+                mode = meta[realLastComponent]?.mode ?? ""
             }
 
             results.append(RecordingMetadata(
