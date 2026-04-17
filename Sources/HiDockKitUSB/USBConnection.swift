@@ -16,6 +16,10 @@ public final class USBConnection: DeviceTransport, @unchecked Sendable {
     private let ioQueue = DispatchQueue(label: "com.hidock.usb-io")
     private let timeoutMs: UInt32 = 5000     // 5 second timeout
 
+    // USB bulk transfer endpoints (macOS-specific, not in cross-platform DeviceConstants)
+    private static let bulkOutEndpoint: UInt8 = 0x01
+    private static let bulkInEndpoint: UInt8 = 0x82
+
     public init(vendorID: UInt16, productID: UInt16) {
         self.vendorID = vendorID
         self.productID = productID
@@ -23,47 +27,56 @@ public final class USBConnection: DeviceTransport, @unchecked Sendable {
 
     /// Open the device, detach kernel driver if needed, claim interface.
     public func open() async throws {
-        // Init libusb
-        var ctx: OpaquePointer?
-        let initResult = libusb_init(&ctx)
-        guard initResult == 0 else {
-            throw USBError.openFailed("libusb_init failed: \(initResult)")
-        }
-        context = ctx
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.ioQueue.async {
+                // Init libusb
+                var ctx: OpaquePointer?
+                let initResult = libusb_init(&ctx)
+                guard initResult == 0 else {
+                    continuation.resume(throwing: TransportError.openFailed("libusb_init failed: \(initResult)"))
+                    return
+                }
+                self.context = ctx
 
-        // Open device by VID/PID
-        handle = libusb_open_device_with_vid_pid(ctx, vendorID, productID)
-        guard handle != nil else {
-            libusb_exit(ctx)
-            context = nil
-            throw USBError.deviceNotFound
-        }
+                // Open device by VID/PID
+                self.handle = libusb_open_device_with_vid_pid(ctx, self.vendorID, self.productID)
+                guard self.handle != nil else {
+                    libusb_exit(ctx)
+                    self.context = nil
+                    continuation.resume(throwing: TransportError.deviceNotFound)
+                    return
+                }
 
-        // Auto-detach kernel driver when claiming (works cross-platform;
-        // on macOS this enables IOKit device seize)
-        let autoDetach = libusb_set_auto_detach_kernel_driver(handle, 1)
-        print("    auto_detach_kernel_driver: \(autoDetach)")
+                // Auto-detach kernel driver when claiming (works cross-platform;
+                // on macOS this enables IOKit device seize)
+                let autoDetach = libusb_set_auto_detach_kernel_driver(self.handle, 1)
+                print("    auto_detach_kernel_driver: \(autoDetach)")
 
-        // Try set_configuration first (like midock does).
-        // On macOS this can fail — not fatal, claim_interface is what matters.
-        let configResult = libusb_set_configuration(handle, 1)
-        print("    set_configuration: \(configResult)")
+                // Try set_configuration first (like midock does).
+                // On macOS this can fail — not fatal, claim_interface is what matters.
+                let configResult = libusb_set_configuration(self.handle, 1)
+                print("    set_configuration: \(configResult)")
 
-        // Claim interface
-        let claimResult = libusb_claim_interface(handle, interfaceNum)
-        if claimResult != 0 {
-            print("    claim_interface failed: \(claimResult)")
-            print("")
-            print("    On macOS, grant USB access to your terminal app:")
-            print("    System Settings → Privacy & Security → USB")
-            print("    (Add Terminal.app or your IDE)")
-            print("")
-            print("    Also try: unplug/replug device, close HiNotes browser tab")
-            libusb_close(handle)
-            handle = nil
-            libusb_exit(ctx)
-            context = nil
-            throw USBError.openFailed("libusb_claim_interface failed: \(claimResult)")
+                // Claim interface
+                let claimResult = libusb_claim_interface(self.handle, self.interfaceNum)
+                if claimResult != 0 {
+                    print("    claim_interface failed: \(claimResult)")
+                    print("")
+                    print("    On macOS, grant USB access to your terminal app:")
+                    print("    System Settings → Privacy & Security → USB")
+                    print("    (Add Terminal.app or your IDE)")
+                    print("")
+                    print("    Also try: unplug/replug device, close HiNotes browser tab")
+                    libusb_close(self.handle)
+                    self.handle = nil
+                    libusb_exit(ctx)
+                    self.context = nil
+                    continuation.resume(throwing: TransportError.openFailed("libusb_claim_interface failed: \(claimResult)"))
+                    return
+                }
+
+                continuation.resume()
+            }
         }
     }
 
@@ -75,7 +88,7 @@ public final class USBConnection: DeviceTransport, @unchecked Sendable {
                     guard let ptr = rawBuffer.baseAddress else { return -1 }
                     return libusb_bulk_transfer(
                         self.handle,
-                        DeviceConstants.bulkOutEndpoint,
+                        Self.bulkOutEndpoint,
                         UnsafeMutablePointer(mutating: ptr.assumingMemoryBound(to: UInt8.self)),
                         Int32(rawBuffer.count),
                         &transferred,
@@ -85,7 +98,7 @@ public final class USBConnection: DeviceTransport, @unchecked Sendable {
                 if result == 0 {
                     continuation.resume()
                 } else {
-                    continuation.resume(throwing: USBError.writeFailed(result))
+                    continuation.resume(throwing: TransportError.writeFailed(result))
                 }
             }
         }
@@ -98,7 +111,7 @@ public final class USBConnection: DeviceTransport, @unchecked Sendable {
                 var transferred: Int32 = 0
                 let result = libusb_bulk_transfer(
                     self.handle,
-                    DeviceConstants.bulkInEndpoint,
+                    Self.bulkInEndpoint,
                     &buffer,
                     Int32(maxLength),
                     &transferred,
@@ -109,12 +122,12 @@ public final class USBConnection: DeviceTransport, @unchecked Sendable {
                     if transferred > 0 {
                         continuation.resume(returning: Data(buffer.prefix(Int(transferred))))
                     } else if result == LIBUSB_ERROR_TIMEOUT.rawValue {
-                        continuation.resume(throwing: USBError.readTimeout)
+                        continuation.resume(throwing: TransportError.readTimeout)
                     } else {
                         continuation.resume(returning: Data())
                     }
                 } else {
-                    continuation.resume(throwing: USBError.readFailed(result))
+                    continuation.resume(throwing: TransportError.readFailed(result))
                 }
             }
         }

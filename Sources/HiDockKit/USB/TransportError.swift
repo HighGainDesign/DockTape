@@ -2,8 +2,8 @@
 
 import Foundation
 
-/// Errors from the USB transport layer.
-public enum USBError: Error, Sendable {
+/// Errors from the device transport layer (USB, ExternalAccessory, etc.).
+public enum TransportError: Error, Sendable {
     case deviceNotFound
     case openFailed(String)
     case interfaceNotFound
@@ -28,7 +28,7 @@ public enum ProtocolError: Error, Sendable {
 
 /// High-level HiDock errors.
 public enum HiDockError: Error, Sendable {
-    case usb(USBError)
+    case usb(TransportError)
     case proto(ProtocolError)
     case fileNotFound(String)
     case transferFailed(String)

@@ -51,7 +51,7 @@ final class MockDeviceTransport: DeviceTransport, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard _responseIndex < _responses.count else {
-            throw USBError.readTimeout
+            throw TransportError.readTimeout
         }
         let response = _responses[_responseIndex]
         _responseIndex += 1
