@@ -417,6 +417,7 @@ final class AppState {
     func executeMerge(as name: String) async {
         guard mergeFilenames.count >= 2 else { return }
 
+        statusMessage = "Merging \(mergeFilenames.count) recordings..."
         do {
             let merged = try await library.store.mergeRecordings(filenames: mergeFilenames, as: name)
             statusMessage = "Merged \(mergeFilenames.count) recordings into \(merged.filename)"
