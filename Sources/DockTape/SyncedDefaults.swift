@@ -19,9 +19,6 @@ final class SyncedDefaults {
         "autoSummarizeTemplate",
         "autoDeleteAfterDownload",
         "autoSyncClock",
-        "librarySortBy",
-        "libraryFilterMode",
-        "libraryFilterPeriod",
     ]
 
     private let cloud = NSUbiquitousKeyValueStore.default
