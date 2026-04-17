@@ -69,6 +69,9 @@ final class AppState {
     var selectedDetailTab: DetailTab = .info
     var triggerRename: Bool = false
     var triggerCustomPrompt: Bool = false
+    var triggerMerge: Bool = false
+    var mergeFilenames: [String] = []
+    var showMergeDeletePrompt: Bool = false
     var errorMessage: String?
     var statusMessage: String = "No device connected"
 
@@ -385,6 +388,56 @@ final class AppState {
         } catch {
             errorMessage = "Rename failed: \(error.localizedDescription)"
         }
+    }
+
+    // MARK: - Merge Recordings
+
+    /// Initiate merge flow for the currently selected recordings.
+    func startMerge() {
+        let selected = library.selectedRecordings
+        guard selected.count >= 2 else {
+            errorMessage = "Select at least 2 recordings to merge."
+            return
+        }
+        // Sort by recorded date (earliest first)
+        let sorted = library.recordings
+            .filter { selected.contains($0.filename) }
+            .sorted { ($0.recordedAt ?? .distantFuture) < ($1.recordedAt ?? .distantFuture) }
+        mergeFilenames = sorted.map(\.filename)
+        triggerMerge = true
+    }
+
+    /// Execute the merge with the given name. Called after the rename dialog.
+    func executeMerge(as name: String) async {
+        guard mergeFilenames.count >= 2 else { return }
+
+        do {
+            let merged = try await library.store.mergeRecordings(filenames: mergeFilenames, as: name)
+            statusMessage = "Merged \(mergeFilenames.count) recordings into \(merged.filename)"
+            await library.refresh()
+            // Select the merged recording
+            library.selectedRecordings = [merged.filename]
+            // Prompt to delete originals
+            showMergeDeletePrompt = true
+        } catch {
+            errorMessage = "Merge failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Delete the original recordings after a merge.
+    func deleteMergeOriginals() async {
+        for filename in mergeFilenames {
+            do {
+                try await library.store.deleteRecordingAndSidecars(filename: filename)
+                try await transcription.transcriptStore.delete(for: filename)
+                try? await summarization.summaryStore.delete(for: filename)
+                summarization.hasSummary.remove(filename)
+            } catch {
+                errorMessage = "Failed to delete \(filename): \(error.localizedDescription)"
+            }
+        }
+        mergeFilenames = []
+        await library.refresh()
     }
 
     func updateSpeakerNames(for filename: String, names: [String: String]) async {

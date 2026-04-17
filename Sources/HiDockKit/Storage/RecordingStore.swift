@@ -227,6 +227,88 @@ public actor RecordingStore {
         )
     }
 
+    // MARK: - Merge recordings
+
+    /// Merge multiple recordings into a single MP3 by concatenating their data.
+    /// Files are concatenated in the order provided. Returns metadata for the merged recording.
+    @discardableResult
+    public func mergeRecordings(filenames: [String], as newFilename: String) throws -> RecordingMetadata {
+        guard filenames.count >= 2 else {
+            throw HiDockError.invalidFilename("Need at least 2 recordings to merge")
+        }
+
+        let sanitized = Self.sanitizeFilename(newFilename.hasSuffix(".mp3") ? String(newFilename.dropLast(4)) : newFilename)
+        guard !sanitized.isEmpty else {
+            throw HiDockError.invalidFilename(newFilename)
+        }
+        let outputFilename = "\(sanitized).mp3"
+        let outputURL = baseDirectory.appendingPathComponent(outputFilename)
+
+        // Concatenate MP3 data
+        var mergedData = Data()
+        var earliestDate: Date?
+        var firstMode: String = ""
+
+        for (index, filename) in filenames.enumerated() {
+            let url = baseDirectory.appendingPathComponent(filename)
+            let data = try Data(contentsOf: url)
+            mergedData.append(data)
+
+            // Get metadata from first file for mode, earliest date from all
+            let parsed = FilenameParsing.parse((filename as NSString).lastPathComponent)
+            let attrs = try? url.resourceValues(forKeys: [.creationDateKey])
+            let date = parsed.date ?? attrs?.creationDate
+
+            if let date {
+                if earliestDate == nil || date < earliestDate! {
+                    earliestDate = date
+                }
+            }
+            if index == 0 {
+                firstMode = parsed.mode != .unknown ? parsed.mode.rawValue : (mode(for: filename) ?? "")
+            }
+        }
+
+        try mergedData.write(to: outputURL, options: .atomic)
+
+        let fileSize = UInt64(mergedData.count)
+
+        // Record metadata
+        let metaEntry = RecordingMeta(
+            mode: firstMode.isEmpty ? nil : firstMode,
+            deviceFilename: nil,
+            mergedFrom: filenames.map { ($0 as NSString).lastPathComponent }
+        )
+        meta[outputURL.lastPathComponent] = metaEntry
+        saveLibraryMeta()
+
+        return RecordingMetadata(
+            filename: outputFilename,
+            recordedAt: earliestDate,
+            mode: firstMode,
+            fileSizeBytes: fileSize,
+            estimatedDuration: DurationCalculator.estimateDuration(fileSize: fileSize)
+        )
+    }
+
+    /// Delete a local recording and all its sidecars.
+    public func deleteRecordingAndSidecars(filename: String) throws {
+        let basename = ((filename as NSString).lastPathComponent as NSString).deletingPathExtension
+        let dir: URL
+        let folderPath = (filename as NSString).deletingLastPathComponent
+        if folderPath.isEmpty || folderPath == "." {
+            dir = baseDirectory
+        } else {
+            dir = baseDirectory.appendingPathComponent(folderPath)
+        }
+
+        for ext in [".mp3", ".transcript.json", ".summary.json", ".txt"] {
+            let url = dir.appendingPathComponent("\(basename)\(ext)")
+            try? FileManager.default.removeItem(at: url)
+        }
+        removeMeta(for: filename)
+    }
+
     /// Delete a local recording and its plain-text sidecar.
     public func deleteRecording(filename: String) throws {
         let url = baseDirectory.appendingPathComponent(filename)
@@ -283,6 +365,7 @@ public actor RecordingStore {
     public struct RecordingMeta: Codable {
         public var mode: String?
         public var deviceFilename: String?
+        public var mergedFrom: [String]?
     }
 
     /// In-memory cache of filename → metadata.

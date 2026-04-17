@@ -97,6 +97,19 @@ struct RecordingListPane: View {
             }
             return .handled
         }
+        .sheet(isPresented: $state.triggerMerge) {
+            MergeRenameSheet(state: state)
+        }
+        .alert("Delete Originals?", isPresented: $state.showMergeDeletePrompt) {
+            Button("Keep Originals") {
+                state.mergeFilenames = []
+            }
+            Button("Delete Originals", role: .destructive) {
+                Task { await state.deleteMergeOriginals() }
+            }
+        } message: {
+            Text("The \(state.mergeFilenames.count) original recordings can be deleted now or kept for reference.")
+        }
     }
 
     private var recordingTitle: String {
@@ -254,6 +267,16 @@ struct RecordingListPane: View {
             state.library.revealInFinder(rec)
         } label: {
             Label("Reveal in Finder", systemImage: "folder")
+        }
+
+        if state.library.selectedRecordings.count >= 2 {
+            Divider()
+
+            Button {
+                state.startMerge()
+            } label: {
+                Label("Merge Selected Recordings\u{2026}", systemImage: "arrow.triangle.merge")
+            }
         }
 
         Divider()

@@ -494,6 +494,8 @@ extension MainWindowController: NSMenuItemValidation {
         case #selector(MainMenuActions.showNextTab(_:)):
             let tabs = DetailTab.allCases
             return tabs.firstIndex(of: appState.selectedDetailTab).map { $0 < tabs.count - 1 } ?? false
+        case #selector(MainMenuActions.mergeRecordings(_:)):
+            return appState.library.selectedRecordings.count >= 2
         case #selector(MainMenuActions.syncAll(_:)):
             return appState.device.isConnected && !appState.device.isSyncing
         case #selector(MainMenuActions.refreshDevice(_:)),
@@ -528,6 +530,7 @@ extension MainWindowController: NSMenuItemValidation {
         appState.library.revealInFinder(rec)
     }
     @objc func deleteRecording(_ sender: Any?) { deleteAction(sender) }
+    @objc func mergeRecordings(_ sender: Any?) { appState.startMerge() }
     @objc func find(_ sender: Any?) { appState.library.isSearchFocused = true }
     @objc func showAllRecordings(_ sender: Any?) { appState.selectedView = .allRecordings }
     @objc func showDevice(_ sender: Any?) {

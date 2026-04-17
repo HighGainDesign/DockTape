@@ -11,6 +11,7 @@ import HiDockKit
     func rename(_ sender: Any?)
     func revealInFinder(_ sender: Any?)
     func deleteRecording(_ sender: Any?)
+    func mergeRecordings(_ sender: Any?)
     func find(_ sender: Any?)
     func showAllRecordings(_ sender: Any?)
     func showDevice(_ sender: Any?)
@@ -62,6 +63,8 @@ enum MainMenu {
 
         fileMenu.addItem(.separator())
         addItem(fileMenu, "Import from Device", action: #selector(MainMenuActions.importFromDevice(_:)), key: "i", modifiers: [.command, .shift])
+        fileMenu.addItem(.separator())
+        addItem(fileMenu, "Merge Selected Recordings\u{2026}", action: #selector(MainMenuActions.mergeRecordings(_:)), key: "m", modifiers: [.command, .shift])
         fileMenu.addItem(.separator())
         addItem(fileMenu, "Rename...", action: #selector(MainMenuActions.rename(_:)), key: "\r", modifiers: [])
         addItem(fileMenu, "Reveal in Finder", action: #selector(MainMenuActions.revealInFinder(_:)), key: "r", modifiers: [.command, .shift])
