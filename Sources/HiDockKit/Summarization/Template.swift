@@ -23,16 +23,46 @@ public struct Template: Codable, Identifiable, Sendable, Equatable, Hashable {
         Template(id: UUID().uuidString, name: name, description: description, promptText: promptText, isBuiltIn: false)
     }
 
-    /// The full system prompt sent to the LLM (prompt text + JSON schema).
-    public var systemPrompt: String {
+    /// The full system prompt sent to the LLM (speaker context + prompt text + JSON schema).
+    /// Pass the recording mode to inject speaker context.
+    public func systemPrompt(forMode mode: String = "") -> String {
         if promptText.isEmpty { return "" }
-        return "\(promptText)\n\n\(Self.jsonSchemaInstruction)"
+        let context = Self.speakerContext(forMode: mode)
+        if context.isEmpty {
+            return "\(promptText)\n\n\(Self.jsonSchemaInstruction)"
+        }
+        return "\(context)\n\n\(promptText)\n\n\(Self.jsonSchemaInstruction)"
     }
 
-    /// Wrap a user-provided one-shot custom prompt with the JSON output schema.
-    public static func buildCustomPrompt(_ userPrompt: String) -> String {
-        """
-        You are analyzing a transcript of an audio recording. The user wants:
+    /// The full system prompt without mode context (backward compat).
+    public var systemPrompt: String {
+        systemPrompt(forMode: "")
+    }
+
+    /// Speaker context preamble based on recording mode.
+    public static func speakerContext(forMode mode: String) -> String {
+        switch mode {
+        case "Rec":
+            return "This is a general recording. Speakers are participants whose roles are not known in advance."
+        case "Pho":
+            return "This is a phone or video call recording. Speakers are call participants."
+        case "Mee":
+            return "This is a meeting recording. Speakers are meeting participants with roughly equal roles."
+        case "Wip":
+            return "This is a voice memo by a single person. There are no other speakers. Treat the entire transcript as first-person narration — omit speaker labels in your summary."
+        default:
+            return ""
+        }
+    }
+
+    /// Wrap a user-provided one-shot custom prompt with speaker context and JSON output schema.
+    public static func buildCustomPrompt(_ userPrompt: String, mode: String = "") -> String {
+        let context = speakerContext(forMode: mode)
+        let preamble = context.isEmpty
+            ? "You are analyzing a transcript of an audio recording."
+            : "You are analyzing a transcript of an audio recording. \(context)"
+        return """
+        \(preamble) The user wants:
 
         \(userPrompt)
 

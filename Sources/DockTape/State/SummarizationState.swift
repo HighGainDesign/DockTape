@@ -65,12 +65,13 @@ final class SummarizationState {
                         continue
                     }
 
-                    let transcriptText = transcript.plainText(includeSpeakers: true)
+                    let isMemo = rec.mode == "Wip"
+                    let transcriptText = transcript.plainText(includeSpeakers: !isMemo)
                     let systemPrompt: String
                     if let customPrompt = entry.customPrompt {
-                        systemPrompt = Template.buildCustomPrompt(customPrompt)
+                        systemPrompt = Template.buildCustomPrompt(customPrompt, mode: rec.mode)
                     } else {
-                        systemPrompt = entry.template.systemPrompt
+                        systemPrompt = entry.template.systemPrompt(forMode: rec.mode)
                     }
 
                     let responseText = try await provider.summarize(
