@@ -94,6 +94,36 @@ public enum TranscriptExporter {
         return srt
     }
 
+    /// Export as Markdown with speaker headings, timestamps, and paragraphs.
+    public static func exportMarkdown(transcript: Transcript) -> String {
+        var lines: [String] = []
+        var currentSpeaker: String?
+
+        lines.append("# Transcript")
+        lines.append("")
+        let fmt = DateFormatter()
+        fmt.dateStyle = .long
+        fmt.timeStyle = .short
+        lines.append("*\(fmt.string(from: transcript.createdAt))*")
+        lines.append("")
+
+        for seg in transcript.segments {
+            let speaker = seg.speakerID.flatMap { transcript.speakerNames[$0] ?? $0 } ?? "Unknown"
+            let timestamp = formatTimestamp(seg.startTime)
+
+            if speaker != currentSpeaker {
+                if !lines.isEmpty { lines.append("") }
+                lines.append("**\(speaker)** `\(timestamp)`")
+                lines.append("")
+                currentSpeaker = speaker
+            }
+
+            lines.append(seg.text)
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - Chunking
 
     /// Groups consecutive same-speaker segments into chunks, splitting at maxChunkChars.

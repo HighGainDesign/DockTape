@@ -257,6 +257,20 @@ struct RecordingListPane: View {
 
         Divider()
 
+        let hasTranscriptForExport = (state.transcription.statuses[rec.filename] ?? .none) == .done
+        if hasTranscriptForExport {
+            Menu {
+                Button("Markdown (.md)") { exportTranscript(rec, format: .markdown) }
+                Button("Plain Text (.txt)") { exportTranscript(rec, format: .plainText) }
+                Button("SRT Subtitles (.srt)") { exportTranscript(rec, format: .srt) }
+                Divider()
+                Button("JSON Lines (.jsonl)") { exportTranscript(rec, format: .jsonl) }
+                Button("JSON (.json)") { exportTranscript(rec, format: .json) }
+            } label: {
+                Label("Export Transcript\u{2026}", systemImage: "square.and.arrow.up")
+            }
+        }
+
         Button {
             state.triggerRename = true
         } label: {
@@ -311,6 +325,46 @@ struct RecordingListPane: View {
 
     private var selectedDeviceFiles: [FileEntry] {
         state.device.files.filter { state.device.selectedDeviceFiles.contains($0.filename) }
+    }
+
+    // MARK: - Export
+
+    enum ExportFormat { case markdown, plainText, srt, jsonl, json }
+
+    private func exportTranscript(_ rec: RecordingMetadata, format: ExportFormat) {
+        Task {
+            guard let transcript = await state.library.transcript(for: rec.filename) else { return }
+
+            let content: String
+            let ext: String
+            switch format {
+            case .markdown:
+                content = TranscriptExporter.exportMarkdown(transcript: transcript)
+                ext = "md"
+            case .plainText:
+                content = TranscriptExporter.exportPlainText(transcript: transcript)
+                ext = "txt"
+            case .srt:
+                content = TranscriptExporter.exportSRT(transcript: transcript)
+                ext = "srt"
+            case .jsonl:
+                let data = TranscriptExporter.exportJSONLines(transcript: transcript, recordingMetadata: rec)
+                content = String(data: data, encoding: .utf8) ?? ""
+                ext = "jsonl"
+            case .json:
+                let data = TranscriptExporter.exportJSON(transcript: transcript, recordingMetadata: rec)
+                content = String(data: data, encoding: .utf8) ?? ""
+                ext = "json"
+            }
+
+            let basename = (rec.displayTitle as NSString).deletingPathExtension
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = "\(basename).\(ext)"
+            panel.allowedContentTypes = [.plainText]
+            if panel.runModal() == .OK, let url = panel.url {
+                try? content.write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
     }
 
     private var filteredRecordings: [RecordingMetadata] {
