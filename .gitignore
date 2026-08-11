@@ -25,3 +25,7 @@ HANDOFF.md
 .gemini/
 .superpowers/
 .worktrees/
+
+# Agent/dev docs (local only — synced out-of-band, never via this repo)
+docs/DEVELOPMENT.md
+docs/superpowers/
