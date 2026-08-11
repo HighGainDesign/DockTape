@@ -2,7 +2,7 @@
 
 import Foundation
 
-/// Orchestrates Jensen command/response over a USB connection.
+/// Orchestrates Jensen command/response over a device transport.
 /// Actor ensures only one command is in flight at a time.
 public actor JensenTransport {
     private let connection: any DeviceTransport

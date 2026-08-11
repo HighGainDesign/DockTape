@@ -23,10 +23,6 @@ public enum DeviceConstants {
     public static let pidHiDockP1v2: UInt16 = 0x0240
     public static let pidHiDockP1Miniv2: UInt16 = 0x0241
 
-    // MARK: - Endpoints
-    public static let bulkOutEndpoint: UInt8 = 0x01
-    public static let bulkInEndpoint: UInt8 = 0x82
-
     // MARK: - All known VID/PID pairs
     public static let allDeviceIDs: [(vendorID: UInt16, productID: UInt16)] = [
         (vendorIDActions, pidP1),

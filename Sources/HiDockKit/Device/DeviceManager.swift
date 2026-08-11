@@ -12,7 +12,7 @@ public actor DeviceManager {
         self.device = device
     }
 
-    /// Connect to a device through the given USB connection.
+    /// Connect to a device through the given transport.
     public func connect(via connection: any DeviceTransport) {
         self.transport = JensenTransport(connection: connection)
     }

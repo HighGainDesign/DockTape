@@ -13,7 +13,8 @@ let package = Package(
         .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.4"),
     ],
     targets: [
-        // Vendored libusb-1.0 (static library, macOS only)
+        // Vendored libusb-1.0 (static library, macOS only).
+        // ⚠️ Cannot build for iOS — iOS targets must depend only on HiDockKit.
         .target(
             name: "CLibUSB",
             path: "Sources/CLibUSB",
@@ -38,7 +39,8 @@ let package = Package(
             ],
             path: "Sources/HiDockKit"
         ),
-        // macOS-only USB transport — USBConnection, USBDeviceMonitor, DeviceProbe
+        // macOS-only USB transport — USBConnection, USBDeviceMonitor, DeviceProbe.
+        // ⚠️ Cannot build for iOS — iOS targets must depend only on HiDockKit.
         .target(
             name: "HiDockKitUSB",
             dependencies: [
