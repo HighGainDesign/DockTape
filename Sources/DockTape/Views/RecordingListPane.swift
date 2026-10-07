@@ -2,6 +2,7 @@
 
 import SwiftUI
 import HiDockKit
+import UniformTypeIdentifiers
 
 /// Column 2: Shows recording list or device file list depending on sidebar selection.
 struct RecordingListPane: View {
@@ -51,9 +52,9 @@ struct RecordingListPane: View {
                         Label("No Recordings", systemImage: "waveform.slash")
                     } description: {
                         if state.device.isConnected {
-                            Text("Download recordings from your device to see them here.")
+                            Text("Import recordings from your device to see them here.")
                         } else {
-                            Text("Connect your HiDock and download recordings to get started.")
+                            Text("Connect your HiDock and import recordings to get started.")
                         }
                     }
                 } else if recs.isEmpty {
@@ -95,6 +96,11 @@ struct RecordingListPane: View {
                 }
                 state.library.selectedRecordings.removeAll()
             }
+            return .handled
+        }
+        .onKeyPress(.return) {
+            guard state.library.selectedRecordings.count == 1 else { return .ignored }
+            state.triggerRename = true
             return .handled
         }
         .sheet(isPresented: $state.triggerMerge) {
@@ -232,7 +238,7 @@ struct RecordingListPane: View {
         if rec.folder != nil {
             Button {
                 Task {
-                    try? await state.library.moveRecording(filename: rec.filename, toFolder: nil)
+                    await state.moveRecording(rec, toFolder: nil)
                 }
             } label: {
                 Label("Move to Library Root", systemImage: "tray.and.arrow.up")
@@ -247,7 +253,7 @@ struct RecordingListPane: View {
                     ForEach(availableFolders, id: \.self) { folder in
                         Button(folder) {
                             Task {
-                                try? await state.library.moveRecording(filename: rec.filename, toFolder: folder)
+                                await state.moveRecording(rec, toFolder: folder)
                             }
                         }
                     }
@@ -360,9 +366,13 @@ struct RecordingListPane: View {
             let basename = (rec.displayTitle as NSString).deletingPathExtension
             let panel = NSSavePanel()
             panel.nameFieldStringValue = "\(basename).\(ext)"
-            panel.allowedContentTypes = [.plainText]
+            panel.allowedContentTypes = [UTType(filenameExtension: ext) ?? .plainText]
             if panel.runModal() == .OK, let url = panel.url {
-                try? content.write(to: url, atomically: true, encoding: .utf8)
+                do {
+                    try content.write(to: url, atomically: true, encoding: .utf8)
+                } catch {
+                    state.errorMessage = "Export failed: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -464,6 +474,46 @@ enum TimePeriod: String, CaseIterable {
     }
 }
 
+/// Keep recording type and duration readable when the list pane is narrow.
+private struct RecordingMetadataLine: View {
+    let mode: String
+    let color: Color
+    let duration: String
+    let size: String
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                modeBadge
+                durationLabel
+                Label(size, systemImage: "doc").foregroundStyle(.secondary)
+            }
+            .fixedSize()
+            HStack(spacing: 8) {
+                modeBadge
+                durationLabel
+            }
+            .fixedSize()
+            durationLabel.fixedSize()
+        }
+        .font(.caption)
+        .lineLimit(1)
+    }
+
+    private var modeBadge: some View {
+        Text(mode)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(color.opacity(0.1))
+            .foregroundStyle(color)
+            .clipShape(Capsule())
+    }
+
+    private var durationLabel: some View {
+        Label(duration, systemImage: "clock").foregroundStyle(.secondary)
+    }
+}
+
 // MARK: - Recording Row
 
 struct RecordingRow: View {
@@ -487,23 +537,8 @@ struct RecordingRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(recording.displayTitle)
                     .font(.body.weight(.medium))
-                HStack(spacing: 8) {
-                    Text(modeLabel)
-                        .font(.caption)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1)
-                        .background(modeColor.opacity(0.1))
-                        .foregroundStyle(modeColor)
-                        .clipShape(Capsule())
-
-                    Label(formattedDuration, systemImage: "clock")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Label(formattedSize, systemImage: "doc")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                RecordingMetadataLine(mode: modeLabel, color: modeColor,
+                                      duration: formattedDuration, size: formattedSize)
             }
 
             Spacer()
@@ -614,32 +649,19 @@ struct DeviceFileRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(displayName)
                     .font(.body.weight(.medium))
-                HStack(spacing: 8) {
-                    Text(parsed.mode.displayName)
-                        .font(.caption)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1)
-                        .background(modeColor.opacity(0.1))
-                        .foregroundStyle(modeColor)
-                        .clipShape(Capsule())
-
-                    Label(formattedDuration, systemImage: "clock")
-                        .font(.caption).foregroundStyle(.secondary)
-
-                    Label(formattedSize, systemImage: "doc")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                RecordingMetadataLine(mode: parsed.mode.displayName, color: modeColor,
+                                      duration: formattedDuration, size: formattedSize)
             }
 
             Spacer()
 
             HStack(spacing: 6) {
-                if isDownloading { ProgressView().controlSize(.small).accessibilityLabel("Downloading") }
+                if isDownloading { ProgressView().controlSize(.small).accessibilityLabel("Importing") }
                 if isDeleting { ProgressView().controlSize(.small).accessibilityLabel("Deleting") }
                 if isDownloaded {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.caption).foregroundStyle(.green)
-                        .accessibilityLabel("Already downloaded")
+                        .accessibilityLabel("Already imported")
                 }
             }
         }

@@ -18,33 +18,9 @@ public actor SummaryStore {
 
     /// Scan for summary files (existence only, no parsing). Fast startup.
     public func loadAll() throws {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: baseDirectory.path) else { return }
-
-        guard let enumerator = fm.enumerator(
-            at: baseDirectory,
-            includingPropertiesForKeys: nil,
-            options: .skipsHiddenFiles
-        ) else { return }
-
-        let basePath = baseDirectory.resolvingSymlinksInPath().path
-        let basePrefix = basePath.hasSuffix("/") ? basePath : basePath + "/"
-
-        var found: Set<String> = []
-        for case let file as URL in enumerator {
-            guard file.pathExtension == "json",
-                  file.lastPathComponent.contains(".summary.") else { continue }
-            let resolvedPath = file.resolvingSymlinksInPath().path
-            let relativePath = resolvedPath.hasPrefix(basePrefix)
-                ? String(resolvedPath.dropFirst(basePrefix.count))
-                : file.lastPathComponent
-            var mp3Key = relativePath.replacingOccurrences(of: ".summary.json", with: ".mp3")
-            if mp3Key.hasPrefix(".") && mp3Key.hasSuffix(".icloud") {
-                mp3Key = String(mp3Key.dropFirst(1).dropLast(7))
-            }
-            found.insert(mp3Key)
-        }
-        knownFiles = found
+        knownFiles = Set(LibraryFileDiscovery.files(in: baseDirectory, suffix: ".summary.json").map {
+            String($0.relativePath.dropLast(".summary.json".count)) + ".mp3"
+        })
     }
 
     /// Load a single summary from disk on demand.
@@ -64,7 +40,7 @@ public actor SummaryStore {
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(summary)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data.write(to: url)
+        try data.write(to: url, options: .atomic)
         cache[mp3Filename] = summary
         knownFiles.insert(mp3Filename)
     }
@@ -123,12 +99,11 @@ public actor SummaryStore {
 
     /// Re-key a summary after recording rename, moving the file on disk
     /// and updating the recordingFilename inside the summary.
-    public func rename(from oldMp3: String, to newMp3: String) {
-        guard let oldSummary = cache.removeValue(forKey: oldMp3) else { return }
+    public func rename(from oldMp3: String, to newMp3: String) throws {
+        guard let oldSummary = cache[oldMp3]
+            ?? loadFromDisk(mp3Filename: newMp3)
+            ?? loadFromDisk(mp3Filename: oldMp3) else { return }
         let oldURL = fileURL(for: oldMp3)
-        let newURL = fileURL(for: newMp3)
-        try? FileManager.default.removeItem(at: newURL)  // avoid collision
-        try? FileManager.default.moveItem(at: oldURL, to: newURL)
         let updated = Summary(
             recordingFilename: newMp3,
             createdAt: oldSummary.createdAt,
@@ -138,13 +113,11 @@ public actor SummaryStore {
             customPrompt: oldSummary.customPrompt,
             sections: oldSummary.sections
         )
-        cache[newMp3] = updated
-        // Re-save so the JSON content reflects the new filename
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        if let data = try? encoder.encode(updated) {
-            try? data.write(to: newURL)
+        try save(updated, mp3Filename: newMp3)
+        if oldMp3 != newMp3 {
+            cache.removeValue(forKey: oldMp3)
+            knownFiles.remove(oldMp3)
+            try? FileManager.default.removeItem(at: oldURL)
         }
     }
 

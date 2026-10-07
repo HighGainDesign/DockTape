@@ -9,6 +9,7 @@ struct DetailPane: View {
     @State private var userHasPickedTab: Bool = false
     @State private var programmaticTabSwitchCount: Int = 0
     @State private var transcript: Transcript?
+    @State private var transcriptLoadedFor: String?
     @State private var renamingRecording: RecordingMetadata?
     @State private var renameText: String = ""
     @State private var confirmRetranscribe: RecordingMetadata?
@@ -120,25 +121,10 @@ struct DetailPane: View {
             // Tab content
             tabContent(for: rec)
         }
-        .onChange(of: state.library.selectedRecording) { _, newFilename in
-            if let filename = newFilename {
-                Task {
-                    self.transcript = await state.library.transcript(for: filename)
-
-                    ensureTabAvailable(for: rec)
-                }
-            } else {
-                state.selectedDetailTab = .info
-            }
-        }
         .task(id: rec.filename) {
-            transcript = await state.library.transcript(for: rec.filename)
-            if let t = transcript {
-                state.playback.segmentTimestamps = t.segments.map { (start: $0.startTime, end: $0.endTime) }
-            } else {
-                state.playback.segmentTimestamps = []
-            }
+            guard await reloadTranscript(for: rec.filename) else { return }
             userTemplates = await state.templateStore.userCreatedTemplates()
+            guard !Task.isCancelled, state.library.selectedRecording == rec.filename else { return }
 
             if !userHasPickedTab {
                 // First load: auto-select best tab
@@ -160,7 +146,7 @@ struct DetailPane: View {
             // Reload transcript and auto-switch when transcription completes
             if newStatus == .done {
                 Task {
-                    self.transcript = await state.library.transcript(for: rec.filename)
+                    guard await reloadTranscript(for: rec.filename) else { return }
                     programmaticTabSwitchCount += 1
                     state.selectedDetailTab = .transcript
                 }
@@ -174,7 +160,8 @@ struct DetailPane: View {
         }
         .onChange(of: state.triggerRename) { _, trigger in
             if trigger, renamingRecording == nil {
-                renameText = (rec.filename as NSString).deletingPathExtension
+                let filename = (rec.filename as NSString).lastPathComponent
+                renameText = (filename as NSString).deletingPathExtension
                 renamingRecording = rec
                 state.triggerRename = false
             }
@@ -255,9 +242,19 @@ struct DetailPane: View {
         }
     }
 
+    /// Track the requested file separately from legacy sidecar identity fields.
+    /// A late read or editor callback must not display another recording's text.
+    private func reloadTranscript(for filename: String) async -> Bool {
+        let loaded = await state.library.transcript(for: filename)
+        guard !Task.isCancelled, state.library.selectedRecording == filename else { return false }
+        transcript = loaded
+        transcriptLoadedFor = filename
+        return true
+    }
+
     private func availableTabs(for rec: RecordingMetadata) -> [DetailTab] {
         let status = state.transcription.statuses[rec.filename] ?? .none
-        if status == .done || transcript != nil {
+        if status == .done || (transcriptLoadedFor == rec.filename && transcript != nil) {
             return [.info, .transcript, .summary]
         }
         return [.info]
@@ -273,39 +270,41 @@ struct DetailPane: View {
             )
 
         case .transcript:
-            if let transcript {
+            if transcriptLoadedFor == rec.filename, let transcript {
                 TranscriptViewer(
                     transcript: transcript,
-                    playbackState: state.playback,
-                    activeSegmentIndex: state.playback.activeSegmentIndex,
+                    playbackState: state.playback.playingFile == rec.filename ? state.playback : nil,
                     onSeek: { time in
                         if state.playback.playingFile == rec.filename {
                             state.playback.seek(to: time)
                         } else {
-                            let url = state.library.store.baseDirectory.appendingPathComponent(rec.filename)
-                            state.playback.play(file: rec.filename, url: url)
+                            state.playRecording(rec)
                             state.playback.seek(to: time)
                         }
                     },
                     onSaveSpeakerNames: { names in
                         Task {
-                            try? await state.updateSpeakerNames(for: rec.filename, names: names)
-                            self.transcript = await state.library.transcript(for: rec.filename)
+                            await state.updateSpeakerNames(for: rec.filename, names: names)
+                            _ = await reloadTranscript(for: rec.filename)
                         }
                     },
                     onSplitSpeaker: { segID, allFollowing in
                         Task {
                             try? await state.library.transcriptStore.splitSpeaker(for: rec.filename, segmentID: segID, allFollowing: allFollowing)
-                            self.transcript = await state.library.transcript(for: rec.filename)
+                            _ = await reloadTranscript(for: rec.filename)
                         }
                     },
                     onMergeSpeaker: { sourceSID, targetSID in
                         Task {
                             try? await state.library.transcriptStore.mergeSpeakers(for: rec.filename, source: sourceSID, into: targetSID)
-                            self.transcript = await state.library.transcript(for: rec.filename)
+                            _ = await reloadTranscript(for: rec.filename)
                         }
                     }
                 )
+                .id(rec.filename)
+            } else if transcriptLoadedFor != rec.filename {
+                ProgressView("Loading transcript...")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ContentUnavailableView {
                     Label("No Transcript", systemImage: "doc.text")
@@ -395,7 +394,7 @@ struct DetailPane: View {
             }
 
             Section("Status") {
-                LabeledContent("Downloaded") {
+                LabeledContent("Imported") {
                     if state.library.isDownloaded(file.filename) {
                         Label("Yes", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)

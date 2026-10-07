@@ -15,14 +15,29 @@ targets:
     platform: macOS
     sources:
       - path: Sources/DockTape
-    resources:
+        excludes:
+          - Resources
       - path: Sources/DockTape/Resources/Assets.xcassets
+        buildPhase: resources
+      - path: Sources/DockTape/Resources/AppIcon.icon
+        type: file
+        buildPhase: resources
+      - path: Vendor/libusb/COPYING
+        buildPhase: resources
+    info:
+      path: .build/DockTape-Info.plist
+      properties:
+        NSUbiquitousContainers:
+          iCloud.design.highgain.docktape:
+            NSUbiquitousContainerIsDocumentScopePublic: true
+            NSUbiquitousContainerName: DockTape
+            NSUbiquitousContainerSupportedFolderLevels: Any
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: design.highgain.docktape
         PRODUCT_NAME: DockTape
         MARKETING_VERSION: "1.2.0"
-        CURRENT_PROJECT_VERSION: "3"
+        CURRENT_PROJECT_VERSION: "5"
         INFOPLIST_KEY_CFBundleDisplayName: DockTape
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.utilities"
         GENERATE_INFOPLIST_FILE: YES
@@ -36,6 +51,7 @@ targets:
           SWIFT_OPTIMIZATION_LEVEL: "-Onone"
           CODE_SIGN_STYLE: Automatic
         Release:
+          ENABLE_HARDENED_RUNTIME: YES
           SWIFT_OPTIMIZATION_LEVEL: "-O"
           CODE_SIGN_STYLE: Manual
           CODE_SIGN_IDENTITY: "Developer ID Application"
@@ -56,3 +72,4 @@ targets:
           - CloudDocuments
         com.apple.developer.ubiquity-container-identifiers:
           - iCloud.design.highgain.docktape
+        com.apple.developer.ubiquity-kvstore-identifier: UX8BPNLPX5.design.highgain.docktape

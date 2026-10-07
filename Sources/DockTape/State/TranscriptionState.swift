@@ -16,6 +16,7 @@ final class TranscriptionState {
 
     private var transcriptionTask: Task<Void, Never>?
     private var pipeline: RecordingPipeline?
+    private var previousStatuses: [String: TranscriptStatus] = [:]
 
     let transcriptStore: TranscriptStore
 
@@ -23,7 +24,7 @@ final class TranscriptionState {
         self.transcriptStore = transcriptStore
     }
 
-    var isTranscribing: Bool { transcribingFile != nil }
+    var isTranscribing: Bool { transcriptionTask != nil }
 
     func transcribe(
         recordings: [RecordingMetadata],
@@ -32,11 +33,13 @@ final class TranscriptionState {
         onError: @escaping (String) -> Void,
         onComplete: @escaping () async -> Void
     ) async {
+        guard transcriptionTask?.isCancelled != true else { return }
         let existingFilenames = Set(queue.map(\.filename))
         let newRecs = recordings.filter { !existingFilenames.contains($0.filename) }
         queue.append(contentsOf: newRecs)
 
         for rec in newRecs {
+            previousStatuses[rec.filename] = statuses[rec.filename] ?? TranscriptStatus.none
             statuses[rec.filename] = .inProgress
         }
 
@@ -66,11 +69,10 @@ final class TranscriptionState {
                     phase = "Transcribing\(progress)..."
                     onStatusMessage("Transcribing \(rec.filename)\(progress)...")
 
-                    try? await transcriptStore.delete(for: rec.filename)
                     let transcript = try await pipeline!.transcribeRecording(filename: rec.filename)
                     try Task.checkCancellation()
 
-                    try? await transcriptStore.save(transcript, mp3Filename: rec.filename)
+                    try await transcriptStore.save(transcript, mp3Filename: rec.filename)
                     statuses[rec.filename] = .done
                     queueIndex += 1
                 }
@@ -80,13 +82,12 @@ final class TranscriptionState {
                 resetState()
                 await onComplete()
             } catch is CancellationError {
-                if let file = transcribingFile {
-                    statuses[file] = TranscriptStatus.none
-                }
+                restorePendingStatuses()
                 onStatusMessage("Transcription cancelled")
                 resetState()
             } catch {
-                if let file = transcribingFile {
+                restorePendingStatuses()
+                if let file = transcribingFile, previousStatuses[file] != .done {
                     statuses[file] = .failed
                 }
                 onError("Transcription failed: \(error.localizedDescription)")
@@ -99,20 +100,22 @@ final class TranscriptionState {
 
     func cancel() {
         transcriptionTask?.cancel()
-        transcriptionTask = nil
-        if let file = transcribingFile {
-            statuses[file] = TranscriptStatus.none
+        phase = "Cancelling transcription..."
+        // The running task owns cleanup. Starting another task before it exits
+        // would let the cancelled task clear the new queue and progress.
+    }
+
+    private func restorePendingStatuses() {
+        for rec in queue where statuses[rec.filename] == .inProgress {
+            statuses[rec.filename] = previousStatuses[rec.filename] ?? TranscriptStatus.none
         }
-        for rec in queue.dropFirst(queueIndex + 1) {
-            statuses[rec.filename] = TranscriptStatus.none
-        }
-        resetState()
     }
 
     private func resetState() {
         transcribingFile = nil
         phase = ""
         queue = []
+        previousStatuses = [:]
         queueIndex = 0
         startTime = nil
         transcriptionTask = nil

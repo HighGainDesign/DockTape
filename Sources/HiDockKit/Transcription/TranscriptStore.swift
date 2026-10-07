@@ -20,34 +20,9 @@ public actor TranscriptStore {
 
     /// Scan for transcript files (existence only, no parsing). Fast startup.
     public func loadAll() throws {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: baseDirectory.path) else { return }
-
-        guard let enumerator = fm.enumerator(
-            at: baseDirectory,
-            includingPropertiesForKeys: nil,
-            options: .skipsHiddenFiles
-        ) else { return }
-
-        let basePath = baseDirectory.resolvingSymlinksInPath().path
-        let basePrefix = basePath.hasSuffix("/") ? basePath : basePath + "/"
-
-        var found: Set<String> = []
-        for case let file as URL in enumerator {
-            guard file.pathExtension == "json",
-                  file.lastPathComponent.contains(".transcript.") else { continue }
-            let resolvedPath = file.resolvingSymlinksInPath().path
-            let relativePath = resolvedPath.hasPrefix(basePrefix)
-                ? String(resolvedPath.dropFirst(basePrefix.count))
-                : file.lastPathComponent
-            // Handle iCloud stub files
-            var mp3Key = relativePath.replacingOccurrences(of: ".transcript.json", with: ".mp3")
-            if mp3Key.hasPrefix(".") && mp3Key.hasSuffix(".icloud") {
-                mp3Key = String(mp3Key.dropFirst(1).dropLast(7))
-            }
-            found.insert(mp3Key)
-        }
-        knownFiles = found
+        knownFiles = Set(LibraryFileDiscovery.files(in: baseDirectory, suffix: ".transcript.json").map {
+            String($0.relativePath.dropLast(".transcript.json".count)) + ".mp3"
+        })
     }
 
     /// Load a single transcript from disk on demand.
@@ -66,7 +41,7 @@ public actor TranscriptStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(transcript)
-        try data.write(to: url)
+        try data.write(to: url, options: .atomic)
         cache[mp3Filename] = transcript
         knownFiles.insert(mp3Filename)
     }
@@ -178,10 +153,24 @@ public actor TranscriptStore {
     }
 
     /// Re-key a transcript after a recording rename.
-    public func rename(from oldMp3: String, to newMp3: String) {
-        guard let transcript = cache.removeValue(forKey: oldMp3) else { return }
-        cache[newMp3] = transcript
-        // The actual file rename is handled by RecordingStore.renameRecording
+    public func rename(from oldMp3: String, to newMp3: String) throws {
+        guard let transcript = cache[oldMp3]
+            ?? loadFromDisk(mp3Filename: newMp3)
+            ?? loadFromDisk(mp3Filename: oldMp3) else { return }
+        let updated = Transcript(
+            recordingFilename: newMp3, createdAt: transcript.createdAt,
+            transcriptionModel: transcript.transcriptionModel,
+            hasSpeakerLabels: transcript.hasSpeakerLabels, segments: transcript.segments,
+            speakerNames: transcript.speakerNames, language: transcript.language
+        )
+        try save(updated, mp3Filename: newMp3)
+        if oldMp3 != newMp3 {
+            cache.removeValue(forKey: oldMp3)
+            knownFiles.remove(oldMp3)
+            try? FileManager.default.removeItem(at: fileURL(for: oldMp3))
+        }
+        dirtyTxtFiles.remove(oldMp3)
+        markTxtDirty(newMp3)
     }
 
     /// Flush all pending TXT writes immediately, cancelling any scheduled debounce.

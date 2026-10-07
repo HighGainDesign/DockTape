@@ -1,0 +1,242 @@
+{
+  "fill-specializations": [
+    {
+      "value": {
+        "solid": "extended-srgb:0.12549,0.14902,0.18039,1.00000"
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "solid": "extended-srgb:0.06667,0.07843,0.09412,1.00000"
+      }
+    }
+  ],
+  "groups": [
+    {
+      "name": "4-Done",
+      "layers": [
+        {
+          "image-name": "4b-check.svg",
+          "name": "4b-check",
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.07059,0.18824,0.18039,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.07059,0.18824,0.18039,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:0.20000,0.20000,0.20000,1.00000"
+              }
+            }
+          ]
+        },
+        {
+          "image-name": "4a-disc.svg",
+          "name": "4a-disc",
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.18039,0.76863,0.71373,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.18039,0.76863,0.71373,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:0.90000,0.90000,0.90000,1.00000"
+              }
+            }
+          ]
+        }
+      ],
+      "lighting": "combined",
+      "specular": true,
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    },
+    {
+      "name": "3-Reel",
+      "layers": [
+        {
+          "image-name": "3a-reel.svg",
+          "name": "3a-reel",
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.94510,0.92549,0.88627,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.89020,0.86667,0.81961,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:0.85000,0.85000,0.85000,1.00000"
+              }
+            }
+          ]
+        }
+      ],
+      "lighting": "individual",
+      "specular": true,
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.5
+      }
+    },
+    {
+      "name": "2-Label",
+      "layers": [
+        {
+          "image-name": "2b-lines.svg",
+          "name": "2b-lines",
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.37255,0.40000,0.43922,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.37255,0.40000,0.43922,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:0.40000,0.40000,0.40000,1.00000"
+              }
+            }
+          ]
+        },
+        {
+          "image-name": "2a-band.svg",
+          "name": "2a-band",
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.90980,0.45490,0.23137,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.90980,0.45490,0.23137,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:0.60000,0.60000,0.60000,1.00000"
+              }
+            }
+          ]
+        }
+      ],
+      "lighting": "individual",
+      "specular": false,
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    },
+    {
+      "name": "1-Body",
+      "layers": [
+        {
+          "image-name": "1b-base.svg",
+          "name": "1b-base",
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.83922,0.80784,0.74902,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.78039,0.74902,0.69020,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:0.70000,0.70000,0.70000,1.00000"
+              }
+            }
+          ]
+        },
+        {
+          "image-name": "1a-body.svg",
+          "name": "1a-body",
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.94510,0.92549,0.88627,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.89020,0.86667,0.81961,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:1.00000,1.00000,1.00000,1.00000"
+              }
+            }
+          ]
+        }
+      ],
+      "lighting": "combined",
+      "specular": true,
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    }
+  ],
+  "supported-platforms": {
+    "circles": [],
+    "squares": "shared"
+  }
+}

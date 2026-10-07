@@ -146,8 +146,8 @@ final class AppState {
     func setup() async throws {
         try await library.setup()
         try await summarization.summaryStore.loadAll()
-        try? await templateStore.load()
-        try? await templateStore.migrateFromUserDefaults(.standard)
+        await templateStore.load()
+        await templateStore.migrateFromUserDefaults(.standard)
 
         // Populate transcript statuses for recordings that already have transcripts on disk
         let transcribedFiles = await transcription.transcriptStore.allTranscribedFilenames()
@@ -225,9 +225,9 @@ final class AppState {
         do {
             try await device.downloadFile(file)
             await library.refresh()
-            statusMessage = "Downloaded \(file.filename)"
+            statusMessage = "Imported \(file.filename)"
         } catch {
-            errorMessage = "Download failed: \(error.localizedDescription)"
+            errorMessage = "Import failed: \(error.localizedDescription)"
         }
     }
 
@@ -238,7 +238,7 @@ final class AppState {
                 deleteAfterDownload: autoDeleteAfterDownload
             ) { [weak self] progress in
                 Task { @MainActor [weak self] in
-                    self?.statusMessage = "Downloading \(progress.currentFile) (\(progress.fileIndex + 1)/\(progress.totalFiles))..."
+                    self?.statusMessage = "Importing \(progress.currentFile) (\(progress.fileIndex + 1)/\(progress.totalFiles))..."
                     self?.syncProgress = progress.overallFraction
                 }
             }
@@ -248,9 +248,14 @@ final class AppState {
             if result.downloaded.isEmpty && result.failed.isEmpty {
                 statusMessage = "Already up to date"
             } else {
-                var msg = "Downloaded \(result.downloaded.count) file(s)"
+                var msg = "Imported \(result.downloaded.count) recording(s)"
                 if !result.failed.isEmpty { msg += ", \(result.failed.count) failed" }
                 statusMessage = msg
+                if !result.failed.isEmpty {
+                    let details = result.failed.prefix(5).map { "\($0.0): \($0.1)" }.joined(separator: "\n")
+                    let remaining = result.failed.count > 5 ? "\nAnd \(result.failed.count - 5) more file(s)." : ""
+                    errorMessage = "Import All finished with \(result.failed.count) error(s).\n\n" + details + remaining
+                }
             }
         } catch {
             syncProgress = nil
@@ -284,6 +289,15 @@ final class AppState {
     func playRecording(_ rec: RecordingMetadata) {
         let url = library.store.baseDirectory.appendingPathComponent(rec.filename)
         playback.play(file: rec.filename, url: url)
+        Task { await refreshPlaybackTranscript(for: rec.filename) }
+    }
+
+    private func refreshPlaybackTranscript(for filename: String) async {
+        let transcript = await library.transcript(for: filename)
+        playback.setSegmentTimestamps(
+            transcript?.segments.map { (start: $0.startTime, end: $0.endTime) } ?? [],
+            for: filename
+        )
     }
 
     func transcribeRecordings(_ recs: [RecordingMetadata]) async {
@@ -295,6 +309,9 @@ final class AppState {
             onError: { [weak self] msg in self?.errorMessage = msg },
             onComplete: { [weak self] in
                 await self?.library.refresh()
+                if let self, let filename = self.playback.playingFile {
+                    await self.refreshPlaybackTranscript(for: filename)
+                }
                 if let self,
                    UserDefaults.standard.bool(forKey: "autoSummarize") {
                     self.autoSummarizeRecordings(recsToSummarize)
@@ -332,7 +349,7 @@ final class AppState {
     /// Summarize with the default template for the recording's mode.
     /// Auto-transcribes first if needed.
     func contextMenuSummarize(_ rec: RecordingMetadata) {
-        guard let settings = makeSettingsProvider() else {
+        guard makeSettingsProvider() != nil else {
             errorMessage = "No API key configured. Go to Settings > AI to add one."
             return
         }
@@ -391,14 +408,60 @@ final class AppState {
     }
 
     func renameRecording(_ rec: RecordingMetadata, to name: String) async {
+        let originalSelection = library.selectedRecordings
         do {
             let newFilename = try await library.renameRecording(rec, to: name)
-            if playback.playingFile == rec.filename { playback.playingFile = newFilename }
-            if transcription.transcribingFile == rec.filename { transcription.transcribingFile = newFilename }
-            await summarization.summaryStore.rename(from: rec.filename, to: newFilename)
+            try await didRelocateRecording(from: rec.filename, to: newFilename, originalSelection: originalSelection)
         } catch {
             errorMessage = "Rename failed: \(error.localizedDescription)"
         }
+    }
+
+    func moveRecording(_ rec: RecordingMetadata, toFolder folder: String?) async {
+        let originalSelection = library.selectedRecordings
+        do {
+            let newFilename = try await library.moveRecording(filename: rec.filename, toFolder: folder)
+            try await didRelocateRecording(from: rec.filename, to: newFilename, originalSelection: originalSelection)
+        } catch {
+            errorMessage = "Move failed: \(error.localizedDescription)"
+        }
+    }
+
+    func renameFolder(from oldName: String, to newName: String) async {
+        let affected = library.recordings.filter { $0.filename.hasPrefix(oldName + "/") }
+        do {
+            let actualName = try await library.renameFolder(from: oldName, to: newName)
+            if selectedView == .folder(oldName) { selectedView = .folder(actualName) }
+            for rec in affected {
+                let newFilename = actualName + rec.filename.dropFirst(oldName.count)
+                try await didRelocateRecording(from: rec.filename, to: newFilename,
+                                                originalSelection: library.selectedRecordings)
+            }
+        } catch {
+            errorMessage = "Folder rename failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func didRelocateRecording(from oldFilename: String, to newFilename: String,
+                                      originalSelection: Set<String>) async throws {
+        if playback.playingFile == oldFilename { playback.playingFile = newFilename }
+        if transcription.transcribingFile == oldFilename { transcription.transcribingFile = newFilename }
+        try await summarization.summaryStore.rename(from: oldFilename, to: newFilename)
+        if let status = transcription.statuses.removeValue(forKey: oldFilename) {
+            transcription.statuses[newFilename] = status
+        }
+        if summarization.hasSummary.remove(oldFilename) != nil {
+            summarization.hasSummary.insert(newFilename)
+        }
+        if originalSelection.contains(oldFilename),
+           library.selectedRecordings == originalSelection || library.selectedRecordings.isEmpty {
+            library.selectedRecordings = Set(originalSelection.map {
+                $0 == oldFilename ? newFilename : $0
+            })
+            if library.selectedRecordings.count == 1 { library.selectedRecording = newFilename }
+        }
+        if library.selectedRecording == oldFilename { library.selectedRecording = newFilename }
+        if playback.playingFile == newFilename { await refreshPlaybackTranscript(for: newFilename) }
     }
 
     // MARK: - Merge Recordings

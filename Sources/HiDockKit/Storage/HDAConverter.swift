@@ -33,7 +33,7 @@ public enum HDAConverter {
         guard let mp3Data = extractMP3(from: hdaData) else {
             throw HiDockError.conversionFailed("No MP3 sync word found in .hda data")
         }
-        try mp3Data.write(to: outputURL)
+        try mp3Data.write(to: outputURL, options: .atomic)
         return outputURL
     }
 }

@@ -115,7 +115,7 @@ final class SummaryStoreTests: XCTestCase {
         )
         try await store.save(summary, mp3Filename: "old.mp3")
 
-        await store.rename(from: "old.mp3", to: "new.mp3")
+        try await store.rename(from: "old.mp3", to: "new.mp3")
 
         // Old file gone, new file exists
         XCTAssertFalse(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent("old.summary.json").path))

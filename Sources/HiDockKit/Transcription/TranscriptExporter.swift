@@ -139,7 +139,6 @@ public enum TranscriptExporter {
         // Group consecutive segments by speaker
         var groups: [(speaker: String, speakerID: String?, segments: [Transcript.Segment])] = []
         for seg in transcript.segments {
-            let sid = seg.speakerID ?? "Unknown"
             let displayName = seg.speakerDisplayName(from: transcript.speakerNames)
             if let last = groups.last, last.speakerID == seg.speakerID {
                 groups[groups.count - 1].segments.append(seg)

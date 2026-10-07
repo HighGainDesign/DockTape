@@ -52,6 +52,14 @@ final class JensenParsersTests: XCTestCase {
         XCTAssertEqual(battery.voltageMV, 4200)
     }
 
+    func testParseP1BatteryVoltageInMicrovolts() throws {
+        var body = Data([2, 100])
+        body.appendUInt32BE(4_198_000)
+        let battery = try JensenParsers.parseBattery(body)
+        XCTAssertEqual(battery.voltageMV, 4198)
+        XCTAssertEqual(battery.status, .full)
+    }
+
     func testParseBatteryTooShort() {
         let body = Data([50])
         XCTAssertThrowsError(try JensenParsers.parseBattery(body))

@@ -64,7 +64,7 @@ final class DeviceState {
 
     func syncAll(
         deleteAfterDownload: Bool,
-        onProgress: @escaping (SyncEngine.SyncProgress) -> Void
+        onProgress: @escaping @Sendable (SyncEngine.SyncProgress) -> Void
     ) async throws -> SyncEngine.SyncResult {
         guard let engine = syncEngine else {
             throw HiDockError.transferFailed("No sync engine")

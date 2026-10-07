@@ -98,7 +98,7 @@ struct SettingsView: View {
             Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
-            Text("Download, transcribe, diarize, and summarize recordings from your HiDock device — entirely on-device.")
+            Text("Import HiDock recordings and transcribe and diarize on-device. Summaries use your chosen local or cloud provider.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)

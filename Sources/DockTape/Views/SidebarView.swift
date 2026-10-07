@@ -36,7 +36,9 @@ struct SidebarView: View {
                     .dropDestination(for: String.self) { filenames, _ in
                         Task {
                             for filename in filenames {
-                                try? await state.library.moveRecording(filename: filename, toFolder: nil)
+                                if let rec = state.library.recordings.first(where: { $0.filename == filename }) {
+                                    await state.moveRecording(rec, toFolder: nil)
+                                }
                             }
                         }
                         return true
@@ -85,7 +87,9 @@ struct SidebarView: View {
                         .dropDestination(for: String.self) { filenames, _ in
                             Task {
                                 for filename in filenames {
-                                    try? await state.library.moveRecording(filename: filename, toFolder: folder)
+                                    if let rec = state.library.recordings.first(where: { $0.filename == filename }) {
+                                        await state.moveRecording(rec, toFolder: folder)
+                                    }
                                 }
                             }
                             return true
@@ -175,8 +179,7 @@ struct SidebarView: View {
         renamingFolder = nil
         guard !newName.isEmpty, newName != oldName else { return }
         Task {
-            do { try await state.library.renameFolder(from: oldName, to: newName) }
-            catch { state.errorMessage = error.localizedDescription }
+            await state.renameFolder(from: oldName, to: newName)
         }
     }
 

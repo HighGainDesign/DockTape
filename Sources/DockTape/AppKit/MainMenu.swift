@@ -66,7 +66,7 @@ enum MainMenu {
         fileMenu.addItem(.separator())
         addItem(fileMenu, "Merge Selected Recordings\u{2026}", action: #selector(MainMenuActions.mergeRecordings(_:)), key: "m", modifiers: [.command, .shift])
         fileMenu.addItem(.separator())
-        addItem(fileMenu, "Rename...", action: #selector(MainMenuActions.rename(_:)), key: "\r", modifiers: [])
+        addItem(fileMenu, "Rename...", action: #selector(MainMenuActions.rename(_:)), key: "", modifiers: [])
         addItem(fileMenu, "Reveal in Finder", action: #selector(MainMenuActions.revealInFinder(_:)), key: "r", modifiers: [.command, .shift])
         fileMenu.addItem(.separator())
         let deleteItem = NSMenuItem(title: "Delete", action: #selector(MainMenuActions.deleteRecording(_:)), keyEquivalent: "\u{8}")

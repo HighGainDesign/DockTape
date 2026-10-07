@@ -68,7 +68,7 @@ struct MergeRenameSheet: View {
             // Default name from first recording
             if let first = state.mergeFilenames.first,
                let rec = state.library.recordings.first(where: { $0.filename == first }) {
-                mergeName = rec.displayTitle
+                mergeName = "\(rec.displayTitle) (Merged)"
             }
         }
     }

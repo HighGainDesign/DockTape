@@ -42,29 +42,25 @@ final class MockDeviceTransport: DeviceTransport, @unchecked Sendable {
     func open() async throws {}
 
     func send(_ data: Data) async throws {
-        lock.lock()
-        defer { lock.unlock() }
-        _sentData.append(data)
+        lock.withLock { _sentData.append(data) }
     }
 
     func receive(maxLength: Int) async throws -> Data {
-        lock.lock()
-        defer { lock.unlock() }
-        guard _responseIndex < _responses.count else {
-            throw TransportError.readTimeout
+        try lock.withLock {
+            guard _responseIndex < _responses.count else {
+                throw TransportError.readTimeout
+            }
+            let response = _responses[_responseIndex]
+            _responseIndex += 1
+            // Return up to maxLength bytes
+            if response.count <= maxLength {
+                return response
+            }
+            return response.prefix(maxLength)
         }
-        let response = _responses[_responseIndex]
-        _responseIndex += 1
-        // Return up to maxLength bytes
-        if response.count <= maxLength {
-            return response
-        }
-        return response.prefix(maxLength)
     }
 
     func close() async {
-        lock.lock()
-        defer { lock.unlock() }
-        _closed = true
+        lock.withLock { _closed = true }
     }
 }

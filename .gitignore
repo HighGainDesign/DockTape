@@ -10,6 +10,7 @@ DerivedData/
 # macOS
 .DS_Store
 *.dSYM/
+*.dmg
 
 # IDE
 .vscode/

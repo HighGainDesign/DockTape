@@ -62,7 +62,8 @@ let package = Package(
         .testTarget(
             name: "HiDockKitTests",
             dependencies: ["HiDockKit"],
-            path: "Tests/HiDockKitTests"
+            path: "Tests/HiDockKitTests",
+            resources: [.copy("Fixtures")]
         ),
     ]
 )

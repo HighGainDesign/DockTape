@@ -36,6 +36,10 @@ final class LibraryState {
     func refresh() async {
         recordings = await store.allRecordings()
         downloadedFilenames = Set(recordings.map(\.filename))
+        selectedRecordings.formIntersection(downloadedFilenames)
+        if let selectedRecording, !downloadedFilenames.contains(selectedRecording) {
+            self.selectedRecording = nil
+        }
         importedDeviceFilenames = await store.allImportedDeviceFilenames()
         folders = await store.folders()
         try? await transcriptStore.loadAll()
@@ -63,10 +67,16 @@ final class LibraryState {
         folders = await store.folders()
     }
 
-    func renameFolder(from oldName: String, to newName: String) async throws {
-        try await store.renameFolder(from: oldName, to: newName)
-        if selectedFolder == oldName { selectedFolder = newName }
+    func renameFolder(from oldName: String, to newName: String) async throws -> String {
+        let affected = recordings.filter { $0.filename.hasPrefix(oldName + "/") }
+        let actualName = try await store.renameFolder(from: oldName, to: newName)
+        for rec in affected {
+            let newFilename = actualName + rec.filename.dropFirst(oldName.count)
+            try await transcriptStore.rename(from: rec.filename, to: newFilename)
+        }
+        if selectedFolder == oldName { selectedFolder = actualName }
         await refresh()
+        return actualName
     }
 
     func deleteFolder(named name: String) async throws {
@@ -75,10 +85,11 @@ final class LibraryState {
         await refresh()
     }
 
-    func moveRecording(filename: String, toFolder folder: String?) async throws {
+    func moveRecording(filename: String, toFolder folder: String?) async throws -> String {
         let newFilename = try await store.moveRecording(filename: filename, toFolder: folder)
-        await transcriptStore.rename(from: filename, to: newFilename)
+        try await transcriptStore.rename(from: filename, to: newFilename)
         await refresh()
+        return newFilename
     }
 
     func deleteRecording(_ rec: RecordingMetadata) async throws {
@@ -89,7 +100,7 @@ final class LibraryState {
 
     func renameRecording(_ rec: RecordingMetadata, to name: String) async throws -> String {
         let newFilename = try await store.renameRecording(filename: rec.filename, to: name)
-        await transcriptStore.rename(from: rec.filename, to: newFilename)
+        try await transcriptStore.rename(from: rec.filename, to: newFilename)
         await refresh()
         return newFilename
     }

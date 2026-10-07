@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify release version
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          version = re.search(r'MARKETING_VERSION: "([^"]+)"', Path('project.yml').read_text())[1]
+          if os.environ['RELEASE_REF_TYPE'] == 'tag':
+              assert os.environ['RELEASE_REF'] == 'v' + version, 'Tag must match MARKETING_VERSION'
+          PY
+      - name: Install build tools
+        run: brew install xcodegen create-dmg
+      - name: Configure temporary signing Keychain
+        env:
+          DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./scripts/ci-signing-setup.sh
+      - name: Test core and playback
+        run: |
+          swift test
+          ./scripts/test-playback.sh
+      - name: Build, sign, notarize, and staple DMG
+        run: ./scripts/release.sh
+      - name: Verify release artifact
+        run: |
+          DMG=$(find .build/release -maxdepth 1 -name 'DockTape-*.dmg' -print -quit)
+          test -n "$DMG"
+          xcrun stapler validate "$DMG"
+          codesign --verify --strict --verbose "$DMG"
+          test -f "$DMG.sha256"
+          (cd .build/release && shasum -a 256 -c "$(basename "$DMG").sha256")
+      - name: Save test artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: DockTape-${{ github.ref_name }}
+          path: |
+            .build/release/DockTape-*.dmg
+            .build/release/DockTape-*.dmg.sha256
+          if-no-files-found: error
+      - name: Publish tagged release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" .build/release/DockTape-*.dmg .build/release/DockTape-*.dmg.sha256 \
+            --verify-tag --title "DockTape $RELEASE_TAG" --notes-file CHANGELOG.md
+      - name: Remove signing credentials
+        if: always()
+        run: ./scripts/ci-signing-cleanup.sh

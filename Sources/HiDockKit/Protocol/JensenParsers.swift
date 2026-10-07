@@ -136,8 +136,11 @@ public enum JensenParsers {
         let statusByte = body[body.startIndex]
         let status = BatteryInfo.BatteryStatus(rawValue: statusByte) ?? .idle
         let level = Int(body[body.startIndex + 1])
-        let voltage: UInt32? = body.count >= 6 ? body.readUInt32BE(at: 2) : nil
-        return BatteryInfo(status: status, level: level, voltageMV: voltage)
+        let rawVoltage: UInt32? = body.count >= 6 ? body.readUInt32BE(at: 2) : nil
+        // P1 firmware 0.1.4.3 reports microvolts (e.g. 4,198,000).
+        // Keep the public millivolt value and accept existing millivolt replies.
+        let voltageMV = rawVoltage.map { $0 >= 100_000 ? $0 / 1000 : $0 }
+        return BatteryInfo(status: status, level: level, voltageMV: voltageMV)
     }
 
     /// Parse CardInfo response.

@@ -19,7 +19,7 @@ final class PlaybackState {
     private var boundaryObserver: Any?
     private var appNapActivity: NSObjectProtocol?
 
-    var segmentTimestamps: [(start: Double, end: Double)] = [] {
+    private(set) var segmentTimestamps: [(start: Double, end: Double)] = [] {
         didSet { setupBoundaryObserver() }
     }
 
@@ -119,9 +119,14 @@ final class PlaybackState {
         progress = 0
         duration = 0
         activeSegmentIndex = nil
-        // segmentTimestamps is managed by the view layer (set when transcript loads)
-        // — don't clear it here, or play() → stop() destroys timestamps before
-        // setupBoundaryObserver() can use them
+        segmentTimestamps = []
+    }
+
+    /// Ignore a transcript load that completed after playback switched files.
+    func setSegmentTimestamps(_ timestamps: [(start: Double, end: Double)], for filename: String) {
+        guard playingFile == filename else { return }
+        segmentTimestamps = timestamps
+        updateActiveSegment()
     }
 
     func seek(to time: Double) {

@@ -17,6 +17,8 @@ for arg in "$@"; do
     esac
 done
 DERIVED_DATA=".build/xcode"
+BUILD_LOG=".build/release-validation/app-${CONFIG}-build.log"
+mkdir -p "$(dirname "$BUILD_LOG")"
 
 # Regenerate Xcode project from project.yml
 echo "Generating Xcode project..."
@@ -29,7 +31,7 @@ xcodebuild \
     -scheme DockTape \
     -configuration "$CONFIG" \
     -derivedDataPath "$DERIVED_DATA" \
-    build 2>&1 | tail -3
+    build 2>&1 | tee "$BUILD_LOG"
 
 APP_PATH="$DERIVED_DATA/Build/Products/$CONFIG/DockTape.app"
 

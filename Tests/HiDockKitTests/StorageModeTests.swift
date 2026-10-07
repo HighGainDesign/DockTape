@@ -39,10 +39,14 @@ final class StorageModeTests: XCTestCase {
     }
 
     func testResolveICloudMode_FallsBackToLocal_WhenUbiquityUnavailable() {
-        let url = StorageLocationResolver.resolve(mode: .icloud, customURL: nil)
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let expected = docs.appendingPathComponent("HiDock Recordings")
-        XCTAssertFalse(url.path.isEmpty)
+        let url = StorageLocationResolver.resolve(mode: .icloud, customURL: nil, containerURL: { nil })
+        XCTAssertEqual(url, StorageLocationResolver.localDefault)
+    }
+
+    func testResolveICloudModeUsesAvailableContainerDocuments() {
+        let container = URL(fileURLWithPath: "/tmp/icloud-container")
+        let url = StorageLocationResolver.resolve(mode: .icloud, customURL: nil, containerURL: { container })
+        XCTAssertEqual(url, container.appendingPathComponent("Documents"))
     }
 
     func testMigrationLogic_ExistingCustomPath() {

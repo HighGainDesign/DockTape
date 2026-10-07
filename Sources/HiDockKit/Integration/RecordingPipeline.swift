@@ -124,6 +124,7 @@ public actor RecordingPipeline {
             diarizer: skipDiarization ? nil : diarizer
         )
 
+        try Task.checkCancellation()
         try await transcriptStore.save(transcript, mp3Filename: filename)
         try exportPlainText(transcript, basename: (filename as NSString).deletingPathExtension)
 

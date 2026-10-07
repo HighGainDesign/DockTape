@@ -20,7 +20,7 @@ final class SummarizationState {
     /// Each queued item carries its own template so mixed-mode auto-summarize works.
     private var queue: [QueueEntry] = []
 
-    var isSummarizing: Bool { summarizingFile != nil }
+    var isSummarizing: Bool { summarizationTask != nil }
 
     private struct QueueEntry {
         let recording: RecordingMetadata
@@ -42,6 +42,7 @@ final class SummarizationState {
         onError: @MainActor @Sendable @escaping (String) -> Void,
         onComplete: @MainActor @Sendable @escaping () -> Void
     ) {
+        guard summarizationTask?.isCancelled != true else { return }
         let existing = Set(queue.map(\.recording.filename))
         let newEntries = recordings
             .filter { !existing.contains($0.filename) }
@@ -59,12 +60,14 @@ final class SummarizationState {
                 phase = "Summarizing with \(model)..."
 
                 do {
+                    try Task.checkCancellation()
                     guard let transcript = await transcriptStore.transcript(for: rec.filename) else {
                         onError("No transcript found for \(rec.displayTitle)")
                         queueIndex += 1
                         continue
                     }
 
+                    try Task.checkCancellation()
                     let isMemo = rec.mode == "Wip"
                     let transcriptText = transcript.plainText(includeSpeakers: !isMemo)
                     let systemPrompt: String
@@ -99,6 +102,10 @@ final class SummarizationState {
                     resetState()
                     return
                 } catch {
+                    if Task.isCancelled {
+                        resetState()
+                        return
+                    }
                     onError("Summarization failed: \(error.localizedDescription)")
                     queueIndex += 1
                 }
@@ -111,7 +118,9 @@ final class SummarizationState {
 
     func cancel() {
         summarizationTask?.cancel()
-        resetState()
+        phase = "Cancelling summary..."
+        // Keep ownership until the cancelled task exits, so it cannot clear a
+        // subsequent queue or send a request after a delayed transcript read.
     }
 
     private func resetState() {

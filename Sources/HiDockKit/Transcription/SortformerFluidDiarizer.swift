@@ -44,30 +44,27 @@ public final class SortformerFluidDiarizer: DiarizationEngine, @unchecked Sendab
         onProgress?(0.05)
 
         // processComplete is synchronous and CPU-intensive — run off the main actor
-        let timeline = try await Task.detached { [diarizer] in
-            try diarizer.processComplete(audioFileURL: audioURL) { processed, total, _ in
+        let segments = try await Task.detached { [diarizer] in
+            let timeline = try diarizer.processComplete(audioFileURL: audioURL) { processed, total, _ in
                 let progress = Double(processed) / Double(max(total, 1))
                 onProgress?(0.05 + progress * 0.9)
             }
+            // Keep FluidAudio's non-Sendable timeline inside this task.
+            var segments: [SpeakerSegment] = []
+            for (_, speaker) in timeline.speakers {
+                for seg in speaker.finalizedSegments {
+                    segments.append(SpeakerSegment(
+                        speakerID: seg.speakerLabel,
+                        startTime: TimeInterval(seg.startTime),
+                        endTime: TimeInterval(seg.endTime)
+                    ))
+                }
+            }
+            segments.sort { $0.startTime < $1.startTime }
+            return segments
         }.value
 
         onProgress?(0.95)
-
-        // Collect finalized segments from all speakers
-        var segments: [SpeakerSegment] = []
-        for (_, speaker) in timeline.speakers {
-            for seg in speaker.finalizedSegments {
-                segments.append(SpeakerSegment(
-                    speakerID: seg.speakerLabel,
-                    startTime: TimeInterval(seg.startTime),
-                    endTime: TimeInterval(seg.endTime)
-                ))
-            }
-        }
-
-        // Sort by start time for consistent merge behavior
-        segments.sort { $0.startTime < $1.startTime }
-
         onProgress?(1.0)
         return segments
     }

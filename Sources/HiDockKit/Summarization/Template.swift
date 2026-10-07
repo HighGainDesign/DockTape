@@ -155,7 +155,7 @@ public struct Template: Codable, Identifiable, Sendable, Equatable, Hashable {
         // Escape inner double quotes: within items arrays, strings often have
         // unescaped quotes from the LLM. Replace sequences where a quote follows
         // a non-delimiter character (not : , [ { whitespace) with an escaped quote.
-        var chars = Array(result)
+        let chars = Array(result)
         var fixed: [Character] = []
         var inString = false
         var i = 0

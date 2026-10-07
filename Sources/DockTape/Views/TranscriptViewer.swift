@@ -32,50 +32,49 @@ struct TranscriptViewer: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 12) {
-                        Label(DurationCalculator.formatDuration(transcript.totalDuration), systemImage: "clock")
-                        Label("\(transcript.segments.count) segments", systemImage: "text.alignleft")
-                        Label("\(transcript.speakerIDs.count) speakers", systemImage: "person.2")
-                        if let lang = transcript.language {
-                            Label(lang, systemImage: "globe")
+            // Keep metadata readable when the detail pane is narrow.
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    Label(DurationCalculator.formatDuration(transcript.totalDuration), systemImage: "clock")
+                    Label("\(transcript.segments.count) segments", systemImage: "text.alignleft")
+                    Label("\(transcript.speakerIDs.count) speakers", systemImage: "person.2")
+                    if let lang = transcript.language {
+                        Label(lang, systemImage: "globe")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                HStack {
+                    if transcript.speakerIDs.count > 1 {
+                        Picker("Speaker", selection: $filterSpeaker) {
+                            Text("All Speakers").tag(String?.none)
+                            Divider()
+                            ForEach(transcript.speakerIDs, id: \.self) { sid in
+                                Text(speakerNames[sid] ?? sid).tag(Optional(sid))
+                            }
                         }
+                        .pickerStyle(.menu)
+                        .frame(width: 160)
                     }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
 
-                Spacer()
+                    Spacer()
 
-                // Speaker filter
-                if transcript.speakerIDs.count > 1 {
-                    Picker("Speaker", selection: $filterSpeaker) {
-                        Text("All Speakers").tag(String?.none)
-                        Divider()
-                        ForEach(transcript.speakerIDs, id: \.self) { sid in
-                            Text(speakerNames[sid] ?? sid).tag(Optional(sid))
-                        }
+                    Button {
+                        copyToClipboard()
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
                     }
-                    .pickerStyle(.menu)
-                    .frame(width: 160)
-                }
-
-                Button {
-                    copyToClipboard()
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                if hasNameChanges {
-                    Button("Save Names") {
-                        onSaveSpeakerNames?(speakerNames)
-                    }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.bordered)
                     .controlSize(.small)
+
+                    if hasNameChanges {
+                        Button("Save Names") {
+                            onSaveSpeakerNames?(speakerNames)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
                 }
             }
             .padding()
@@ -126,15 +125,9 @@ struct TranscriptViewer: View {
         }
         .onAppear {
             speakerNames = transcript.speakerNames
-            for sid in transcript.speakerIDs where speakerNames[sid] == nil {
-                speakerNames[sid] = sid
-            }
         }
         .onChange(of: transcript.speakerNames) { _, newNames in
             speakerNames = newNames
-            for sid in transcript.speakerIDs where speakerNames[sid] == nil {
-                speakerNames[sid] = sid
-            }
         }
         .alert("Merge Speakers?", isPresented: Binding(
             get: { mergeConfirmation != nil },

@@ -17,9 +17,16 @@ public enum StorageLocationResolver {
 
     /// Resolve the storage base directory.
     public static func resolve(mode: StorageMode, customURL: URL?) -> URL {
+        resolve(mode: mode, customURL: customURL) {
+            FileManager.default.url(forUbiquityContainerIdentifier: containerID)
+        }
+    }
+
+    /// Inject only container availability for deterministic fallback verification.
+    static func resolve(mode: StorageMode, customURL: URL?, containerURL: () -> URL?) -> URL {
         switch mode {
         case .icloud:
-            if let container = FileManager.default.url(forUbiquityContainerIdentifier: containerID) {
+            if let container = containerURL() {
                 return container.appendingPathComponent("Documents")
             }
             return localDefault

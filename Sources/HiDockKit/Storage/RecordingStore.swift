@@ -3,7 +3,7 @@
 import Foundation
 
 /// Manages local storage of downloaded recordings.
-/// The filesystem is the source of truth — no metadata JSON.
+/// Audio files are canonical; library.json preserves metadata through renames.
 public actor RecordingStore {
     public nonisolated let baseDirectory: URL
 
@@ -30,12 +30,13 @@ public actor RecordingStore {
         guard let contents = try? fm.contentsOfDirectory(
             at: baseDirectory,
             includingPropertiesForKeys: [.isDirectoryKey],
-            options: .skipsHiddenFiles
+            options: []
         ) else {
             return []
         }
         return contents
             .filter { url in
+                guard !url.lastPathComponent.hasPrefix(".") else { return false }
                 let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
                 return isDir
             }
@@ -58,7 +59,8 @@ public actor RecordingStore {
     }
 
     /// Rename a top-level folder.
-    public func renameFolder(from oldName: String, to newName: String) throws {
+    @discardableResult
+    public func renameFolder(from oldName: String, to newName: String) throws -> String {
         let sanitized = Self.sanitizeFilename(newName)
         guard !sanitized.isEmpty else {
             throw HiDockError.invalidFilename(newName)
@@ -66,6 +68,7 @@ public actor RecordingStore {
         let oldURL = baseDirectory.appendingPathComponent(oldName)
         let newURL = baseDirectory.appendingPathComponent(sanitized)
         try FileManager.default.moveItem(at: oldURL, to: newURL)
+        return sanitized
     }
 
     /// Delete a top-level folder and all its contents.
@@ -122,6 +125,9 @@ public actor RecordingStore {
         // Compute new relative filename
         let newFilename = newRelativeDir.isEmpty ? basename : "\(newRelativeDir)/\(basename)"
 
+        guard filename != newFilename else { return filename }
+        try requireAvailableRecordingPath(newFilename)
+
         // Move the MP3 file
         let oldMP3 = oldDir.appendingPathComponent(basename)
         let newMP3 = newDir.appendingPathComponent(basename)
@@ -142,64 +148,17 @@ public actor RecordingStore {
     // MARK: - Private helpers
 
     private func scanRecordings(in directory: URL, relativeTo base: URL) -> [RecordingMetadata] {
-        let fm = FileManager.default
-        guard let enumerator = fm.enumerator(
-            at: directory,
-            includingPropertiesForKeys: [.fileSizeKey, .creationDateKey, .isDirectoryKey],
-            options: .skipsHiddenFiles
-        ) else {
-            return []
-        }
-
-        // Normalize base path for reliable prefix stripping.
-        // Use resolvingSymlinksInPath to handle /var -> /private/var on macOS.
-        let basePath = base.resolvingSymlinksInPath().path
-        let basePrefix = basePath.hasSuffix("/") ? basePath : basePath + "/"
-
         var results: [RecordingMetadata] = []
-        for case let url as URL in enumerator {
-            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-            if isDir { continue }
-
-            // Handle both local MP3s and iCloud placeholder files (.filename.mp3.icloud)
-            let isMP3 = url.pathExtension.lowercased() == "mp3"
-            let isICloudStub = url.lastPathComponent.hasSuffix(".mp3.icloud") && url.lastPathComponent.hasPrefix(".")
-            guard isMP3 || isICloudStub else { continue }
-
-            // Trigger download for iCloud stubs
-            if isICloudStub {
+        for file in LibraryFileDiscovery.files(in: directory, relativeTo: base, suffix: ".mp3") {
+            let url = file.url
+            if file.isPlaceholder {
                 try? FileManager.default.startDownloadingUbiquitousItem(at: url)
             }
-
             guard let attrs = try? url.resourceValues(forKeys: [.fileSizeKey, .creationDateKey]) else {
                 continue
             }
-
-            // Convert iCloud stub filename to real filename
-            // .filename.mp3.icloud → filename.mp3
-            let realLastComponent: String
-            if isICloudStub {
-                var name = url.lastPathComponent
-                name = String(name.dropFirst(1))   // remove leading "."
-                name = String(name.dropLast(7))    // remove trailing ".icloud"
-                realLastComponent = name
-            } else {
-                realLastComponent = url.lastPathComponent
-            }
-
-            // Compute relative path from base; resolve symlinks to match /var -> /private/var
-            let normalizedPath = url.resolvingSymlinksInPath().path
-            var relativePath: String
-            if normalizedPath.hasPrefix(basePrefix) {
-                relativePath = String(normalizedPath.dropFirst(basePrefix.count))
-            } else {
-                relativePath = url.lastPathComponent
-            }
-            // Fix relative path for iCloud stubs
-            if isICloudStub {
-                let dir = (relativePath as NSString).deletingLastPathComponent
-                relativePath = dir == "." || dir.isEmpty ? realLastComponent : "\(dir)/\(realLastComponent)"
-            }
+            let realLastComponent = file.logicalName
+            let relativePath = file.relativePath
 
             // Determine folder from relative path (first path component if nested)
             let components = relativePath.split(separator: "/", maxSplits: 1)
@@ -207,7 +166,9 @@ public actor RecordingStore {
 
             let fileSize = UInt64(attrs.fileSize ?? 0)
             let parsed = FilenameParsing.parse(realLastComponent)
-            let recordedAt = parsed.date ?? attrs.creationDate
+            let recordMeta = meta[realLastComponent]
+            let originalDate = recordMeta?.deviceFilename.flatMap { FilenameParsing.parse($0).date }
+            let recordedAt = recordMeta?.recordedAt ?? parsed.date ?? originalDate ?? attrs.creationDate
             let mode: String
             if parsed.mode != .unknown {
                 mode = parsed.mode.rawValue
@@ -255,7 +216,7 @@ public actor RecordingStore {
 
     // MARK: - Merge recordings
 
-    /// Merge multiple recordings into a single MP3 by concatenating their data.
+    /// Merge encoded audio frames, rebuilding duration metadata without re-encoding.
     /// Files are concatenated in the order provided. Returns metadata for the merged recording.
     @discardableResult
     public func mergeRecordings(filenames: [String], as newFilename: String) throws -> RecordingMetadata {
@@ -269,21 +230,23 @@ public actor RecordingStore {
         }
         let outputFilename = "\(sanitized).mp3"
         let outputURL = baseDirectory.appendingPathComponent(outputFilename)
+        try requireAvailableRecordingPath(outputFilename)
 
-        // Concatenate MP3 data
-        var mergedData = Data()
+        var concatenator = MP3Concatenator()
         var earliestDate: Date?
         var firstMode: String = ""
 
         for (index, filename) in filenames.enumerated() {
             let url = baseDirectory.appendingPathComponent(filename)
             let data = try Data(contentsOf: url)
-            mergedData.append(data)
+            try concatenator.append(data)
 
             // Get metadata from first file for mode, earliest date from all
             let parsed = FilenameParsing.parse((filename as NSString).lastPathComponent)
             let attrs = try? url.resourceValues(forKeys: [.creationDateKey])
-            let date = parsed.date ?? attrs?.creationDate
+            let originalMeta = meta[(filename as NSString).lastPathComponent]
+            let originalDate = originalMeta?.deviceFilename.flatMap { FilenameParsing.parse($0).date }
+            let date = originalMeta?.recordedAt ?? parsed.date ?? originalDate ?? attrs?.creationDate
 
             if let date {
                 if earliestDate == nil || date < earliestDate! {
@@ -295,6 +258,7 @@ public actor RecordingStore {
             }
         }
 
+        let mergedData = try concatenator.output()
         try mergedData.write(to: outputURL, options: .atomic)
 
         let fileSize = UInt64(mergedData.count)
@@ -303,7 +267,8 @@ public actor RecordingStore {
         let metaEntry = RecordingMeta(
             mode: firstMode.isEmpty ? nil : firstMode,
             deviceFilename: nil,
-            mergedFrom: filenames.map { ($0 as NSString).lastPathComponent }
+            mergedFrom: filenames.map { ($0 as NSString).lastPathComponent },
+            recordedAt: earliestDate
         )
         meta[outputURL.lastPathComponent] = metaEntry
         saveLibraryMeta()
@@ -357,12 +322,16 @@ public actor RecordingStore {
         guard !sanitized.isEmpty else {
             throw HiDockError.invalidFilename(newName)
         }
-        let newFilename = "\(sanitized).mp3"
-        let newBasename = sanitized
+        let folder = (filename as NSString).deletingLastPathComponent
+        let newFilename = folder.isEmpty || folder == "."
+            ? "\(sanitized).mp3" : "\(folder)/\(sanitized).mp3"
+        let newBasename = (newFilename as NSString).deletingPathExtension
 
         guard filename != newFilename else { return filename }
 
         let fm = FileManager.default
+
+        try requireAvailableRecordingPath(newFilename)
 
         // Rename the MP3 file
         let oldURL = baseDirectory.appendingPathComponent(filename)
@@ -376,6 +345,18 @@ public actor RecordingStore {
             try? fm.moveItem(at: oldAssoc, to: newAssoc)
         }
 
+        let oldKey = (filename as NSString).lastPathComponent
+        if meta[oldKey] == nil {
+            let parsed = FilenameParsing.parse(oldKey)
+            meta[oldKey] = RecordingMeta(
+                mode: parsed.mode == .unknown ? nil : parsed.mode.rawValue,
+                deviceFilename: parsed.date == nil ? nil : (oldKey as NSString).deletingPathExtension + ".hda",
+                recordedAt: parsed.date ?? (try? newURL.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+            )
+        }
+        if meta[oldKey]?.deviceFilename == nil, FilenameParsing.parse(oldKey).date != nil {
+            meta[oldKey]?.deviceFilename = (oldKey as NSString).deletingPathExtension + ".hda"
+        }
         renameMeta(from: filename, to: newFilename)
         return newFilename
     }
@@ -392,6 +373,7 @@ public actor RecordingStore {
         public var mode: String?
         public var deviceFilename: String?
         public var mergedFrom: [String]?
+        public var recordedAt: Date?
     }
 
     /// In-memory cache of filename → metadata.
@@ -442,7 +424,10 @@ public actor RecordingStore {
 
     /// All device filenames that have been imported (for synchronous download checks).
     public func allImportedDeviceFilenames() -> Set<String> {
-        Set(meta.values.compactMap(\.deviceFilename))
+        let existingNames = Set(LibraryFileDiscovery.files(in: baseDirectory, suffix: ".mp3").map(\.logicalName))
+        return Set(meta.compactMap { filename, value in
+            existingNames.contains(filename) ? value.deviceFilename : nil
+        })
     }
 
     /// Check if a device filename has been imported (even if later renamed).
@@ -450,10 +435,14 @@ public actor RecordingStore {
         let mp3Name = deviceFilename.hasSuffix(".hda")
             ? deviceFilename.replacingOccurrences(of: ".hda", with: ".mp3")
             : deviceFilename
-        // Check direct filename match first
-        if meta[mp3Name] != nil { return true }
-        // Check if any recording was imported from this device file
-        return meta.values.contains { $0.deviceFilename == deviceFilename }
+        let matchingKeys = Set(meta.compactMap { key, value in
+            key == mp3Name || value.deviceFilename == deviceFilename ? key : nil
+        })
+        guard !matchingKeys.isEmpty else { return false }
+        // Metadata annotates canonical files; a stale entry is not an import.
+        return LibraryFileDiscovery.files(in: baseDirectory, suffix: ".mp3").contains {
+            matchingKeys.contains($0.logicalName)
+        }
     }
 
     /// Update library.json when a recording is renamed.
@@ -471,6 +460,18 @@ public actor RecordingStore {
         let key = (filename as NSString).lastPathComponent
         meta.removeValue(forKey: key)
         saveLibraryMeta()
+    }
+
+    /// Reject orphan sidecars too, before moving audio or replacing metadata.
+    private func requireAvailableRecordingPath(_ filename: String) throws {
+        let stem = (filename as NSString).deletingPathExtension
+        for name in [filename, stem + ".transcript.json", stem + ".summary.json", stem + ".txt"] {
+            let url = baseDirectory.appendingPathComponent(name)
+            let placeholder = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).icloud")
+            if FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path) {
+                throw HiDockError.invalidFilename(filename)
+            }
+        }
     }
 
     /// Sanitize a filename by replacing illegal characters.
@@ -492,6 +493,9 @@ public actor RecordingStore {
         // Direct file check (fast path for un-renamed recordings)
         let url = baseDirectory.appendingPathComponent(mp3Name)
         if FileManager.default.fileExists(atPath: url.path) { return true }
+        let placeholder = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(url.lastPathComponent).icloud")
+        if FileManager.default.fileExists(atPath: placeholder.path) { return true }
         // Check library.json for renamed recordings
         return isImported(deviceFilename: filename)
     }

@@ -23,6 +23,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
     private let splitViewController: MainSplitViewController
     private var stateObservationTask: Task<Void, Never>?
     private var searchField: NSSearchField?
+    private var searchToolbarItem: NSSearchToolbarItem?
     private var isDeviceContext: Bool = false
     private var settingsWindow: NSWindow?
 
@@ -177,6 +178,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
             item.searchField.target = self
             item.searchField.action = #selector(searchChanged(_:))
             searchField = item.searchField
+            searchToolbarItem = item
             return item
         default:
             return nil
@@ -284,6 +286,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
     /// Rebuild summarize menu contents on open — picks up user-created templates at runtime.
     private func populateSummarizeMenu(_ menu: NSMenu) {
         menu.removeAllItems()
+        // NSMenuToolbarItem uses the first entry as the pull-down title. Keep
+        // a title entry so rebuilding the menu doesn't hide the first template.
+        menu.addItem(NSMenuItem(title: "Summarize", action: nil, keyEquivalent: ""))
 
         let builtIn = TemplateStore.builtInDefaults
         if !builtIn.isEmpty {
@@ -531,7 +536,7 @@ extension MainWindowController: NSMenuItemValidation {
     }
     @objc func deleteRecording(_ sender: Any?) { deleteAction(sender) }
     @objc func mergeRecordings(_ sender: Any?) { appState.startMerge() }
-    @objc func find(_ sender: Any?) { appState.library.isSearchFocused = true }
+    @objc func find(_ sender: Any?) { searchToolbarItem?.beginSearchInteraction() }
     @objc func showAllRecordings(_ sender: Any?) { appState.selectedView = .allRecordings }
     @objc func showDevice(_ sender: Any?) {
         guard appState.device.isConnected else { return }
