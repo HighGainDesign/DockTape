@@ -10,7 +10,7 @@ let package = Package(
         .library(name: "HiDockKitUSB", targets: ["HiDockKitUSB"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.4"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.13.6"),
     ],
     targets: [
         // Vendored libusb-1.0 (static library, macOS only).
