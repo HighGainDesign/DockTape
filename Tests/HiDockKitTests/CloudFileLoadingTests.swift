@@ -72,6 +72,43 @@ final class CloudFileLoadingTests: XCTestCase {
         XCTAssertEqual(data, Data("hydrated".utf8))
     }
 
+    func testKnownSummaryWaitsThroughInitiallyInvisiblePlaceholder() async throws {
+        let dir = try directory(); defer { try? FileManager.default.removeItem(at: dir) }
+        let writer = SummaryStore(baseDirectory: dir)
+        try await writer.save(summary("a.mp3"), mp3Filename: "a.mp3")
+        actor Steps {
+            var first = true
+            func next() -> RecordingFileAccess.Availability {
+                if first { first = false; return .missing }
+                return .local
+            }
+        }
+        let steps = Steps()
+        let requested = expectation(description: "Known file requested despite metadata gap")
+        let access = RecordingFileAccess(availability: { _ in await steps.next() },
+                                          requestDownload: { _ in requested.fulfill() })
+        let store = SummaryStore(baseDirectory: dir, fileAccess: access)
+        try await store.loadAll()
+        let loaded = try await store.loadSummary(for: "a.mp3")
+        await fulfillment(of: [requested], timeout: 2)
+        XCTAssertEqual(loaded?.recordingFilename, "a.mp3")
+    }
+
+    func testLateMissingLookupCannotHideNewlySavedSummary() async throws {
+        let dir = try directory(); defer { try? FileManager.default.removeItem(at: dir) }
+        let gate = Gate(), started = expectation(description: "Old missing lookup pending")
+        let access = RecordingFileAccess(availability: { _ in
+            started.fulfill(); await gate.wait(); return .missing
+        }, requestDownload: { _ in XCTFail() })
+        let store = SummaryStore(baseDirectory: dir, fileAccess: access)
+        let pending = Task { try await store.loadSummary(for: "a.mp3") }
+        await fulfillment(of: [started], timeout: 2)
+        try await store.save(summary("a.mp3", text: "New"), mp3Filename: "a.mp3")
+        await gate.release()
+        let result = try await pending.value
+        XCTAssertEqual(result?.sections.first?.content, "New")
+    }
+
     func testMissingAndDownloadFailureAreDifferent() async throws {
         let missing = RecordingFileAccess(availability: { _ in .missing }, requestDownload: { _ in XCTFail() })
         let absent = try await missing.readDataIfPresent(at: URL(fileURLWithPath: "/missing.json"))

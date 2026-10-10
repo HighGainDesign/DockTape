@@ -25,7 +25,7 @@ final class PlaybackState {
     private let prepareFile: @Sendable (URL, @escaping @Sendable () async -> Void) async throws -> Bool
 
     init(prepareFile: @escaping @Sendable (URL, @escaping @Sendable () async -> Void) async throws -> Bool = {
-        url, waiting in try await RecordingFileAccess().waitUntilAvailable(at: url, onWaiting: waiting)
+        url, waiting in try await RecordingFileAccess().waitUntilAvailable(at: url, knownToExist: true, onWaiting: waiting)
     }) {
         self.prepareFile = prepareFile
     }

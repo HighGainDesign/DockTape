@@ -27,10 +27,10 @@ public actor SummaryStore {
     }
 
     /// Load a single summary from disk on demand.
-    private func loadFromDisk(mp3Filename: String,
+    private func loadFromDisk(mp3Filename: String, knownToExist: Bool = false,
                               onWaiting: @Sendable () async -> Void = {}) async throws -> Summary? {
         let url = fileURL(for: mp3Filename)
-        guard let data = try await fileAccess.readDataIfPresent(at: url, onWaiting: onWaiting) else { return nil }
+        guard let data = try await fileAccess.readDataIfPresent(at: url, knownToExist: knownToExist, onWaiting: onWaiting) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(Summary.self, from: data)
@@ -60,10 +60,11 @@ public actor SummaryStore {
                                onWaiting: @Sendable () async -> Void = {}) async throws -> Summary? {
         if let cached = cache[mp3Filename] { return cached }
         let revision = revisions[mp3Filename, default: 0]
-        guard let loaded = try await loadFromDisk(mp3Filename: mp3Filename, onWaiting: onWaiting) else { return nil }
+        let loaded = try await loadFromDisk(mp3Filename: mp3Filename,
+                                            knownToExist: knownFiles.contains(mp3Filename), onWaiting: onWaiting)
         try Task.checkCancellation()
         guard revisions[mp3Filename, default: 0] == revision else { return cache[mp3Filename] }
-        cache[mp3Filename] = loaded
+        if let loaded { cache[mp3Filename] = loaded }
         return loaded
     }
 

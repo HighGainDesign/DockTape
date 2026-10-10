@@ -31,7 +31,7 @@ public struct RecordingFileAccess: Sendable {
     }
 
     /// False means absent, rather than a cloud file still waiting to download.
-    public func waitUntilAvailable(at url: URL,
+    public func waitUntilAvailable(at url: URL, knownToExist: Bool = false,
                                   onWaiting: @Sendable () async -> Void = {}) async throws -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
@@ -42,7 +42,13 @@ public struct RecordingFileAccess: Sendable {
             case .missing:
                 // Providers can briefly remove a placeholder before publishing
                 // the downloaded file. A requested download is not missing.
-                if !requested { return false }
+                if !requested {
+                    if !knownToExist { return false }
+                    await onWaiting()
+                    try Task.checkCancellation()
+                    try await requestDownload(url)
+                    requested = true
+                }
             case .local: return true
             case .downloading(let sourceURL):
                 if !requested {
@@ -57,9 +63,9 @@ public struct RecordingFileAccess: Sendable {
         }
     }
 
-    public func readDataIfPresent(at url: URL,
+    public func readDataIfPresent(at url: URL, knownToExist: Bool = false,
                                   onWaiting: @Sendable () async -> Void = {}) async throws -> Data? {
-        guard try await waitUntilAvailable(at: url, onWaiting: onWaiting) else { return nil }
+        guard try await waitUntilAvailable(at: url, knownToExist: knownToExist, onWaiting: onWaiting) else { return nil }
         try Task.checkCancellation()
         let data = try await readFile(url)
         try Task.checkCancellation()
