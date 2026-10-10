@@ -10,7 +10,7 @@ struct DockTapePlaybackTests {
     }
 
     @MainActor
-    static func main() throws {
+    static func main() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("DockTapePlaybackTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -21,6 +21,7 @@ struct DockTapePlaybackTests {
         let playback = PlaybackState()
         defer { playback.stop() }
         playback.play(file: "first.mp3", url: audioURL)
+        try await waitUntil { playback.avPlayer != nil || playback.loadError != nil }
         playback.setSegmentTimestamps([(0, 5), (5, 10)], for: "first.mp3")
         try expect(playback.activeSegmentIndex == 0, "Playing transcript should highlight its first segment")
 
@@ -45,7 +46,120 @@ struct DockTapePlaybackTests {
         playback.setSegmentTimestamps([(0, 10)], for: "second.mp3")
         try expect(playback.playingFile == nil && playback.segmentTimestamps.isEmpty,
                    "Stopping must clear the timeline and ignore pending transcript loads")
-        print("Playback regression checks passed (9 assertions).")
+        try await cloudPlaybackChecks(url: audioURL)
+        try await selectionLoadingChecks()
+        print("Playback and selected-content regression checks passed (original9 + cloud/cancellation/selection checks).")
+    }
+
+    private actor Gate {
+        var isWaiting = false
+        private var released = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+        func wait() async {
+            isWaiting = true
+            if released { return }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+        func release() { released = true; waiters.forEach { $0.resume() }; waiters.removeAll() }
+    }
+
+    @MainActor
+    private static func waitUntil(_ condition: () async -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !(await condition()) {
+            guard ContinuousClock.now < deadline else { throw Failure(description: "Timed out waiting for regression condition") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    @MainActor
+    private static func cloudPlaybackChecks(url: URL) async throws {
+        let gate = Gate()
+        let playback = PlaybackState(prepareFile: { _, waiting in
+            await waiting(); await gate.wait(); return true
+        })
+        playback.play(file: "cloud.mp3", url: url)
+        try await waitUntil { await gate.isWaiting }
+        try expect(playback.isPreparing && !playback.isPlaying, "Pending cloud audio must not be represented as playing")
+        try expect(playback.preparationMessage.contains("iCloud Drive"), "Cloud wait needs a visible explanation")
+        playback.seek(to: 3)
+        playback.stop()
+        await gate.release()
+        // Cancellation completion must never restart the stopped recording.
+        try await Task.sleep(for: .milliseconds(20))
+        try expect(playback.playingFile == nil && playback.avPlayer == nil, "Late cloud completion must not restart playback")
+
+        let switchGate = Gate()
+        let switching = PlaybackState(prepareFile: { candidate, waiting in
+            if candidate.lastPathComponent == "pending.wav" { await waiting(); await switchGate.wait() }
+            return true
+        })
+        switching.play(file: "a.mp3", url: url.deletingLastPathComponent().appendingPathComponent("pending.wav"))
+        try await waitUntil { await switchGate.isWaiting }
+        switching.play(file: "b.mp3", url: url)
+        try await waitUntil { switching.avPlayer != nil || switching.loadError != nil }
+        await switchGate.release()
+        try await Task.sleep(for: .milliseconds(20))
+        try expect(switching.playingFile == "b.mp3" && switching.loadError == nil,
+                   "Resident audio must start independently and ignore the cancelled cloud request")
+        switching.stop()
+
+        let fixtureURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Tests/HiDockKitTests/Fixtures/first.mp3")
+        let mp3 = PlaybackState()
+        mp3.play(file: "fixture.mp3", url: fixtureURL)
+        try await waitUntil { mp3.avPlayer != nil || mp3.loadError != nil }
+        try expect(mp3.loadError == nil && mp3.duration > 1, "Resident MP3 playback must still prepare and measure its duration")
+        mp3.stop()
+
+        actor Attempts {
+            var count = 0
+            func next() -> Int { count += 1; return count }
+        }
+        let attempts = Attempts()
+        let retrying = PlaybackState(prepareFile: { _, _ in
+            if await attempts.next() == 1 { throw CocoaError(.fileReadNoPermission) }
+            return true
+        })
+        retrying.play(file: "retry.mp3", url: url)
+        try await waitUntil { retrying.loadError != nil }
+        retrying.retry()
+        try await waitUntil { retrying.avPlayer != nil || retrying.loadError != nil }
+        try expect(retrying.avPlayer != nil && retrying.loadError == nil, "Playback Retry must recover without restarting the app")
+        retrying.stop()
+
+        let failing = PlaybackState(prepareFile: { _, _ in throw CocoaError(.fileReadNoPermission) })
+        failing.play(file: "missing.mp3", url: url)
+        try await waitUntil { failing.loadError != nil }
+        try expect(!failing.isPlaying && !failing.isPreparing, "Playback errors must exit the waiting state")
+        failing.stop()
+    }
+
+    @MainActor
+    private static func selectionLoadingChecks() async throws {
+        let gate = Gate()
+        let state = RecordingContentState<String>()
+        let first = Task {
+            await state.load(for: "a.mp3") { waiting in
+                await waiting(); await gate.wait()
+                await waiting() // Deliberately late callback from the previous selection.
+                return "A"
+            }
+        }
+        try await waitUntil { await gate.isWaiting }
+        try expect(state.isLoading && state.isDownloading, "Pending content should show a download state, not missing content")
+        await state.load(for: "b.mp3") { _ in "B" }
+        try expect(state.content == "B" && !state.isLoading, "Resident selection must load while A remains pending")
+        await gate.release(); await first.value
+        try expect(state.filename == "b.mp3" && state.content == "B" && !state.isDownloading,
+                   "Late A content and download callbacks must not overwrite B")
+        await state.load(for: "bad.mp3") { _ in throw CocoaError(.fileReadNoPermission) }
+        try expect(state.errorMessage != nil && !state.isLoading, "Read failures must not masquerade as missing summaries")
+        await state.load(for: "bad.mp3") { _ in "Recovered" }
+        try expect(state.content == "Recovered" && state.errorMessage == nil, "Retry should recover without restarting the app")
+        await state.load(for: "absent.mp3") { _ in nil }
+        try expect(state.content == nil && state.errorMessage == nil && !state.isLoading,
+                   "Only a completed missing-file lookup should display no content")
     }
 
     private static func expect(_ condition: Bool, _ message: String) throws {

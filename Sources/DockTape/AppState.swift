@@ -188,6 +188,8 @@ final class AppState {
     /// Switch storage location and re-initialize all stores.
     /// Does NOT move files — the user manages that via Finder.
     func switchStorageLocation(to mode: StorageMode, customURL: URL? = nil) async {
+        // A pending cloud playback request belongs to the old library.
+        playback.stop()
         let defaults = UserDefaults.standard
         defaults.set(mode.rawValue, forKey: "storageMode")
 

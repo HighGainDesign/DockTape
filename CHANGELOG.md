@@ -15,6 +15,8 @@
 
 ### Improved
 
+- Cloud-only audio, transcripts, and summaries show download/loading status and recoverable errors. Waiting for one iCloud file no longer stalls another recording; late results cannot replace the newly selected content.
+
 - Cloud-only iCloud recordings and their transcript/summary sidecars remain visible, including hidden placeholder files.
 - Transcripts and summaries load on demand for faster startup.
 - Summary prompts use the recording mode to provide speaker context. Voice memos skip unnecessary speaker diarization.

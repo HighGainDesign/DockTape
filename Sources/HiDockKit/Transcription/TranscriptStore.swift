@@ -7,12 +7,15 @@ import Foundation
 /// Cache is keyed by MP3 filename.
 public actor TranscriptStore {
     private let baseDirectory: URL
+    private let fileAccess: RecordingFileAccess
+    private var revisions: [String: Int] = [:]
     private var cache: [String: Transcript] = [:]  // keyed by MP3 filename
     private var dirtyTxtFiles: Set<String> = []
     private var txtFlushTask: Task<Void, Never>?
 
-    public init(baseDirectory: URL) {
+    public init(baseDirectory: URL, fileAccess: RecordingFileAccess = RecordingFileAccess()) {
         self.baseDirectory = baseDirectory
+        self.fileAccess = fileAccess
     }
 
     /// Set of MP3 filenames that have transcript files on disk.
@@ -26,12 +29,13 @@ public actor TranscriptStore {
     }
 
     /// Load a single transcript from disk on demand.
-    private func loadFromDisk(mp3Filename: String) -> Transcript? {
+    private func loadFromDisk(mp3Filename: String,
+                              onWaiting: @Sendable () async -> Void = {}) async throws -> Transcript? {
         let url = fileURL(for: mp3Filename)
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let data = try await fileAccess.readDataIfPresent(at: url, onWaiting: onWaiting) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(Transcript.self, from: data)
+        return try decoder.decode(Transcript.self, from: data)
     }
 
     /// Save a transcript, keyed by MP3 filename.
@@ -42,19 +46,26 @@ public actor TranscriptStore {
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(transcript)
         try data.write(to: url, options: .atomic)
+        revisions[mp3Filename, default: 0] += 1
         cache[mp3Filename] = transcript
         knownFiles.insert(mp3Filename)
     }
 
     /// Get a transcript for a recording by MP3 filename.
-    public func transcript(for mp3Filename: String) -> Transcript? {
+    public func transcript(for mp3Filename: String) async -> Transcript? {
+        try? await loadTranscript(for: mp3Filename)
+    }
+
+    /// Throwing UI load distinguishes a missing sidecar from download/read errors.
+    public func loadTranscript(for mp3Filename: String,
+                               onWaiting: @Sendable () async -> Void = {}) async throws -> Transcript? {
         if let cached = cache[mp3Filename] { return cached }
-        // Lazy load from disk
-        if let loaded = loadFromDisk(mp3Filename: mp3Filename) {
-            cache[mp3Filename] = loaded
-            return loaded
-        }
-        return nil
+        let revision = revisions[mp3Filename, default: 0]
+        guard let loaded = try await loadFromDisk(mp3Filename: mp3Filename, onWaiting: onWaiting) else { return nil }
+        try Task.checkCancellation()
+        guard revisions[mp3Filename, default: 0] == revision else { return cache[mp3Filename] }
+        cache[mp3Filename] = loaded
+        return loaded
     }
 
     /// Check if a transcript exists for a recording (fast, no parsing).
@@ -66,6 +77,7 @@ public actor TranscriptStore {
     public func delete(for mp3Filename: String) throws {
         let url = fileURL(for: mp3Filename)
         try? FileManager.default.removeItem(at: url)
+        revisions[mp3Filename, default: 0] += 1
         cache.removeValue(forKey: mp3Filename)
         knownFiles.remove(mp3Filename)
     }
@@ -153,10 +165,11 @@ public actor TranscriptStore {
     }
 
     /// Re-key a transcript after a recording rename.
-    public func rename(from oldMp3: String, to newMp3: String) throws {
-        guard let transcript = cache[oldMp3]
-            ?? loadFromDisk(mp3Filename: newMp3)
-            ?? loadFromDisk(mp3Filename: oldMp3) else { return }
+    public func rename(from oldMp3: String, to newMp3: String) async throws {
+        var loaded = cache[oldMp3]
+        if loaded == nil { loaded = try await loadFromDisk(mp3Filename: newMp3) }
+        if loaded == nil { loaded = try await loadFromDisk(mp3Filename: oldMp3) }
+        guard let transcript = loaded else { return }
         let updated = Transcript(
             recordingFilename: newMp3, createdAt: transcript.createdAt,
             transcriptionModel: transcript.transcriptionModel,
@@ -165,6 +178,7 @@ public actor TranscriptStore {
         )
         try save(updated, mp3Filename: newMp3)
         if oldMp3 != newMp3 {
+            revisions[oldMp3, default: 0] += 1
             cache.removeValue(forKey: oldMp3)
             knownFiles.remove(oldMp3)
             try? FileManager.default.removeItem(at: fileURL(for: oldMp3))

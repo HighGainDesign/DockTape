@@ -8,8 +8,11 @@ struct DetailPane: View {
     @Bindable var state: AppState
     @State private var userHasPickedTab: Bool = false
     @State private var programmaticTabSwitchCount: Int = 0
-    @State private var transcript: Transcript?
-    @State private var transcriptLoadedFor: String?
+    @State private var transcriptState = RecordingContentState<Transcript>()
+    @State private var transcriptRetry = 0
+
+    private var transcript: Transcript? { transcriptState.content }
+    private var transcriptLoadedFor: String? { transcriptState.filename }
     @State private var renamingRecording: RecordingMetadata?
     @State private var renameText: String = ""
     @State private var confirmRetranscribe: RecordingMetadata?
@@ -121,7 +124,7 @@ struct DetailPane: View {
             // Tab content
             tabContent(for: rec)
         }
-        .task(id: rec.filename) {
+        .task(id: "\(contentID(for: rec.filename))|\(transcriptRetry)") {
             guard await reloadTranscript(for: rec.filename) else { return }
             userTemplates = await state.templateStore.userCreatedTemplates()
             guard !Task.isCancelled, state.library.selectedRecording == rec.filename else { return }
@@ -244,20 +247,29 @@ struct DetailPane: View {
 
     /// Track the requested file separately from legacy sidecar identity fields.
     /// A late read or editor callback must not display another recording's text.
+    private func contentID(for filename: String) -> String {
+        state.library.store.baseDirectory.appendingPathComponent(filename).absoluteString
+    }
+
     private func reloadTranscript(for filename: String) async -> Bool {
-        let loaded = await state.library.transcript(for: filename)
+        let identity = contentID(for: filename)
         guard !Task.isCancelled, state.library.selectedRecording == filename else { return false }
-        transcript = loaded
-        transcriptLoadedFor = filename
-        return true
+        let store = state.library.transcriptStore
+        await transcriptState.load(for: identity) { waiting in
+            try await store.loadTranscript(for: filename, onWaiting: waiting)
+        }
+        return !Task.isCancelled && state.library.selectedRecording == filename
+            && contentID(for: filename) == identity && transcriptState.filename == identity
+            && !transcriptState.isLoading
     }
 
     private func availableTabs(for rec: RecordingMetadata) -> [DetailTab] {
         let status = state.transcription.statuses[rec.filename] ?? .none
-        if status == .done || (transcriptLoadedFor == rec.filename && transcript != nil) {
-            return [.info, .transcript, .summary]
-        }
-        return [.info]
+        let hasTranscript = status == .done || (transcriptLoadedFor == contentID(for: rec.filename) && transcript != nil)
+        var tabs: [DetailTab] = [.info]
+        if hasTranscript { tabs.append(.transcript) }
+        if hasTranscript || state.summarization.hasSummary.contains(rec.filename) { tabs.append(.summary) }
+        return tabs
     }
 
     @ViewBuilder
@@ -270,7 +282,7 @@ struct DetailPane: View {
             )
 
         case .transcript:
-            if transcriptLoadedFor == rec.filename, let transcript {
+            if transcriptLoadedFor == contentID(for: rec.filename), !transcriptState.isLoading, let transcript {
                 TranscriptViewer(
                     transcript: transcript,
                     playbackState: state.playback.playingFile == rec.filename ? state.playback : nil,
@@ -301,10 +313,23 @@ struct DetailPane: View {
                         }
                     }
                 )
-                .id(rec.filename)
-            } else if transcriptLoadedFor != rec.filename {
-                ProgressView("Loading transcript...")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .id(contentID(for: rec.filename))
+            } else if transcriptLoadedFor != contentID(for: rec.filename) || transcriptState.isLoading {
+                VStack(spacing: 12) {
+                    ProgressView(transcriptState.isDownloading
+                        ? "Downloading transcript from iCloud Drive…" : "Loading transcript…")
+                    if transcriptState.isDownloading {
+                        Text("This file is not available on this Mac yet. You can select another recording while it downloads.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .padding().frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let error = transcriptState.errorMessage {
+                ContentUnavailableView {
+                    Label("Unable to Load Transcript", systemImage: "exclamationmark.icloud")
+                } description: { Text(error) } actions: {
+                    Button("Retry") { transcriptRetry += 1 }
+                }
             } else {
                 ContentUnavailableView {
                     Label("No Transcript", systemImage: "doc.text")
@@ -314,7 +339,7 @@ struct DetailPane: View {
             }
 
         case .summary:
-            SummaryTabView(state: state, recording: rec)
+            SummaryTabView(state: state, recording: rec).id(contentID(for: rec.filename))
 
         }
     }
@@ -428,63 +453,86 @@ struct NowPlayingBar: View {
         VStack(spacing: 0) {
             Divider()
             VStack(spacing: 6) {
-                HStack(spacing: 12) {
-                    Button {
-                        state.playback.togglePlayPause()
-                    } label: {
-                        Image(systemName: state.playback.isPlaying ? "pause.fill" : "play.fill")
-                            .frame(width: 20)
-                    }
-                    .buttonStyle(.borderless)
-                    .accessibilityLabel(state.playback.isPlaying ? "Pause" : "Play")
-
-                    if let file = state.playback.playingFile {
-                        let rec = state.library.recordings.first { $0.filename == file }
-                        Text(rec?.displayTitle ?? file)
-                            .font(.caption.weight(.medium))
-                            .lineLimit(1)
-                    }
-
-                    Spacer()
-
-                    // Time display driven by TimelineView for smooth updates
-                    TimelineView(.animation(minimumInterval: 1.0 / 10, paused: !state.playback.isPlaying)) { _ in
-                        let currentTime = isDragging ? dragValue : state.playback.currentTime
-                        let duration = state.playback.duration
-
-                        Text("\(formatTime(currentTime)) / \(formatTime(duration))")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Menu {
-                        ForEach(PlaybackState.speeds, id: \.self) { speed in
-                            Button {
-                                state.playback.setRate(speed)
-                            } label: {
-                                HStack {
-                                    Text(speedLabel(speed))
-                                    if state.playback.rate == speed { Image(systemName: "checkmark") }
-                                }
+                if state.playback.isPreparing || state.playback.loadError != nil {
+                    HStack(spacing: 12) {
+                        if state.playback.isPreparing { ProgressView().controlSize(.small) }
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(state.playback.loadError == nil ? state.playback.preparationMessage : "Unable to Play Recording")
+                                .font(.caption.weight(.medium))
+                            if let file = state.playback.playingFile {
+                                Text(state.library.recordings.first { $0.filename == file }?.displayTitle ?? file)
+                                    .font(.caption).lineLimit(1)
+                            }
+                            if let error = state.playback.loadError {
+                                Text(error).font(.caption).foregroundStyle(.secondary)
                             }
                         }
-                    } label: {
-                        Text(speedLabel(state.playback.rate))
-                            .font(.caption.monospacedDigit().weight(.medium))
-                            .frame(minWidth: 30)
+                        Spacer()
+                        if state.playback.loadError != nil {
+                            Button("Retry") { state.playback.retry() }
+                        }
+                        Button(state.playback.isPreparing ? "Cancel" : "Dismiss") { state.playback.stop() }
                     }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .help("Playback speed")
+                } else {
+                    HStack(spacing: 12) {
+                        Button {
+                            state.playback.togglePlayPause()
+                        } label: {
+                            Image(systemName: state.playback.isPlaying ? "pause.fill" : "play.fill")
+                                .frame(width: 20)
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel(state.playback.isPlaying ? "Pause" : "Play")
 
-                    Button {
-                        state.playback.stop()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
+                        if let file = state.playback.playingFile {
+                            let rec = state.library.recordings.first { $0.filename == file }
+                            Text(rec?.displayTitle ?? file)
+                                .font(.caption.weight(.medium))
+                                .lineLimit(1)
+                        }
+
+                        Spacer()
+
+                        // Time display driven by TimelineView for smooth updates
+                        TimelineView(.animation(minimumInterval: 1.0 / 10, paused: !state.playback.isPlaying)) { _ in
+                            let currentTime = isDragging ? dragValue : state.playback.currentTime
+                            let duration = state.playback.duration
+
+                            Text("\(formatTime(currentTime)) / \(formatTime(duration))")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Menu {
+                            ForEach(PlaybackState.speeds, id: \.self) { speed in
+                                Button {
+                                    state.playback.setRate(speed)
+                                } label: {
+                                    HStack {
+                                        Text(speedLabel(speed))
+                                        if state.playback.rate == speed { Image(systemName: "checkmark") }
+                                    }
+                                }
+                            }
+                        } label: {
+                            Text(speedLabel(state.playback.rate))
+                                .font(.caption.monospacedDigit().weight(.medium))
+                                .frame(minWidth: 30)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help("Playback speed")
+
+                        Button {
+                            state.playback.stop()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("Stop playback")
                     }
-                    .buttonStyle(.borderless)
-                    .accessibilityLabel("Stop playback")
+
                 }
 
                 // Scrubber driven by TimelineView for smooth updates
@@ -517,6 +565,9 @@ struct NowPlayingBar: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(.bar)
+        }
+        .onChange(of: state.playback.isPreparing) { _, preparing in
+            if preparing { isDragging = false; dragValue = 0 }
         }
     }
 

@@ -2,6 +2,7 @@
 
 import SwiftUI
 import AVFoundation
+import HiDockKit
 
 @Observable
 @MainActor
@@ -12,6 +13,22 @@ final class PlaybackState {
     var progress: Double = 0
     var duration: Double = 0
     var activeSegmentIndex: Int?
+    private(set) var isPreparing = false
+    private(set) var preparationMessage = "Preparing recording…"
+    private(set) var loadError: String?
+
+    private var preparationTask: Task<Void, Never>?
+    private var preparingAsset: AVURLAsset?
+    private var requestID = UUID()
+    private var requestedURL: URL?
+    private var pendingSeek: Double?
+    private let prepareFile: @Sendable (URL, @escaping @Sendable () async -> Void) async throws -> Bool
+
+    init(prepareFile: @escaping @Sendable (URL, @escaping @Sendable () async -> Void) async throws -> Bool = {
+        url, waiting in try await RecordingFileAccess().waitUntilAvailable(at: url, onWaiting: waiting)
+    }) {
+        self.prepareFile = prepareFile
+    }
 
     private(set) var avPlayer: AVPlayer?
     private var endOfPlaybackObserver: NSObjectProtocol?
@@ -31,28 +48,65 @@ final class PlaybackState {
     static let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
     func play(file: String, url: URL) {
-        if playingFile == file, avPlayer != nil {
-            togglePlayPause()
-            return
+        if playingFile == file {
+            if isPreparing { stop(); return }
+            if avPlayer != nil { togglePlayPause(); return }
         }
-
         stop()
+        playingFile = file
+        requestedURL = url
+        isPreparing = true
+        preparationMessage = "Preparing recording…"
+        let request = requestID
+        preparationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                guard try await prepareFile(url, { [weak self] in
+                    await self?.markCloudDownload(for: request)
+                }) else { throw CocoaError(.fileReadNoSuchFile) }
+                try Task.checkCancellation()
+                let asset = AVURLAsset(url: url)
+                preparingAsset = asset
+                let measuredDuration = try await asset.load(.duration)
+                try Task.checkCancellation()
+                guard requestID == request else { return }
+                isPreparing = false
+                preparationTask = nil
+                preparingAsset = nil
+                duration = measuredDuration.seconds.isFinite ? measuredDuration.seconds : 0
+                startPlayer(url: url)
+                if let seekTime = pendingSeek {
+                    pendingSeek = nil
+                    seek(to: seekTime)
+                }
+            } catch {
+                guard requestID == request, !Task.isCancelled else { return }
+                isPreparing = false
+                preparationTask = nil
+                preparingAsset = nil
+                loadError = error.localizedDescription
+            }
+        }
+    }
 
+    private func markCloudDownload(for request: UUID) {
+        guard requestID == request else { return }
+        preparationMessage = "Downloading recording from iCloud Drive…"
+    }
+
+    func retry() {
+        guard let file = playingFile, let url = requestedURL else { return }
+        play(file: file, url: url)
+    }
+
+    private func startPlayer(url: URL) {
         let playerItem = AVPlayerItem(url: url)
         playerItem.preferredForwardBufferDuration = 2
         let player = AVPlayer(playerItem: playerItem)
         player.automaticallyWaitsToMinimizeStalling = false
 
         avPlayer = player
-        playingFile = file
         isPlaying = true
-
-        // Load duration
-        Task {
-            if let d = try? await playerItem.asset.load(.duration) {
-                self.duration = d.seconds
-            }
-        }
 
         // Prevent App Nap during playback
         appNapActivity = ProcessInfo.processInfo.beginActivity(
@@ -64,7 +118,7 @@ final class PlaybackState {
         let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             MainActor.assumeIsolated {
-                guard let self else { return }
+                guard let self, self.avPlayer === player else { return }
                 self.progress = time.seconds
             }
         }
@@ -76,7 +130,8 @@ final class PlaybackState {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.stop()
+                guard let self, self.avPlayer?.currentItem === playerItem else { return }
+                self.stop()
             }
         }
 
@@ -85,6 +140,7 @@ final class PlaybackState {
     }
 
     func togglePlayPause() {
+        if isPreparing { stop(); return }
         guard let player = avPlayer else { return }
         if isPlaying {
             player.pause()
@@ -96,6 +152,15 @@ final class PlaybackState {
     }
 
     func stop() {
+        requestID = UUID()
+        preparingAsset?.cancelLoading()
+        preparingAsset = nil
+        preparationTask?.cancel()
+        preparationTask = nil
+        isPreparing = false
+        loadError = nil
+        requestedURL = nil
+        pendingSeek = nil
         if let obs = endOfPlaybackObserver {
             NotificationCenter.default.removeObserver(obs)
             endOfPlaybackObserver = nil
@@ -130,6 +195,11 @@ final class PlaybackState {
     }
 
     func seek(to time: Double) {
+        if isPreparing {
+            pendingSeek = time
+            progress = time
+            return
+        }
         let cmTime = CMTime(seconds: time, preferredTimescale: 600)
         avPlayer?.seek(to: cmTime)
         progress = time
@@ -170,7 +240,7 @@ final class PlaybackState {
     }
 
     func updateActiveSegment() {
-        guard !segmentTimestamps.isEmpty else {
+        guard avPlayer != nil, !segmentTimestamps.isEmpty else {
             activeSegmentIndex = nil
             return
         }

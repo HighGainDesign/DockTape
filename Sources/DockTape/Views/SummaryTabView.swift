@@ -10,7 +10,9 @@ struct SummaryTabView: View {
     @AppStorage("aiProvider") private var providerName: String = "anthropic"
     @AppStorage("aiModel") private var selectedModel: String = "claude-sonnet-4-6"
 
-    @State private var summary: Summary?
+    @State private var summaryState = RecordingContentState<Summary>()
+    @State private var summaryRetry = 0
+    private var summary: Summary? { summaryState.content }
     @State private var hasTranscript: Bool = false
     @State private var selectedTemplate: Template?
     @State private var templates: [Template] = []
@@ -25,10 +27,29 @@ struct SummaryTabView: View {
         self.recording = recording
     }
 
+    private var contentID: String {
+        state.library.store.baseDirectory.appendingPathComponent(recording.filename).absoluteString
+    }
+
     var body: some View {
         Group {
             if state.summarization.summarizingFile == recording.filename {
                 summarizingView
+            } else if summaryState.filename != contentID || summaryState.isLoading {
+                VStack(spacing: 12) {
+                    ProgressView(summaryState.isDownloading
+                        ? "Downloading summary from iCloud Drive…" : "Loading summary…")
+                    if summaryState.isDownloading {
+                        Text("This file is not available on this Mac yet. You can select another recording while it downloads.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }.padding().frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let error = summaryState.errorMessage {
+                ContentUnavailableView {
+                    Label("Unable to Load Summary", systemImage: "exclamationmark.icloud")
+                } description: { Text(error) } actions: {
+                    Button("Retry") { summaryRetry += 1 }
+                }
             } else if let summary {
                 summaryContentView(summary)
             } else if showAPIKeySetup {
@@ -40,26 +61,33 @@ struct SummaryTabView: View {
         .sheet(isPresented: $showCustomPromptSheet) {
             customPromptSheet
         }
-        .task(id: recording.filename) {
-            summary = await state.summarization.summaryStore.summary(for: recording.filename)
-            hasTranscript = await state.transcription.transcriptStore.hasTranscript(for: recording.filename)
-            templates = await state.templateStore.allTemplates()
-            selectedTemplate = await state.templateStore.defaultTemplate(forMode: recording.mode)
-
-            // If re-summarizing, map old template IDs to new ones
-            if let existing = summary {
-                let mapped = mapLegacyTemplateID(existing.templateUsed)
-                if let t = await state.templateStore.template(forID: mapped) {
-                    selectedTemplate = t
-                }
-            }
+        .task(id: "\(contentID)|\(summaryRetry)") {
+            await reloadSummary()
         }
         .onChange(of: state.summarization.summarizingFile) { old, new in
             if old == recording.filename && new != recording.filename {
-                Task {
-                    summary = await state.summarization.summaryStore.summary(for: recording.filename)
-                }
+                summaryRetry += 1
             }
+        }
+    }
+
+    private func reloadSummary() async {
+        let filename = recording.filename
+        let identity = contentID
+        let store = state.summarization.summaryStore
+        guard !Task.isCancelled, state.library.selectedRecording == filename, contentID == identity else { return }
+        await summaryState.load(for: identity) { waiting in
+            try await store.loadSummary(for: filename, onWaiting: waiting)
+        }
+        guard !Task.isCancelled, state.library.selectedRecording == filename, contentID == identity else { return }
+        hasTranscript = await state.transcription.transcriptStore.hasTranscript(for: filename)
+        templates = await state.templateStore.allTemplates()
+        selectedTemplate = await state.templateStore.defaultTemplate(forMode: recording.mode)
+        guard !Task.isCancelled, state.library.selectedRecording == filename, contentID == identity else { return }
+        if let existing = summary,
+           let template = await state.templateStore.template(forID: mapLegacyTemplateID(existing.templateUsed)) {
+            guard !Task.isCancelled, state.library.selectedRecording == filename, contentID == identity else { return }
+            selectedTemplate = template
         }
     }
 
@@ -293,9 +321,7 @@ struct SummaryTabView: View {
                                         item.id,
                                         inSummaryFor: recording.filename
                                     )
-                                    self.summary = await state.summarization.summaryStore.summary(
-                                        for: recording.filename
-                                    )
+                                    await reloadSummary()
                                 }
                             } label: {
                                 Image(systemName: item.isCompleted
