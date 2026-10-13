@@ -37,7 +37,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: design.highgain.docktape
         PRODUCT_NAME: DockTape
         MARKETING_VERSION: "1.2.0"
-        CURRENT_PROJECT_VERSION: "6"
+        CURRENT_PROJECT_VERSION: "7"
         INFOPLIST_KEY_CFBundleDisplayName: DockTape
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.utilities"
         GENERATE_INFOPLIST_FILE: YES

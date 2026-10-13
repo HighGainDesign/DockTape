@@ -1,13 +1,16 @@
 // © 2026 High Gain Design. All rights reserved.
 
 import Foundation
+import CryptoKit
 
 /// Manages local storage of downloaded recordings.
 /// Audio files are canonical; library.json preserves metadata through renames.
 public actor RecordingStore {
     public nonisolated let baseDirectory: URL
+    private let fileAccess: RecordingFileAccess
 
-    public init(baseDirectory: URL? = nil) {
+    public init(baseDirectory: URL? = nil, fileAccess: RecordingFileAccess = RecordingFileAccess()) {
+        self.fileAccess = fileAccess
         if let dir = baseDirectory {
             self.baseDirectory = dir
         } else {
@@ -188,30 +191,118 @@ public actor RecordingStore {
         return results
     }
 
-    /// Store a downloaded .hda file: convert to .mp3.
+    /// Store imported audio, preserving the existing path when repairing it.
     @discardableResult
-    public func storeRecording(hdaData: Data, entry: FileEntry) throws -> RecordingMetadata {
-        let mp3Filename = entry.filename.replacingOccurrences(of: ".hda", with: ".mp3", options: .caseInsensitive)
-        let outputURL = baseDirectory.appendingPathComponent(mp3Filename)
+    public func storeRecording(hdaData: Data, entry: FileEntry) async throws -> RecordingMetadata {
+        if let imported = try await importRecording(hdaData: hdaData, entry: entry) {
+            return imported
+        }
+        guard let existing = try existingRecording(for: entry) else {
+            throw HiDockError.fileNotFound(entry.filename)
+        }
+        return existing
+    }
 
-        try HDAConverter.convertAndWrite(hdaData: hdaData, to: outputURL)
+    /// Skip a transfer only when both the device source and saved audio are verified.
+    /// An absent/unproven device checksum or legacy metadata needs byte comparison.
+    public func matchesVerifiedImport(_ entry: FileEntry) async throws -> Bool {
+        guard let existing = try existingRecording(for: entry) else { return false }
+        let key = (existing.filename as NSString).lastPathComponent
+        guard let saved = meta[key], let sourceMD5 = saved.sourceMD5,
+              sourceMD5 == entry.md5.lowercased(), let audioSHA256 = saved.audioSHA256 else {
+            return false
+        }
+        let url = baseDirectory.appendingPathComponent(existing.filename)
+        guard let bytes = try await fileAccess.readDataIfPresent(at: url, knownToExist: true) else {
+            return false
+        }
+        // A rename/move or a new import during cloud hydration invalidates this check.
+        guard try existingRecording(for: entry)?.filename == existing.filename,
+              meta[key]?.sourceMD5 == sourceMD5, meta[key]?.audioSHA256 == audioSHA256 else {
+            return false
+        }
+        return Self.sha256(bytes) == audioSHA256
+    }
 
-        // Read back metadata from the file we just wrote
-        let attrs = try outputURL.resourceValues(forKeys: [.fileSizeKey, .creationDateKey])
-        let fileSize = UInt64(attrs.fileSize ?? 0)
-        let parsed = FilenameParsing.parse(mp3Filename)
-        let mode = parsed.mode != .unknown ? parsed.mode.rawValue : ""
+    /// Returns nil for identical audio. Different bytes repair the existing file
+    /// atomically, with no retained backup/copy; sidecars stay available for review.
+    public func importRecording(hdaData: Data, entry: FileEntry) async throws -> RecordingMetadata? {
+        guard hdaData.count == Int(entry.size) else {
+            throw HiDockError.transferFailed("The recording transfer was incomplete. Existing audio was left unchanged.")
+        }
+        guard let mp3Data = HDAConverter.extractMP3(from: hdaData) else {
+            throw HiDockError.conversionFailed("No MP3 sync word found in .hda data")
+        }
+        let existing = try existingRecording(for: entry)
+        let filename = existing?.filename ?? entry.filename.replacingOccurrences(
+            of: ".hda", with: ".mp3", options: .caseInsensitive)
+        let key = (filename as NSString).lastPathComponent
+        let previous = meta[key]
+        let rawMD5 = Insecure.MD5.hash(data: hdaData).map { String(format: "%02x", $0) }.joined()
+        let reportedMD5 = entry.md5.lowercased()
+        // Enforce a device checksum only after an earlier import established that
+        // this device field actually hashes the raw HDA bytes.
+        if previous?.sourceMD5 != nil, reportedMD5.count == 32,
+           reportedMD5 != String(repeating: "0", count: 32),
+           reportedMD5.allSatisfy({ $0.isHexDigit }), rawMD5 != reportedMD5 {
+            throw HiDockError.transferFailed("The downloaded recording failed its device checksum. Existing audio was left unchanged.")
+        }
+        let outputURL = baseDirectory.appendingPathComponent(filename)
+        var unchanged = false
+        if existing != nil {
+            let bytes = try await fileAccess.readDataIfPresent(at: outputURL, knownToExist: true)
+            try Task.checkCancellation()
+            guard try existingRecording(for: entry)?.filename == filename, meta[key] == previous else {
+                throw HiDockError.storageError("The library changed while checking this recording. Try importing again.")
+            }
+            unchanged = bytes == mp3Data
+        } else {
+            // Do not attach unrelated orphan sidecars to a new recording.
+            try requireAvailableRecordingPath(filename)
+        }
+        try Task.checkCancellation()
+        if !unchanged { try mp3Data.write(to: outputURL, options: .atomic) }
 
-        // Persist mode and original device filename so they survive renames
-        setMeta(mode: mode, deviceFilename: entry.filename, for: mp3Filename)
-
+        let parsed = FilenameParsing.parse(key)
+        let mode = previous?.mode ?? (parsed.mode == .unknown ? nil : parsed.mode.rawValue)
+        let recordedAt = previous?.recordedAt ?? existing?.recordedAt ?? parsed.date
+        var updated = previous ?? RecordingMeta(mode: mode, deviceFilename: entry.filename, recordedAt: recordedAt)
+        updated.mode = mode
+        updated.deviceFilename = entry.filename
+        updated.recordedAt = recordedAt
+        updated.sourceMD5 = rawMD5 == reportedMD5 ? rawMD5 : nil
+        updated.audioSHA256 = Self.sha256(mp3Data)
+        if previous != updated {
+            meta[key] = updated
+            saveLibraryMeta()
+        }
+        if unchanged { return nil }
+        let folderPath = (filename as NSString).deletingLastPathComponent
         return RecordingMetadata(
-            filename: mp3Filename,
-            recordedAt: parsed.date ?? attrs.creationDate,
-            mode: mode,
-            fileSizeBytes: fileSize,
-            estimatedDuration: DurationCalculator.estimateDuration(fileSize: fileSize)
+            filename: filename,
+            recordedAt: recordedAt,
+            mode: mode ?? "",
+            fileSizeBytes: UInt64(mp3Data.count),
+            estimatedDuration: DurationCalculator.estimateDuration(fileSize: UInt64(mp3Data.count)),
+            folder: folderPath.isEmpty || folderPath == "." ? nil : folderPath
         )
+    }
+
+    private static func sha256(_ bytes: Data) -> String {
+        SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func existingRecording(for entry: FileEntry) throws -> RecordingMetadata? {
+        let mp3Name = entry.filename.replacingOccurrences(of: ".hda", with: ".mp3", options: .caseInsensitive)
+        let matches = allRecordings().filter { recording in
+            let key = (recording.filename as NSString).lastPathComponent
+            return key == mp3Name || meta[key]?.deviceFilename == entry.filename
+        }
+        let uniquePaths = Set(matches.map(\.filename))
+        guard uniquePaths.count <= 1 else {
+            throw HiDockError.storageError("Multiple library recordings match this device file. Resolve the duplicates before importing again.")
+        }
+        return matches.first
     }
 
     // MARK: - Merge recordings
@@ -369,11 +460,15 @@ public actor RecordingStore {
     // MARK: - Recording metadata (library.json)
 
     /// Per-recording metadata that survives renames. Keyed by current filename.
-    public struct RecordingMeta: Codable {
+    public struct RecordingMeta: Codable, Equatable {
         public var mode: String?
         public var deviceFilename: String?
         public var mergedFrom: [String]?
         public var recordedAt: Date?
+        /// Verified raw HDA fingerprint, only when it matched the device field.
+        public var sourceMD5: String?
+        /// Imported MP3 baseline used to detect later corruption.
+        public var audioSHA256: String?
     }
 
     /// In-memory cache of filename → metadata.

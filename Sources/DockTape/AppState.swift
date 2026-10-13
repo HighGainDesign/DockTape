@@ -225,9 +225,17 @@ final class AppState {
 
     func downloadFile(_ file: FileEntry) async {
         do {
-            try await device.downloadFile(file)
+            let wasImported = library.isDownloaded(file.filename)
+            statusMessage = "Checking \(file.filename)…"
+            let changed = try await device.downloadFile(file)
             await library.refresh()
-            statusMessage = "Imported \(file.filename)"
+            if !changed {
+                statusMessage = "Already imported — audio matches \(file.filename)"
+            } else if wasImported {
+                statusMessage = "Re-imported \(file.filename). Review its transcript and summary."
+            } else {
+                statusMessage = "Imported \(file.filename)"
+            }
         } catch {
             errorMessage = "Import failed: \(error.localizedDescription)"
         }
@@ -251,6 +259,7 @@ final class AppState {
                 statusMessage = "Already up to date"
             } else {
                 var msg = "Imported \(result.downloaded.count) recording(s)"
+                if !result.reimported.isEmpty { msg += ", \(result.reimported.count) repaired; review their transcripts and summaries" }
                 if !result.failed.isEmpty { msg += ", \(result.failed.count) failed" }
                 statusMessage = msg
                 if !result.failed.isEmpty {

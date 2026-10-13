@@ -46,7 +46,8 @@ public actor SyncEngine {
     /// Result of a sync operation.
     public struct SyncResult: Sendable {
         public let downloaded: [RecordingMetadata]
-        public let skipped: [String]        // already downloaded
+        public let skipped: [String]        // verified identical audio
+        public let reimported: [String]     // existing audio repaired in place
         public let failed: [(String, String)] // (filename, error description)
         public let deletedFromDevice: [String]
     }
@@ -56,7 +57,7 @@ public actor SyncEngine {
         let deviceFiles = try await deviceManager.queryFileList()
         var pending: [FileEntry] = []
         for file in deviceFiles {
-            let alreadyHave = await store.isDownloaded(filename: file.filename)
+            let alreadyHave = try await store.matchesVerifiedImport(file)
             if !alreadyHave {
                 pending.append(file)
             }
@@ -75,19 +76,26 @@ public actor SyncEngine {
         let deviceFiles = try await deviceManager.queryFileList()
         var toDownload: [FileEntry] = []
         var skipped: [String] = []
+        var failed: [(String, String)] = []
 
         for file in deviceFiles {
-            let alreadyHave = await store.isDownloaded(filename: file.filename)
-            if alreadyHave {
-                skipped.append(file.filename)
-            } else {
-                toDownload.append(file)
+            try Task.checkCancellation()
+            do {
+                if try await store.matchesVerifiedImport(file) {
+                    skipped.append(file.filename)
+                } else {
+                    toDownload.append(file)
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                failed.append((file.filename, error.localizedDescription))
             }
         }
 
         let totalFiles = toDownload.count
         var downloaded: [RecordingMetadata] = []
-        var failed: [(String, String)] = []
+        var reimported: [String] = []
         var deleted: [String] = []
 
         // Download each new file
@@ -96,12 +104,17 @@ public actor SyncEngine {
             onProgress?(SyncProgress(phase: .downloading, currentFile: file.filename, fileIndex: i, totalFiles: totalFiles, bytesDownloaded: 0, bytesTotal: Int(file.size)))
 
             do {
+                let wasImported = await store.isDownloaded(filename: file.filename)
                 let hdaData = try await deviceManager.downloadFile(entry: file)
 
                 onProgress?(SyncProgress(phase: .converting, currentFile: file.filename, fileIndex: i, totalFiles: totalFiles, bytesDownloaded: Int(file.size), bytesTotal: Int(file.size)))
 
-                let meta = try await store.storeRecording(hdaData: hdaData, entry: file)
+                guard let meta = try await store.importRecording(hdaData: hdaData, entry: file) else {
+                    skipped.append(file.filename)
+                    continue
+                }
                 downloaded.append(meta)
+                if wasImported { reimported.append(meta.filename) }
 
                 if deleteAfterDownload {
                     onProgress?(SyncProgress(phase: .deleting, currentFile: file.filename, fileIndex: i, totalFiles: totalFiles, bytesDownloaded: Int(file.size), bytesTotal: Int(file.size)))
@@ -115,22 +128,24 @@ public actor SyncEngine {
 
         onProgress?(SyncProgress(phase: .complete, currentFile: "", fileIndex: totalFiles, totalFiles: totalFiles, bytesDownloaded: 0, bytesTotal: 0))
 
-        return SyncResult(downloaded: downloaded, skipped: skipped, failed: failed, deletedFromDevice: deleted)
+        return SyncResult(downloaded: downloaded, skipped: skipped, reimported: reimported, failed: failed, deletedFromDevice: deleted)
     }
 
-    /// Download a single specific file.
+    /// Import one file; nil means verified identical audio was skipped.
+    /// Unknown source checksums require a transfer before comparing MP3 bytes.
     public func downloadFile(
         _ file: FileEntry,
         deleteAfterDownload: Bool = false,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
-    ) async throws -> RecordingMetadata {
+    ) async throws -> RecordingMetadata? {
+        if try await store.matchesVerifiedImport(file) { return nil }
         onProgress?(SyncProgress(phase: .downloading, currentFile: file.filename, fileIndex: 0, totalFiles: 1, bytesDownloaded: 0, bytesTotal: Int(file.size)))
 
         let hdaData = try await deviceManager.downloadFile(entry: file)
 
         onProgress?(SyncProgress(phase: .converting, currentFile: file.filename, fileIndex: 0, totalFiles: 1, bytesDownloaded: Int(file.size), bytesTotal: Int(file.size)))
 
-        let meta = try await store.storeRecording(hdaData: hdaData, entry: file)
+        guard let meta = try await store.importRecording(hdaData: hdaData, entry: file) else { return nil }
 
         if deleteAfterDownload {
             onProgress?(SyncProgress(phase: .deleting, currentFile: file.filename, fileIndex: 0, totalFiles: 1, bytesDownloaded: Int(file.size), bytesTotal: Int(file.size)))

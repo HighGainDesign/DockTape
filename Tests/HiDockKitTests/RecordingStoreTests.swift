@@ -96,16 +96,105 @@ final class RecordingStoreTests: XCTestCase {
         XCTAssertEqual(all[0].filename, "REC_20240315_143000.mp3")
     }
 
-    func testDuplicateStoreReplaces() async throws {
-        var hda = Data([0xFF, 0xFB])
-        hda.append(Data(repeating: 0xAA, count: 50))
-        let entry = FileEntry(filename: "REC_20240315_143000.hda", size: UInt32(hda.count))
+    func testIdenticalImportDoesNotRewriteAudioOrSidecars() async throws {
+        let name = "REC_20240315_143000"
+        let original = Data([0xFF, 0xFB, 0xAA, 0xAA])
+        let entry = FileEntry(filename: name + ".hda", size: UInt32(original.count))
+        try await store.storeRecording(hdaData: original, entry: entry)
+        let url = tmpDir.appendingPathComponent(name + ".mp3")
+        let oldFileID = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+        let transcript = Data("original transcript".utf8)
+        let summary = Data("original summary".utf8)
+        try transcript.write(to: tmpDir.appendingPathComponent(name + ".transcript.json"))
+        try summary.write(to: tmpDir.appendingPathComponent(name + ".summary.json"))
+        try await store.storeRecording(hdaData: original, entry: entry)
+        let newFileID = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+        XCTAssertEqual(newFileID, oldFileID, "Identical audio must not be atomically replaced")
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        XCTAssertEqual(try Data(contentsOf: tmpDir.appendingPathComponent(name + ".transcript.json")), transcript)
+        XCTAssertEqual(try Data(contentsOf: tmpDir.appendingPathComponent(name + ".summary.json")), summary)
+    }
 
-        try await store.storeRecording(hdaData: hda, entry: entry)
-        try await store.storeRecording(hdaData: hda, entry: entry) // store again
-
+    func testChangedImportRepairsRenamedMovedAudioWithoutExtraFiles() async throws {
+        let original = Data([0xFF, 0xFB, 0xAA, 0xAA])
+        let entry = FileEntry(filename: "REC_20240315_143000.hda", size: UInt32(original.count))
+        let metadata = try await store.storeRecording(hdaData: original, entry: entry)
+        let renamed = try await store.renameRecording(filename: metadata.filename, to: "meeting")
+        try await store.createFolder(named: "Archive")
+        let moved = try await store.moveRecording(filename: renamed, toFolder: "Archive")
+        let transcriptURL = tmpDir.appendingPathComponent("Archive/meeting.transcript.json")
+        let summaryURL = tmpDir.appendingPathComponent("Archive/meeting.summary.json")
+        let transcript = Data("saved transcript".utf8)
+        let summary = Data("saved summary".utf8)
+        try transcript.write(to: transcriptURL)
+        try summary.write(to: summaryURL)
+        // Simulate corrupt local/cloud bytes without changing the device recording.
+        try Data([0xFF, 0xFB, 0xBB]).write(to: tmpDir.appendingPathComponent(moved))
+        let repaired = try await store.storeRecording(hdaData: original, entry: entry)
+        XCTAssertEqual(repaired.filename, "Archive/meeting.mp3")
+        XCTAssertEqual(repaired.recordedAt, metadata.recordedAt)
+        XCTAssertEqual(try Data(contentsOf: tmpDir.appendingPathComponent(moved)), original)
+        XCTAssertEqual(try Data(contentsOf: transcriptURL), transcript)
+        XCTAssertEqual(try Data(contentsOf: summaryURL), summary)
         let all = await store.allRecordings()
-        XCTAssertEqual(all.count, 1) // should not duplicate
+        XCTAssertEqual(all.map(\.filename), ["Archive/meeting.mp3"])
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: tmpDir.appendingPathComponent("Archive").path)),
+                       Set(["meeting.mp3", "meeting.transcript.json", "meeting.summary.json"]))
+    }
+
+    func testImportCannotReuseAnUnrelatedOrphanSidecarDestination() async throws {
+        for suffix in [".transcript.json", ".summary.json", ".txt"] {
+            let dir = tmpDir.appendingPathComponent(UUID().uuidString)
+            let isolatedStore = RecordingStore(baseDirectory: dir)
+            try await isolatedStore.setup()
+            let reservedName = suffix == ".mp3.icloud" ? ".recording" + suffix : "recording" + suffix
+            let reservedURL = dir.appendingPathComponent(reservedName)
+            let original = Data("existing content".utf8)
+            try original.write(to: reservedURL)
+            do {
+                try await isolatedStore.storeRecording(
+                    hdaData: Data([0xFF, 0xFB, 0xAA]),
+                    entry: FileEntry(filename: "recording.hda", size: 3))
+                XCTFail("Import must reject reserved destination: \(suffix)")
+            } catch {}
+            XCTAssertEqual(try Data(contentsOf: reservedURL), original)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("recording.mp3").path))
+        }
+    }
+
+    func testBadTransferCannotReplaceVerifiedAudio() async throws {
+        let original = Data([0xFF, 0xFB, 0xAA, 0xAA])
+        let entry = FileEntry(filename: "recording.hda", size: 4, md5: "bb8e5c306ef0dfbe6fa05803f2ed69ab")
+        try await store.storeRecording(hdaData: original, entry: entry)
+        for bad in [Data([0xFF, 0xFB, 0xBB, 0xBB]), Data([0xFF, 0xFB, 0xAA])] {
+            do {
+                try await store.storeRecording(hdaData: bad, entry: entry)
+                XCTFail("A mismatched checksum or incomplete transfer must not replace good audio")
+            } catch {}
+            XCTAssertEqual(try Data(contentsOf: tmpDir.appendingPathComponent("recording.mp3")), original)
+        }
+    }
+
+    func testLegacyImportGetsVerifiedWithoutRewritingItsAudio() async throws {
+        let bytes = Data([0xFF, 0xFB, 0xAA, 0xAA])
+        let url = tmpDir.appendingPathComponent("recording.mp3")
+        try bytes.write(to: url)
+        // No library.json/source hash existed for this legacy recording.
+        let fileID = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+        let entry = FileEntry(filename: "recording.hda", size: 4, md5: "bb8e5c306ef0dfbe6fa05803f2ed69ab")
+        let before = try await store.matchesVerifiedImport(entry)
+        XCTAssertFalse(before, "An unverified legacy file is not enough to skip")
+        let imported = try await store.importRecording(hdaData: bytes, entry: entry)
+        XCTAssertNil(imported)
+        let verified = try await store.matchesVerifiedImport(entry)
+        XCTAssertTrue(verified)
+        let afterID = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+        XCTAssertEqual(afterID, fileID)
+        // Check persisted evidence, not just an in-memory hash.
+        let reloaded = RecordingStore(baseDirectory: tmpDir)
+        try await reloaded.setup()
+        let persisted = try await reloaded.matchesVerifiedImport(entry)
+        XCTAssertTrue(persisted)
     }
 
     func testRenameRecording() async throws {

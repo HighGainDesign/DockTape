@@ -126,7 +126,7 @@ enum MainMenu {
 
         // Device menu
         let deviceMenu = NSMenu(title: "Device")
-        addItem(deviceMenu, "Sync All", action: #selector(MainMenuActions.syncAll(_:)), key: "d", modifiers: [.command, .shift])
+        addItem(deviceMenu, "Import All", action: #selector(MainMenuActions.syncAll(_:)), key: "d", modifiers: [.command, .shift])
         addItem(deviceMenu, "Refresh Device", action: #selector(MainMenuActions.refreshDevice(_:)), key: "", modifiers: [])
         deviceMenu.addItem(.separator())
         addItem(deviceMenu, "Device Info...", action: #selector(MainMenuActions.deviceInfo(_:)), key: "i", modifiers: .command)
