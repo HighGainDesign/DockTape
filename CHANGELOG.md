@@ -15,6 +15,8 @@
 
 ### Improved
 
+- Changing storage locations also retargets imports from an already connected device. Existing library files stay in place.
+
 - Import compares existing audio with the device recording: verified matches are skipped, while different or corrupted audio is re-imported in place, preserving names, folders and sidecars without extra recovery copies. Older recordings establish verification data on first comparison. The batch command is now labelled Import All in the Device menu.
 
 - Cloud-only audio, transcripts, and summaries show download/loading status and recoverable errors. Waiting for one iCloud file no longer stalls another recording; late results cannot replace the newly selected content.

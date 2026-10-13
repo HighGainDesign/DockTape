@@ -111,6 +111,7 @@ final class SyncEngineTests: XCTestCase {
         let engine = SyncEngine(deviceManager: manager, store: store)
         let result = try await engine.downloadFile(FileEntry(filename: "recording.hda", size: UInt32(bytes.count)))
         XCTAssertNotNil(result)
+        XCTAssertNotNil(result?.recordedAt, "Unrecognized device filenames retain the file-date fallback")
         XCTAssertEqual(transport.sentData.count, 1)
         XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("recording.mp3")), Data([0xFF, 0xFB, 0xAA]))
     }

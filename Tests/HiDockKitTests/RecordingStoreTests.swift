@@ -175,6 +175,31 @@ final class RecordingStoreTests: XCTestCase {
         }
     }
 
+    func testChangedSourceWithUnprovenChecksumCoverageStillReimports() async throws {
+        try await store.storeRecording(hdaData: Data([0xFF, 0xFB, 0xAA, 0xAA]),
+            entry: FileEntry(filename: "recording.hda", size: 4, md5: "bb8e5c306ef0dfbe6fa05803f2ed69ab"))
+        // A later source reports an MP3 fingerprint rather than raw HDA coverage.
+        // Its changed fingerprint is not proof of the old coverage contract.
+        let hda = Data([0x00, 0xFF, 0xFB, 0xBB, 0xBB])
+        let entry = FileEntry(filename: "recording.hda", size: 5, md5: "2b88e3e302ad447d456ddc88394bd046")
+        let updated = try await store.importRecording(hdaData: hda, entry: entry)
+        XCTAssertEqual(updated?.filename, "recording.mp3")
+        XCTAssertEqual(try Data(contentsOf: tmpDir.appendingPathComponent("recording.mp3")), Data([0xFF, 0xFB, 0xBB, 0xBB]))
+        let verified = try await store.matchesVerifiedImport(entry)
+        XCTAssertFalse(verified, "Unproven raw checksum coverage must use a new transfer next time")
+    }
+
+    func testHeaderCoverageChangeCanRestoreTheTrustedAudioBaseline() async throws {
+        let audio = Data([0xFF, 0xFB, 0xAA, 0xAA])
+        try await store.storeRecording(hdaData: audio,
+            entry: FileEntry(filename: "recording.hda", size: 4, md5: "bb8e5c306ef0dfbe6fa05803f2ed69ab"))
+        try Data([0xBB]).write(to: tmpDir.appendingPathComponent("recording.mp3"))
+        let entry = FileEntry(filename: "recording.hda", size: 5, md5: "bb8e5c306ef0dfbe6fa05803f2ed69ab")
+        let result = try await store.importRecording(hdaData: Data([0x00]) + audio, entry: entry)
+        XCTAssertNotNil(result)
+        XCTAssertEqual(try Data(contentsOf: tmpDir.appendingPathComponent("recording.mp3")), audio)
+    }
+
     func testLegacyImportGetsVerifiedWithoutRewritingItsAudio() async throws {
         let bytes = Data([0xFF, 0xFB, 0xAA, 0xAA])
         let url = tmpDir.appendingPathComponent("recording.mp3")

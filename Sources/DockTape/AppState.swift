@@ -88,6 +88,8 @@ final class AppState {
     private let monitor = USBDeviceMonitor()
     private var isConnecting: Bool = false
     private var pollingTask: Task<Void, Never>?
+    private(set) var playbackTranscriptTask: Task<Void, Never>?
+    private var playbackTranscriptRequestID = UUID()
 
     init() {
         let defaults = UserDefaults.standard
@@ -187,14 +189,28 @@ final class AppState {
 
     /// Switch storage location and re-initialize all stores.
     /// Does NOT move files — the user manages that via Finder.
-    func switchStorageLocation(to mode: StorageMode, customURL: URL? = nil) async {
+    @discardableResult
+    func switchStorageLocation(to mode: StorageMode, customURL: URL? = nil) async -> Bool {
+        guard !device.isDeviceBusy, !transcription.isTranscribing, !summarization.isSummarizing else {
+            errorMessage = "Wait for the current operation to finish before changing storage."
+            return false
+        }
         // A pending cloud playback request belongs to the old library.
+        playbackTranscriptRequestID = UUID()
+        playbackTranscriptTask?.cancel()
+        playbackTranscriptTask = nil
         playback.stop()
         let defaults = UserDefaults.standard
         defaults.set(mode.rawValue, forKey: "storageMode")
 
         if mode == .custom, let url = customURL {
             defaults.set(url, forKey: "libraryLocation")
+            if let bookmark = try? url.bookmarkData(options: .withSecurityScope,
+                                                   includingResourceValuesForKeys: nil, relativeTo: nil) {
+                defaults.set(bookmark, forKey: "libraryLocationBookmark")
+            } else {
+                defaults.removeObject(forKey: "libraryLocationBookmark")
+            }
         }
 
         let baseDir = StorageLocationResolver.resolve(mode: mode, customURL: customURL)
@@ -207,11 +223,16 @@ final class AppState {
         let summaryStore = SummaryStore(baseDirectory: store.baseDirectory)
         self.summarization = SummarizationState(summaryStore: summaryStore)
         self.templateStore = TemplateStore(baseDirectory: store.baseDirectory)
+        if let manager = device.deviceManager {
+            device.syncEngine = SyncEngine(deviceManager: manager, store: store)
+        }
 
         do {
             try await setup()
+            return true
         } catch {
             errorMessage = "Failed to load library: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -226,10 +247,15 @@ final class AppState {
     func downloadFile(_ file: FileEntry) async {
         do {
             let wasImported = library.isDownloaded(file.filename)
+            let importDirectory = library.store.baseDirectory
             statusMessage = "Checking \(file.filename)…"
             let changed = try await device.downloadFile(file)
+            if let changed, library.store.baseDirectory == importDirectory,
+               playback.playingFile == changed.filename {
+                playback.stop()
+            }
             await library.refresh()
-            if !changed {
+            if changed == nil {
                 statusMessage = "Already imported — audio matches \(file.filename)"
             } else if wasImported {
                 statusMessage = "Re-imported \(file.filename). Review its transcript and summary."
@@ -242,6 +268,7 @@ final class AppState {
     }
 
     func syncAll() async {
+        let importDirectory = library.store.baseDirectory
         syncProgress = 0
         do {
             let result = try await device.syncAll(
@@ -253,6 +280,10 @@ final class AppState {
                 }
             }
             syncProgress = nil
+            if library.store.baseDirectory == importDirectory, let filename = playback.playingFile,
+               result.downloaded.contains(where: { $0.filename == filename }) {
+                playback.stop()
+            }
             await library.refresh()
 
             if result.downloaded.isEmpty && result.failed.isEmpty {
@@ -300,11 +331,19 @@ final class AppState {
     func playRecording(_ rec: RecordingMetadata) {
         let url = library.store.baseDirectory.appendingPathComponent(rec.filename)
         playback.play(file: rec.filename, url: url)
-        Task { await refreshPlaybackTranscript(for: rec.filename) }
+        playbackTranscriptRequestID = UUID()
+        let request = playbackTranscriptRequestID
+        playbackTranscriptTask?.cancel()
+        playbackTranscriptTask = Task { [weak self] in
+            await self?.refreshPlaybackTranscript(for: rec.filename, requestID: request)
+        }
     }
 
-    private func refreshPlaybackTranscript(for filename: String) async {
-        let transcript = await library.transcript(for: filename)
+    private func refreshPlaybackTranscript(for filename: String, requestID: UUID? = nil) async {
+        let request = requestID ?? playbackTranscriptRequestID
+        let readingLibrary = library
+        let transcript = await readingLibrary.transcript(for: filename)
+        guard library === readingLibrary, playbackTranscriptRequestID == request else { return }
         playback.setSegmentTimestamps(
             transcript?.segments.map { (start: $0.startTime, end: $0.endTime) } ?? [],
             for: filename

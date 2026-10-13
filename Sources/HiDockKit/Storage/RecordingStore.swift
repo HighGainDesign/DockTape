@@ -239,12 +239,15 @@ public actor RecordingStore {
         let key = (filename as NSString).lastPathComponent
         let previous = meta[key]
         let rawMD5 = Insecure.MD5.hash(data: hdaData).map { String(format: "%02x", $0) }.joined()
+        let audioSHA256 = Self.sha256(mp3Data)
         let reportedMD5 = entry.md5.lowercased()
-        // Enforce a device checksum only after an earlier import established that
-        // this device field actually hashes the raw HDA bytes.
-        if previous?.sourceMD5 != nil, reportedMD5.count == 32,
+        // The old raw baseline proves this exact source fingerprint. A changed
+        // source/format can have different checksum coverage; compare its bytes
+        // and establish a fresh baseline rather than rejecting a valid re-import.
+        if previous?.sourceMD5 == reportedMD5, reportedMD5.count == 32,
            reportedMD5 != String(repeating: "0", count: 32),
-           reportedMD5.allSatisfy({ $0.isHexDigit }), rawMD5 != reportedMD5 {
+           reportedMD5.allSatisfy({ $0.isHexDigit }), rawMD5 != reportedMD5,
+           previous?.audioSHA256 != audioSHA256 {
             throw HiDockError.transferFailed("The downloaded recording failed its device checksum. Existing audio was left unchanged.")
         }
         let outputURL = baseDirectory.appendingPathComponent(filename)
@@ -266,12 +269,13 @@ public actor RecordingStore {
         let parsed = FilenameParsing.parse(key)
         let mode = previous?.mode ?? (parsed.mode == .unknown ? nil : parsed.mode.rawValue)
         let recordedAt = previous?.recordedAt ?? existing?.recordedAt ?? parsed.date
+            ?? (try? outputURL.resourceValues(forKeys: [.creationDateKey]))?.creationDate
         var updated = previous ?? RecordingMeta(mode: mode, deviceFilename: entry.filename, recordedAt: recordedAt)
         updated.mode = mode
         updated.deviceFilename = entry.filename
         updated.recordedAt = recordedAt
         updated.sourceMD5 = rawMD5 == reportedMD5 ? rawMD5 : nil
-        updated.audioSHA256 = Self.sha256(mp3Data)
+        updated.audioSHA256 = audioSHA256
         if previous != updated {
             meta[key] = updated
             saveLibraryMeta()

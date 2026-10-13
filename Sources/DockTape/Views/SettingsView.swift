@@ -114,7 +114,7 @@ struct SettingsView: View {
     }
 
     private var isProcessing: Bool {
-        state.transcription.isTranscribing || state.summarization.summarizingFile != nil || state.device.isDeviceBusy
+        state.transcription.isTranscribing || state.summarization.isSummarizing || state.device.isDeviceBusy
     }
 
     private func handleStorageModeChange(_ mode: StorageMode) {
@@ -122,8 +122,11 @@ struct SettingsView: View {
             chooseCustomLocation()
         } else {
             Task {
-                await state.switchStorageLocation(to: mode)
-                showLocationChangedAlert = true
+                showLocationChangedAlert = await state.switchStorageLocation(to: mode)
+                if !showLocationChangedAlert {
+                    let raw = UserDefaults.standard.string(forKey: "storageMode") ?? "icloud"
+                    storageMode = StorageMode(rawValue: raw) ?? .icloud
+                }
             }
         }
     }
@@ -137,16 +140,11 @@ struct SettingsView: View {
         panel.message = "Select where to store downloaded recordings"
 
         if panel.runModal() == .OK, let url = panel.url {
-            // Store as security-scoped bookmark so we can access it after restart
-            if let bookmark = try? url.bookmarkData(
-                options: .withSecurityScope,
-                includingResourceValuesForKeys: nil,
-                relativeTo: nil
-            ) {
-                UserDefaults.standard.set(bookmark, forKey: "libraryLocationBookmark")
-                Task {
-                    await state.switchStorageLocation(to: .custom, customURL: url)
-                    showLocationChangedAlert = true
+            Task {
+                showLocationChangedAlert = await state.switchStorageLocation(to: .custom, customURL: url)
+                if !showLocationChangedAlert {
+                    let raw = UserDefaults.standard.string(forKey: "storageMode") ?? "icloud"
+                    storageMode = StorageMode(rawValue: raw) ?? .icloud
                 }
             }
         } else {

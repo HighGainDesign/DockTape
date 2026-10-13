@@ -45,12 +45,12 @@ final class DeviceState {
         _ = try? await mgr.queryFileList()
     }
 
-    func downloadFile(_ file: FileEntry) async throws -> Bool {
+    func downloadFile(_ file: FileEntry) async throws -> RecordingMetadata? {
         guard let engine = syncEngine else { throw HiDockError.noDevice }
         try guardNotBusy()
         downloadingFiles.insert(file.filename)
         defer { downloadingFiles.remove(file.filename) }
-        return try await engine.downloadFile(file) != nil
+        return try await engine.downloadFile(file)
     }
 
     func deleteFromDevice(_ file: FileEntry) async throws {
