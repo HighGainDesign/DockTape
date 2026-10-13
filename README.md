@@ -24,7 +24,7 @@ Import, transcribe, diarize, and manage recordings on your Mac. Transcription an
 
 **[Download DockTape](https://github.com/HighGainDesign/DockTape/releases/latest)** — signed `.dmg`.
 
-As of October 6, 2026, the latest published release is **v1.0.0**. The features described above reflect the current source (**v1.2.0**), which is awaiting release testing. Building from source includes changes that are not yet in the published download.
+As of October 13, 2026, the latest published release is **v1.0.0**. The features described above reflect the current source (**v1.2.0**), which is awaiting final interface acceptance. Building from source includes changes that are not yet in the published download.
 
 ## Requirements
 
@@ -57,6 +57,7 @@ swift run hidock help
 ```bash
 swift test
 ./scripts/test-playback.sh   # App playback regression checks (macOS)
+./scripts/test-import.sh     # App import and storage regression checks (macOS)
 ```
 
 ### Releases

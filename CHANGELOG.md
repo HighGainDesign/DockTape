@@ -21,7 +21,7 @@
 
 - Cloud-only audio, transcripts, and summaries show download/loading status and recoverable errors. Waiting for one iCloud file no longer stalls another recording; late results cannot replace the newly selected content.
 
-- Cloud-only iCloud recordings and their transcript/summary sidecars remain visible, including hidden placeholder files.
+- The iCloud recording list appears on first launch without requiring Refresh. Cloud-only recordings and their transcript/summary sidecars remain visible, including hidden placeholder files.
 - Transcripts and summaries load on demand for faster startup.
 - Summary prompts use the recording mode to provide speaker context. Voice memos skip unnecessary speaker diarization.
 - Renaming preserves recording dates, modes, folders, transcripts, and summaries. Moving recordings into folders updates their transcript and summary status.
@@ -33,10 +33,9 @@
 - P1 battery voltage displays in volts with the correct firmware units.
 - Selecting another recording no longer replaces the playing recording's transcript timestamps or highlights the wrong transcript.
 - The vendored USB library now targets the app's macOS 14 minimum. Release builds preserve full diagnostic logs and verify signing strictly.
-- The shared core has initial iOS support; an iOS app is still in development.
+- The shared core has initial iOS support; an iOS app is planned.
 
 ### Known issues
 
-- A blank recording list has been reported on first launch with an iCloud library. Use Refresh if this occurs; investigation continues in [issue #30](https://github.com/HighGainDesign/DockTape/issues/30).
 - iCloud conflict handling remains limited when multiple Macs edit the same sidecar files simultaneously.
 - Recording-list durations are estimates. The playback bar uses the measured audio duration.
