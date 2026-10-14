@@ -28,6 +28,16 @@ public enum SharedProjectionDocument {
         body[key] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(marker))
         return try JSONSerialization.data(withJSONObject: body, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
     }
+    /// Read identity declarations even when a user edit has invalidated the
+    /// body checksum. This is only for review binding, never write permission.
+    static func declaredMarker(in bytes: Data) throws -> SharedProjectionMarker? {
+        guard let body = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { return nil }
+        guard let raw = body[key] else { return nil }
+        let marker = try JSONDecoder().decode(SharedProjectionMarker.self, from: canonical(raw))
+        guard marker.schema == 1, Set(marker.entities).count == marker.entities.count,
+              marker.entities == marker.entities.sorted(by: { $0.uuidString < $1.uuidString }) else { throw SharedSidecarError.invalidContent }
+        return marker
+    }
     public static func marker(in bytes: Data) throws -> SharedProjectionMarker? {
         guard var body = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { throw SharedSidecarError.invalidContent }
         guard let raw = body.removeValue(forKey: key) else { return nil }

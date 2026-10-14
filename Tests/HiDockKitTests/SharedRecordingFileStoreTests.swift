@@ -218,7 +218,7 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertEqual(current.state.value(for: "title"), .text("Renamed"))
     }
     func testBootstrapLocationsRemainOwnedThroughMoveBeforeFirstProjection() async throws {
-        let (root, coordinator, store) = try await fixture(project: false)
+        let (root, _, store) = try await fixture(project: false)
         let renamed = try await store.renameRecording(filename: "Meeting.mp3", to: "Renamed")
         XCTAssertEqual(renamed, "Renamed.mp3")
         let outcome = await store.sharedOperation

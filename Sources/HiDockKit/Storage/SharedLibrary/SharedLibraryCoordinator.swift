@@ -863,6 +863,8 @@ public actor SharedLibraryCoordinator {
       throw SharedLibraryCoordinatorError.externalChanged
     }
     let fresh = try await read(candidate.entity)
+    let checked = try SharedDocument(id: candidate.document.id, json: externalBody(bytes, snapshot: fresh, component: candidate.component))
+    guard checked.json == candidate.document.json else { throw SharedLibraryCoordinatorError.externalChanged }
     let marker = "externalAdoption." + candidate.component.rawValue
     if fresh.state.value(for: marker) == .text(candidate.fingerprint),
       fresh.state.currentDocument(for: candidate.component)?.json == candidate.document.json
@@ -901,7 +903,7 @@ public actor SharedLibraryCoordinator {
       let id = try SharedLibraryIdentity.legacy(
         relativePath:
           "version-\(entity.id.uuidString)-\(component.rawValue)-\(version.id)-\(fingerprint).json")
-      let document = try SharedDocument(id: id, json: bytes)
+      let document = try SharedDocument(id: id, json: externalBody(bytes, snapshot: snapshot, component: component))
       result.append(
         .init(
           libraryID: snapshot.libraryID, versionID: version.id, id: id, entity: entity,
@@ -923,11 +925,27 @@ public actor SharedLibraryCoordinator {
     let fingerprint = try SharedStateFingerprint.of(bytes)
     let id = try SharedLibraryIdentity.legacy(
       relativePath: "external-\(entity.id.uuidString)-\(component.rawValue)-\(fingerprint).json")
-    let document = try SharedDocument(id: id, json: bytes)
+    let document = try SharedDocument(id: id, json: externalBody(bytes, snapshot: snapshot, component: component))
+    let manifest = try await bind(force: true)
+    let membership = try await memberRepository().load().membership
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let relative = String(url.standardizedFileURL.resolvingSymlinksInPath().path.dropFirst(root.path.count + 1))
+    if (try? published.validateCompanion(path: relative, bytes: bytes, entity: entity.id,
+         library: snapshot.libraryID, kind: component.rawValue)) != nil { return nil }
     if snapshot.state.currentDocument(for: component)?.json == document.json { return nil }
     return .init(
       libraryID: snapshot.libraryID, versionID: nil, id: id, entity: entity, component: component,
       url: url,
       fingerprint: fingerprint, document: document)
   }
+  private func externalBody(_ bytes: Data, snapshot: SharedLibraryViewSnapshot, component: SharedComponent) throws -> Data {
+    guard let marker = try SharedProjectionDocument.declaredMarker(in: bytes) else { return bytes }
+    guard marker.libraryID == snapshot.libraryID, marker.entities == [snapshot.state.id], marker.kind == component.rawValue else {
+      throw SharedLibraryCoordinatorError.differentBinding
+    }
+    guard var object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { throw SharedSidecarError.invalidContent }
+    object.removeValue(forKey: SharedProjectionDocument.key)
+    return try SharedProjectionDocument.canonical(object)
+  }
+
 }

@@ -150,7 +150,14 @@ struct SharedLibraryProjectionWriter {
                         let original = (reference.initialPath as NSString).deletingPathExtension + "." + desiredMarker.kind + ".json"
                         initial = inputs.files[original] == hash
                     }
-                    guard published || initial else { throw SharedProjectionWriteError.untracked(path) }
+                    let adopted: Bool
+                    if let desiredMarker, desiredMarker.entities.count == 1,
+                       let view = context.views.first(where: { $0.state.id == desiredMarker.entities[0] && $0.state.kind == .recording }),
+                       let component = SharedComponent(rawValue: desiredMarker.kind),
+                       view.state.currentDocument(for: component)?.id == desiredMarker.generation {
+                        adopted = view.state.value(for: "externalAdoption." + desiredMarker.kind) == .text(try SharedStateFingerprint.of(existing))
+                    } else { adopted = false }
+                    guard published || initial || adopted else { throw SharedProjectionWriteError.untracked(path) }
                 }
                 changes.append((index + 1, path, desired))
             }
