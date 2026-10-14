@@ -146,6 +146,13 @@ struct SidebarView: View {
                 .background(.blue.opacity(0.05))
             }
 
+            if state.sharedLibrary.phase == .connecting {
+                HStack { ProgressView().controlSize(.small); Text("Opening shared library…").font(.caption) }.padding(8)
+            } else if state.sharedLibrary.phase == .readOnly {
+                Label("Shared library: read-only", systemImage: "lock").font(.caption).foregroundStyle(.secondary).padding(8)
+            } else if state.sharedLibrary.phase == .failed {
+                Label("Shared library needs attention in Settings", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange).padding(8)
+            }
             Divider()
             deviceStatusBar
         }

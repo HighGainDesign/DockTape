@@ -28,7 +28,7 @@ struct SummaryTabView: View {
     }
 
     private var contentID: String {
-        state.library.store.baseDirectory.appendingPathComponent(recording.filename).absoluteString
+        state.library.store.baseDirectory.appendingPathComponent(recording.filename).absoluteString + "|\(state.sharedLibrary.revision)"
     }
 
     var body: some View {

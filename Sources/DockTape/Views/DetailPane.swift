@@ -248,7 +248,7 @@ struct DetailPane: View {
     /// Track the requested file separately from legacy sidecar identity fields.
     /// A late read or editor callback must not display another recording's text.
     private func contentID(for filename: String) -> String {
-        state.library.store.baseDirectory.appendingPathComponent(filename).absoluteString
+        state.library.store.baseDirectory.appendingPathComponent(filename).absoluteString + "|\(state.sharedLibrary.revision)"
     }
 
     private func reloadTranscript(for filename: String) async -> Bool {

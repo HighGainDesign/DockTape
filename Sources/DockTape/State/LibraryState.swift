@@ -18,8 +18,11 @@ final class LibraryState {
 
     let store: RecordingStore
     let transcriptStore: TranscriptStore
+    let sharedCoordinator: SharedLibraryCoordinator?
+    var refreshError: String?
 
-    init(store: RecordingStore, transcriptStore: TranscriptStore) {
+    init(store: RecordingStore, transcriptStore: TranscriptStore, sharedCoordinator: SharedLibraryCoordinator? = nil) {
+        self.sharedCoordinator = sharedCoordinator
         self.store = store
         self.transcriptStore = transcriptStore
     }
@@ -34,6 +37,10 @@ final class LibraryState {
     var importedDeviceFilenames: Set<String> = []
 
     func refresh() async {
+        if sharedCoordinator != nil {
+            do { try await store.loadLibraryMeta(); refreshError = nil }
+            catch { refreshError = error.localizedDescription }
+        }
         recordings = await store.allRecordings()
         downloadedFilenames = Set(recordings.map(\.filename))
         selectedRecordings.formIntersection(downloadedFilenames)
@@ -72,7 +79,8 @@ final class LibraryState {
         let actualName = try await store.renameFolder(from: oldName, to: newName)
         for rec in affected {
             let newFilename = actualName + rec.filename.dropFirst(oldName.count)
-            try await transcriptStore.rename(from: rec.filename, to: newFilename)
+            if sharedCoordinator == nil { try await transcriptStore.rename(from: rec.filename, to: newFilename) }
+        else { try await transcriptStore.loadAll() }
         }
         if selectedFolder == oldName { selectedFolder = actualName }
         await refresh()
@@ -87,20 +95,22 @@ final class LibraryState {
 
     func moveRecording(filename: String, toFolder folder: String?) async throws -> String {
         let newFilename = try await store.moveRecording(filename: filename, toFolder: folder)
-        try await transcriptStore.rename(from: filename, to: newFilename)
+        if sharedCoordinator == nil { try await transcriptStore.rename(from: filename, to: newFilename) }
+        else { try await transcriptStore.loadAll() }
         await refresh()
         return newFilename
     }
 
     func deleteRecording(_ rec: RecordingMetadata) async throws {
         try await store.deleteRecording(filename: rec.filename)
-        try await transcriptStore.delete(for: rec.filename)
+        if sharedCoordinator == nil { try await transcriptStore.delete(for: rec.filename) }
         await refresh()
     }
 
     func renameRecording(_ rec: RecordingMetadata, to name: String) async throws -> String {
         let newFilename = try await store.renameRecording(filename: rec.filename, to: name)
-        try await transcriptStore.rename(from: rec.filename, to: newFilename)
+        if sharedCoordinator == nil { try await transcriptStore.rename(from: rec.filename, to: newFilename) }
+        else { try await transcriptStore.loadAll() }
         await refresh()
         return newFilename
     }

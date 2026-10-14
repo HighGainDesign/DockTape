@@ -64,6 +64,7 @@ final class AppState {
     var transcription: TranscriptionState
     var summarization: SummarizationState
     var templateStore: TemplateStore
+    var sharedLibrary: SharedLibraryState
 
     var selectedView: SidebarSelection = .allRecordings
     var selectedDetailTab: DetailTab = .info
@@ -91,7 +92,10 @@ final class AppState {
     private(set) var playbackTranscriptTask: Task<Void, Never>?
     private var playbackTranscriptRequestID = UUID()
 
-    init() {
+    init(baseDirectory: URL? = nil,
+         sharedIdentity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity = { try await SharedWriterIdentityFactory().load() },
+         sharedWitnessDirectory: URL? = nil) {
+        self.sharedLibrary = SharedLibraryState(identity: sharedIdentity, witnessDirectory: sharedWitnessDirectory)
         let defaults = UserDefaults.standard
 
         // One-time migration: determine storage mode for pre-iCloud installs
@@ -128,7 +132,7 @@ final class AppState {
         } else {
             customURL = defaults.url(forKey: "libraryLocation")
         }
-        let baseDir = StorageLocationResolver.resolve(mode: mode, customURL: customURL)
+        let baseDir = baseDirectory ?? StorageLocationResolver.resolve(mode: mode, customURL: customURL)
 
         let store = RecordingStore(baseDirectory: baseDir)
         let transcriptStore = TranscriptStore(baseDirectory: store.baseDirectory)
@@ -145,11 +149,53 @@ final class AppState {
         self.autoSyncClock = defaults.object(forKey: "autoSyncClock") as? Bool ?? true
     }
 
+    private func requireWritableLibrary() -> Bool {
+        if sharedLibrary.phase == .ready { return true }
+        if sharedLibrary.phase == .legacy,
+           !FileManager.default.fileExists(atPath: library.store.baseDirectory.appendingPathComponent(".docktape").path) { return true }
+        errorMessage = sharedLibrary.phase == .readOnly
+            ? "This library is read-only. Join it in Settings and wait for the other Macs to connect."
+            : "Wait for shared library setup to finish, or retry it in Settings."
+        return false
+    }
+
+    func enableSharedLibrary() async -> Bool {
+        guard !device.isDeviceBusy, !transcription.isTranscribing, !summarization.isSummarizing, !sharedLibrary.isBusy else {
+            errorMessage = "Wait for the current operation to finish before enabling a shared library."
+            return false
+        }
+        do {
+            if let coordinator = try await sharedLibrary.connect(root: library.store.baseDirectory, enable: true) {
+                attachSharedStores(coordinator)
+            }
+            try await setup()
+            if let coordinator = sharedLibrary.coordinator { _ = try await coordinator.projectOutputs() }
+            return true
+        } catch { errorMessage = "Shared library setup failed: \(error.localizedDescription)"; return false }
+    }
+
+    private func attachSharedStores(_ coordinator: SharedLibraryCoordinator) {
+        let previous = library
+        let store = RecordingStore(baseDirectory: coordinator.root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        let transcripts = TranscriptStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator))
+        library = LibraryState(store: store, transcriptStore: transcripts, sharedCoordinator: coordinator)
+        library.selectedFolder = previous.selectedFolder
+        library.selectedRecording = previous.selectedRecording
+        library.selectedRecordings = previous.selectedRecordings
+        transcription = TranscriptionState(transcriptStore: transcripts)
+        summarization = SummarizationState(summaryStore: SummaryStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator)))
+        templateStore = TemplateStore(baseDirectory: coordinator.root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        if let manager = device.deviceManager { device.syncEngine = SyncEngine(deviceManager: manager, store: store) }
+    }
+
     func setup() async throws {
+        if let coordinator = try await sharedLibrary.connect(root: library.store.baseDirectory), library.sharedCoordinator !== coordinator {
+            attachSharedStores(coordinator)
+        }
         try await library.setup()
         try await summarization.summaryStore.loadAll()
         try await templateStore.load()
-        try await templateStore.migrateFromUserDefaults(.standard)
+        if sharedLibrary.coordinator == nil { try await templateStore.migrateFromUserDefaults(.standard) }
 
         // Populate transcript statuses for recordings that already have transcripts on disk
         let transcribedFiles = await transcription.transcriptStore.allTranscribedFilenames()
@@ -162,36 +208,50 @@ final class AppState {
         // Populate summary existence set
         let summarizedFiles = await summarization.summaryStore.allSummarizedFilenames()
         summarization.hasSummary = Set(summarizedFiles)
+        try await sharedLibrary.listen { [weak self] in await self?.refreshAll(refreshShared: false) }
     }
 
     /// Refresh library, transcript statuses, and summary statuses from disk.
     /// Called on app activate to pick up external filesystem changes.
-    func refreshAll() async {
-        await library.refresh()
-        try? await transcription.transcriptStore.loadAll()
-        try? await summarization.summaryStore.loadAll()
-
-        // Re-sync statuses from disk
-        let transcribedFiles = await transcription.transcriptStore.allTranscribedFilenames()
+    func refreshAll(refreshShared: Bool = true) async {
+        let currentLibrary = library, currentTranscription = transcription, currentSummary = summarization
+        let currentTemplates = templateStore, bound = sharedLibrary.coordinator
+        func stillBound() -> Bool { library === currentLibrary && sharedLibrary.coordinator === bound }
+        if let bound {
+            do {
+                if refreshShared { try await bound.refresh() }
+                guard stillBound() else { return }
+                try await sharedLibrary.refreshStatus()
+                guard stillBound() else { return }
+                try await currentTemplates.load()
+                guard stillBound() else { return }
+                if sharedLibrary.phase == .ready { _ = try await bound.projectOutputs() }
+                guard stillBound() else { return }
+                sharedLibrary.message = nil
+            } catch { if stillBound() { sharedLibrary.message = error.localizedDescription } }
+        }
+        await currentLibrary.refresh()
+        guard stillBound() else { return }
+        if bound != nil { sharedLibrary.revision &+= 1 }
+        try? await currentTranscription.transcriptStore.loadAll()
+        try? await currentSummary.summaryStore.loadAll()
+        guard stillBound() else { return }
+        let transcribedFiles = await currentTranscription.transcriptStore.allTranscribedFilenames()
+        guard stillBound() else { return }
         var newStatuses: [String: TranscriptStatus] = [:]
-        for filename in transcribedFiles {
-            newStatuses[filename] = .done
-        }
-        // Preserve in-progress statuses from current session
-        for (file, status) in transcription.statuses where status == .inProgress {
-            newStatuses[file] = .inProgress
-        }
-        transcription.statuses = newStatuses
-
-        let summarizedFiles = await summarization.summaryStore.allSummarizedFilenames()
-        summarization.hasSummary = Set(summarizedFiles)
+        for filename in transcribedFiles { newStatuses[filename] = .done }
+        for (file, status) in currentTranscription.statuses where status == .inProgress { newStatuses[file] = .inProgress }
+        currentTranscription.statuses = newStatuses
+        let summarizedFiles = await currentSummary.summaryStore.allSummarizedFilenames()
+        guard stillBound() else { return }
+        currentSummary.hasSummary = Set(summarizedFiles)
     }
 
     /// Switch storage location and re-initialize all stores.
     /// Does NOT move files — the user manages that via Finder.
     @discardableResult
     func switchStorageLocation(to mode: StorageMode, customURL: URL? = nil) async -> Bool {
-        guard !device.isDeviceBusy, !transcription.isTranscribing, !summarization.isSummarizing else {
+        guard !device.isDeviceBusy, !transcription.isTranscribing, !summarization.isSummarizing, !sharedLibrary.isBusy else {
             errorMessage = "Wait for the current operation to finish before changing storage."
             return false
         }
@@ -215,6 +275,7 @@ final class AppState {
 
         let baseDir = StorageLocationResolver.resolve(mode: mode, customURL: customURL)
 
+        await sharedLibrary.close()
         let store = RecordingStore(baseDirectory: baseDir)
         let transcriptStore = TranscriptStore(baseDirectory: store.baseDirectory)
 
@@ -245,6 +306,7 @@ final class AppState {
     // MARK: - Cross-cutting actions
 
     func downloadFile(_ file: FileEntry) async {
+        guard requireWritableLibrary() else { return }
         do {
             let wasImported = library.isDownloaded(file.filename)
             let importDirectory = library.store.baseDirectory
@@ -268,6 +330,7 @@ final class AppState {
     }
 
     func syncAll() async {
+        guard requireWritableLibrary() else { return }
         let importDirectory = library.store.baseDirectory
         syncProgress = 0
         do {
@@ -351,6 +414,7 @@ final class AppState {
     }
 
     func transcribeRecordings(_ recs: [RecordingMetadata]) async {
+        guard requireWritableLibrary() else { return }
         let recsToSummarize = recs
         await transcription.transcribe(
             recordings: recs,
@@ -377,6 +441,7 @@ final class AppState {
         provider: any LLMProvider,
         model: String
     ) {
+        guard requireWritableLibrary() else { return }
         summarization.summarize(
             recordings: recs,
             template: template,
@@ -413,6 +478,7 @@ final class AppState {
     /// Summarize with a specific template and optional custom prompt.
     /// Auto-transcribes first if the recording has no transcript.
     func summarizeWithTemplate(_ rec: RecordingMetadata, template: Template, customPrompt: String? = nil) {
+        guard requireWritableLibrary() else { return }
         guard let settings = makeSettingsProvider() else {
             errorMessage = "No API key configured. Go to Settings > AI to add one."
             return
@@ -496,7 +562,8 @@ final class AppState {
                                       originalSelection: Set<String>) async throws {
         if playback.playingFile == oldFilename { playback.playingFile = newFilename }
         if transcription.transcribingFile == oldFilename { transcription.transcribingFile = newFilename }
-        try await summarization.summaryStore.rename(from: oldFilename, to: newFilename)
+        if sharedLibrary.coordinator == nil { try await summarization.summaryStore.rename(from: oldFilename, to: newFilename) }
+        else { try await summarization.summaryStore.loadAll() }
         if let status = transcription.statuses.removeValue(forKey: oldFilename) {
             transcription.statuses[newFilename] = status
         }
@@ -533,6 +600,7 @@ final class AppState {
 
     /// Execute the merge with the given name. Called after the rename dialog.
     func executeMerge(as name: String) async {
+        guard requireWritableLibrary() else { return }
         guard mergeFilenames.count >= 2 else { return }
 
         statusMessage = "Merging \(mergeFilenames.count) recordings..."

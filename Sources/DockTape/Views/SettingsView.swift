@@ -50,7 +50,7 @@ struct SettingsView: View {
                 Picker("Store recordings in", selection: $storageMode) {
                     Text("iCloud Drive").tag(StorageMode.icloud)
                     Text("This Mac").tag(StorageMode.local)
-                    Text("This Mac (Custom\u{2026})").tag(StorageMode.custom)
+                    Text("Custom Folder\u{2026}").tag(StorageMode.custom)
                 }
                 .disabled(isProcessing)
                 .onChange(of: storageMode) { _, newMode in
@@ -72,8 +72,47 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
+            Section("Shared Library") {
+                sharedLibrarySettings
+            }
         }
         .formStyle(.grouped)
+    }
+
+    @ViewBuilder private var sharedLibrarySettings: some View {
+        switch state.sharedLibrary.phase {
+        case .legacy:
+            Button("Enable Shared Library") { Task { _ = await state.enableSharedLibrary() } }
+                .disabled(isProcessing)
+            Text("Use a DockTape build with shared-library support on every Mac sharing this folder. Recordings stay in place.")
+                .font(.caption).foregroundStyle(.secondary)
+        case .connecting:
+            HStack { ProgressView().controlSize(.small); Text("Opening shared library…") }
+        case .ready:
+            Label("Shared library enabled", systemImage: "checkmark.circle")
+            Text("Independent edits are combined. Audio deletion waits for all participating Macs.")
+                .font(.caption).foregroundStyle(.secondary)
+        case .readOnly:
+            Label("Read-only on this Mac", systemImage: "lock")
+            Button("Join Shared Library") {
+                Task {
+                    do { try await state.sharedLibrary.requestAccess(); await state.refreshAll() }
+                    catch { state.sharedLibrary.message = error.localizedDescription }
+                }
+            }.disabled(isProcessing)
+            Text("Keep the other participating Macs running until this Mac is ready to make changes.")
+                .font(.caption).foregroundStyle(.secondary)
+        case .failed:
+            Button("Retry Shared Library") {
+                Task {
+                    do { try await state.setup() }
+                    catch { state.sharedLibrary.message = error.localizedDescription }
+                }
+            }.disabled(isProcessing)
+        }
+        if let message = state.sharedLibrary.message { Text(message).font(.caption).foregroundStyle(.red) }
+        Text("For Dropbox, choose a folder managed by its desktop app. Readable transcripts and summaries stay alongside the recordings.")
+            .font(.caption).foregroundStyle(.secondary)
     }
 
     private func deviceSettings(_ settings: DeviceSettings) -> some View {
@@ -114,7 +153,7 @@ struct SettingsView: View {
     }
 
     private var isProcessing: Bool {
-        state.transcription.isTranscribing || state.summarization.isSummarizing || state.device.isDeviceBusy
+        state.transcription.isTranscribing || state.summarization.isSummarizing || state.device.isDeviceBusy || state.sharedLibrary.isBusy
     }
 
     private func handleStorageModeChange(_ mode: StorageMode) {
