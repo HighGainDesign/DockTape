@@ -1,5 +1,6 @@
 // © 2026 High Gain Design. All rights reserved.
 import Foundation
+import Darwin
 
 public enum SharedLibraryCoordinatorError: Error, Equatable, Sendable {
   case notEnabled, bootstrapPending, enrollmentPending, differentBinding, staleReview, staleJob,
@@ -73,6 +74,7 @@ public actor SharedLibraryCoordinator {
   private var authorityLease: SharedMaterializationLease?
   private var leasedRevisions: [SharedEntityIdentity: String] = [:]
   private var jobs: [UUID: SharedLibraryJobToken] = [:]
+  private var jobLeases: [UUID: SharedLocalJobLease] = [:]
   private func revokeAuthority() {
     authorityLease?.revoke()
     authorityLease = nil
@@ -715,9 +717,12 @@ public actor SharedLibraryCoordinator {
         (SharedEntityIdentity(id: $0.state.id, kind: $0.state.kind), $0.fingerprint)
       })
     }
+    let jobGate = try localJobGate(library: manifest.libraryID, entity: entity.id)
+    let localPending = try jobGate?.hasActiveWork() ?? false
     var result = SharedMaterializationAuthority(
       libraryID: manifest.libraryID, state: selected.state, membership: membership,
-      acknowledgments: acknowledgments, hasPendingWork: jobs.values.contains { $0.entity == entity }, pathOwners: owners)
+      acknowledgments: acknowledgments, hasPendingWork: localPending || jobs.values.contains { $0.entity == entity }, pathOwners: owners)
+    result.jobGate = jobGate
     result.additionalBindings = locations.proofs.map { url, expected in
       SharedMaterializationBinding(file: url) { SharedLibraryOperation.fingerprint($0) == expected }
     }.sorted { $0.file.path < $1.file.path }
@@ -791,6 +796,14 @@ public actor SharedLibraryCoordinator {
     }
   }
 
+  private func localJobGate(library: UUID, entity: UUID) throws -> SharedLibraryJobGate? {
+    guard let directory = witnessDirectory else { return nil }
+    let gate = SharedLibraryJobGate(file: directory.appendingPathComponent("Jobs").appendingPathComponent(library.uuidString)
+      .appendingPathComponent(writerID.uuidString).appendingPathComponent(entity.uuidString + ".lock"))
+    try gate.prepare(outside: root)
+    return gate
+  }
+
   public func pinJob(_ entity: SharedEntityIdentity, input: SharedComponent? = nil, output: SharedComponent? = nil,
                      audioURL: URL? = nil) async throws
     -> SharedLibraryJobToken
@@ -826,6 +839,31 @@ public actor SharedLibraryCoordinator {
       lifecycle: try Self.lifecycleRevision(snapshot.state),
       component: input, input: try Self.inputRevision(snapshot.state, component: input), output: output,
       snapshot: snapshot, inputFile: inputFile, recordingMode: mode)
+    if let jobGate = try localJobGate(library: snapshot.libraryID, entity: entity.id) {
+      guard let gate, let directory = witnessDirectory else { throw SharedLibraryOperationError.invalidOperation }
+      let witness = SharedOwnerWitness(directory: directory, libraryID: snapshot.libraryID, writerID: writerID)
+      let checkpoint = try witness.checkpointFingerprint()
+      let manifest = try await bind(force: true)
+      let bindings = try repository.readBindings(current.repository) + [SharedMaterializationBinding(file: root.appendingPathComponent(".docktape/format.json")) { bytes in
+        guard let value = try? JSONDecoder().decode(SharedBootstrapManifest.self, from: bytes) else { return false }
+        return value.complete && value.libraryID == manifest.libraryID && value.fingerprint == manifest.fingerprint
+      }]
+      let items = try gate.items(outside: root)
+      let root = self.root
+      let descriptor = try await CoordinatedFileAccess().withWrites(items, reading: bindings.map(\.file)) { scopes in
+        try gate.validate(scopes[0], outside: root)
+        guard try witness.checkpointFingerprint() == checkpoint else { throw SharedLibraryCoordinatorError.staleJob }
+        for (binding, scope) in zip(bindings, scopes.dropFirst(items.count)) {
+          guard scope.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
+                try binding.validate(Data(contentsOf: scope.url)) else { throw SharedLibraryCoordinatorError.staleJob }
+          try scope.checkCancellation()
+        }
+        try scopes[0].checkCancellation()
+        return try jobGate.acquireShared()
+      }
+      if Task.isCancelled { Darwin.close(descriptor); throw CancellationError() }
+      jobLeases[token.id] = SharedLocalJobLease(descriptor: descriptor)
+    }
     jobs[token.id] = token
     return token
   }
@@ -862,11 +900,12 @@ public actor SharedLibraryCoordinator {
     await afterCommit()
     return view
   }
-  public func finishJob(_ token: SharedLibraryJobToken) {
+  public func finishJob(_ token: SharedLibraryJobToken) async {
     guard let existing = jobs[token.id], existing.library == token.library, existing.entity == token.entity else { return }
     existing.lease.revoke()
     revokeAuthority()
     jobs.removeValue(forKey: token.id)
+    if let lease = jobLeases.removeValue(forKey: token.id) { await lease.release() }
   }
   public func validateJob(_ token: SharedLibraryJobToken) async throws {
     guard jobs[token.id] != nil else { throw SharedLibraryCoordinatorError.staleJob }

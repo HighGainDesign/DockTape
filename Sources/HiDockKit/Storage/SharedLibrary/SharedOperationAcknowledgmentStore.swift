@@ -1,5 +1,6 @@
 // © 2026 High Gain Design. All rights reserved.
 import Foundation
+import Darwin
 
 /// Each writer owns one current acknowledgment per entity. Older provider files
 /// cannot authorize a different revision/cohort; no acknowledgment writes alive.
@@ -43,7 +44,7 @@ public actor SharedOperationAcknowledgmentStore {
     }
     try await write(
       acknowledgment, entity: acknowledgment.entity, directory: directory,
-      lease: fresh.revisionLease, validation: fresh.validateLocalCommit)
+      lease: fresh.revisionLease, validation: fresh.validateLocalCommit, jobGate: fresh.jobGate)
     return acknowledgment
   }
   public func withdraw(entity: UUID) async throws {
@@ -52,7 +53,8 @@ public actor SharedOperationAcknowledgmentStore {
   }
   private func write(
     _ acknowledgment: SharedOperationAcknowledgment?, entity: UUID, directory: URL,
-    lease: SharedMaterializationLease? = nil, validation: @escaping @Sendable () throws -> Bool = { true }
+    lease: SharedMaterializationLease? = nil, validation: @escaping @Sendable () throws -> Bool = { true },
+    jobGate: SharedLibraryJobGate? = nil
   ) async throws {
     let file = directory.appendingPathComponent(writer.uuidString + ".json")
     let library = libraryID
@@ -67,6 +69,10 @@ public actor SharedOperationAcknowledgmentStore {
     let execute:
       @Sendable (CoordinatedFileAccess.Scope, Data?) throws -> SharedOwnerPreparedWrite<Void> = {
         scope, data in
+        let descriptor: Int32?
+        if let jobGate { guard let acquired = try jobGate.acquireExclusive() else { throw SharedLibraryOperationError.invalidOperation }; descriptor = acquired }
+        else { descriptor = nil }
+        defer { if let descriptor { Darwin.close(descriptor) } }
         guard lease?.isRevoked != true, try validation() else { throw SharedLibraryOperationError.staleAuthority }
         try SharedLibraryMaterializer.checkRoot(root)
         guard SharedLibraryMaterializer.contained(scope.url, in: directory) else {

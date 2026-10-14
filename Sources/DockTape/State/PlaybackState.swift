@@ -7,6 +7,13 @@ import HiDockKit
 @Observable
 @MainActor
 final class PlaybackState {
+    struct Lease: Sendable {
+        let validate: @Sendable () async throws -> Void
+        let release: @Sendable () async -> Void
+    }
+    var acquireLease: (@Sendable (String, URL) async throws -> Lease)?
+    private var playbackLease: Lease?
+
     var playingFile: String?
     var isPlaying: Bool = false
     var rate: Float = 1.0
@@ -61,6 +68,11 @@ final class PlaybackState {
         preparationTask = Task { [weak self] in
             guard let self else { return }
             do {
+                if let acquireLease {
+                    let lease = try await acquireLease(file, url)
+                    guard requestID == request, !Task.isCancelled else { await lease.release(); return }
+                    playbackLease = lease
+                }
                 guard try await prepareFile(url, { [weak self] in
                     await self?.markCloudDownload(for: request)
                 }) else { throw CocoaError(.fileReadNoSuchFile) }
@@ -68,6 +80,7 @@ final class PlaybackState {
                 let asset = AVURLAsset(url: url)
                 preparingAsset = asset
                 let measuredDuration = try await asset.load(.duration)
+                try await playbackLease?.validate()
                 try Task.checkCancellation()
                 guard requestID == request else { return }
                 isPreparing = false
@@ -84,6 +97,7 @@ final class PlaybackState {
                 isPreparing = false
                 preparationTask = nil
                 preparingAsset = nil
+                releasePlaybackLease()
                 loadError = error.localizedDescription
             }
         }
@@ -151,7 +165,14 @@ final class PlaybackState {
         }
     }
 
+    private func releasePlaybackLease() {
+        let previous = playbackLease
+        playbackLease = nil
+        if let previous { Task { await previous.release() } }
+    }
+
     func stop() {
+        releasePlaybackLease()
         requestID = UUID()
         preparingAsset?.cancelLoading()
         preparingAsset = nil

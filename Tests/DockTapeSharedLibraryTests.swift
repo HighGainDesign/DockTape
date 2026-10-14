@@ -20,6 +20,12 @@ struct DockTapeSharedLibraryTests {
             return "Synthetic summary"
         }
     }
+    actor Gate {
+        var waiting = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        func wait() async { waiting = true; await withCheckedContinuation { continuation = $0 } }
+        func release() { continuation?.resume(); continuation = nil }
+    }
     @MainActor static func main() async throws {
         _ = NSApplication.shared
         UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
@@ -47,6 +53,30 @@ struct DockTapeSharedLibraryTests {
         try expect(await state.enableSharedLibrary(), "Explicit enable must connect the app to shared authority")
         try expect(state.sharedLibrary.coordinator != nil, "All shared stores must use one coordinator")
         let entity = try await state.sharedLibrary.coordinator!.recording(at: "Meeting.mp3").state.id
+        let playbackCoordinator = state.sharedLibrary.coordinator!
+        let gate = Gate()
+        let heldPlayer = PlaybackState(prepareFile: { _, _ in await gate.wait(); return true })
+        heldPlayer.acquireLease = { filename, _ in
+            let view = try await playbackCoordinator.recording(at: filename)
+            let token = try await playbackCoordinator.pinJob(.init(id: view.state.id, kind: .recording))
+            return .init(validate: { try await playbackCoordinator.validateJob(token) }, release: { await playbackCoordinator.finishJob(token) })
+        }
+        heldPlayer.play(file: "Meeting.mp3", url: root.appendingPathComponent("Meeting.mp3"))
+        let playerDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !(await gate.waiting) {
+            guard ContinuousClock.now < playerDeadline else { throw Failure(description: "Playback preparation did not start") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let observer = SharedLibraryCoordinator(root: root, writerID: playbackCoordinator.writerID, witnessDirectory: witnesses)
+        let protected = try await observer.operationAuthority(entity: .init(id: entity, kind: .recording), paths: ["Meeting.mp3"])
+        try expect(protected.hasPendingWork, "Playback preparation must protect the original across instances")
+        heldPlayer.stop()
+        let releaseDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while try await observer.operationAuthority(entity: .init(id: entity, kind: .recording), paths: ["Meeting.mp3"]).hasPendingWork {
+            guard ContinuousClock.now < releaseDeadline else { throw Failure(description: "Playback stop did not release lease") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await gate.release()
         _ = try await state.library.transcriptStore.loadTranscript(for: "Meeting.mp3")
         try await state.library.updateSpeakerNames(for: "Meeting.mp3", names: ["s": "Alice"])
         await state.refreshAll()

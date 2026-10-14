@@ -1,6 +1,7 @@
 // © 2026 High Gain Design. All rights reserved.
 import CryptoKit
 import Foundation
+import Darwin
 
 /// Local receipts are outside the provider folder. Accepted user state is always
 /// in the shared repository; a receipt only tracks its physical projection.
@@ -42,7 +43,7 @@ public actor SharedLibraryMaterializer {
     guard !Self.contained(receipts, in: root) else { throw SharedLibraryOperationError.unsafePath }
     let initial = try await authority()
     let initialPending = try Self.check(operation, authority: initial)
-    if let pending = initialPending, pending != .waitingForAcknowledgments { return pending }
+    if let pending = initialPending, pending != .waitingForAcknowledgments && pending != .waitingForActiveWork { return pending }
     // The accepted delete plan must survive an offline cohort or active job.
     // Save its expected hashes before waiting, without touching provider files.
     try FileManager.default.createDirectory(at: receipts, withIntermediateDirectories: true)
@@ -130,6 +131,12 @@ public actor SharedLibraryMaterializer {
               throw SharedLibraryOperationError.unsafePath
             }
           }
+          let jobDescriptor: Int32?
+          if let jobGate = fresh.jobGate {
+            guard let acquired = try jobGate.acquireExclusive() else { return .pending(.waitingForActiveWork) }
+            jobDescriptor = acquired
+          } else { jobDescriptor = nil }
+          defer { if let jobDescriptor { Darwin.close(jobDescriptor) } }
           // Persist intent before the physical commit. Recovery still
           // verifies exact bytes/ownership, never merely file existence.
           let replaying = actual.attempting
@@ -431,6 +438,9 @@ public actor SharedLibraryMaterializer {
           return .needsReplanning
         }
         if !repair && !authority.mayDestroy(.replaceAudio) { return .waitingForAcknowledgments }
+      case .move:
+        if authority.hasPendingWork { return .waitingForActiveWork }
+        guard authority.state.lifecycle == .alive else { return .needsReplanning }
       default:
         guard authority.state.lifecycle == .alive else { return .needsReplanning }
       }

@@ -9,7 +9,7 @@ public enum SharedLibraryOperationError: Error, Equatable, Sendable {
   case unsafePath, unavailableRoot
 }
 public enum SharedMaterializationResult: Equatable, Sendable {
-  case complete, needsReplanning, waitingForAcknowledgments
+  case complete, needsReplanning, waitingForAcknowledgments, waitingForActiveWork
   case waitingForFile(String)
   case directoryNotEmpty(String)
 }
@@ -59,6 +59,7 @@ public struct SharedMaterializationAuthority: Sendable {
   public var membership: SharedLibraryMembership
   public var acknowledgments: [SharedOperationAcknowledgment]
   public var hasPendingWork: Bool
+  public var jobGate: SharedLibraryJobGate? = nil
   /// Exact owners from the current identity/path index plus retained operation
   /// claims. An empty set is unowned, multiple IDs is a path conflict.
   public var pathOwners: [String: Set<UUID>]

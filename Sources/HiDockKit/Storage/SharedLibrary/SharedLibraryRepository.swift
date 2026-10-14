@@ -106,6 +106,12 @@ public actor SharedLibraryRepository {
     snapshot.binding == binding && snapshot.writer == writerID
   }
 
+  nonisolated func readBindings(_ snapshot: SharedLibrarySnapshot) throws -> [SharedMaterializationBinding] {
+    guard accepts(snapshot) else { throw SharedLibraryRepositoryError.differentBinding }
+    return snapshot.sourceHeads.map { url, hash in SharedMaterializationBinding(file: url) { Self.hash($0) == hash } }
+        .sorted { $0.file.path < $1.file.path }
+  }
+
   public func load(entity: SharedEntityIdentity) async throws -> SharedLibrarySnapshot {
     if let witness, !witness.isOutside(root) { throw SharedLibraryRepositoryError.invalidPath }
     let root = self.root

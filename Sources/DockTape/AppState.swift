@@ -175,6 +175,14 @@ final class AppState {
     }
 
     private func attachSharedStores(_ coordinator: SharedLibraryCoordinator) {
+        playback.stop()
+        playback.acquireLease = { filename, url in
+            let expected = coordinator.root.appendingPathComponent(filename).standardizedFileURL.resolvingSymlinksInPath()
+            guard url.standardizedFileURL.resolvingSymlinksInPath() == expected else { throw SharedLibraryCoordinatorError.differentBinding }
+            let view = try await coordinator.recording(at: filename)
+            let token = try await coordinator.pinJob(.init(id: view.state.id, kind: .recording))
+            return .init(validate: { try await coordinator.validateJob(token) }, release: { await coordinator.finishJob(token) })
+        }
         let previous = library
         let store = RecordingStore(baseDirectory: coordinator.root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
         let transcripts = TranscriptStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator))
@@ -260,6 +268,7 @@ final class AppState {
         playbackTranscriptTask?.cancel()
         playbackTranscriptTask = nil
         playback.stop()
+        playback.acquireLease = nil
         let defaults = UserDefaults.standard
         defaults.set(mode.rawValue, forKey: "storageMode")
 

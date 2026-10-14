@@ -19,6 +19,47 @@ struct SharedLibraryProcessFixture {
     else {
       throw FixtureError.arguments
     }
+    if args[1].hasPrefix("job-") {
+      guard args.count >= 6 else { throw FixtureError.arguments }
+      let root = URL(fileURLWithPath: args[2]), local = URL(fileURLWithPath: args[5])
+      let coordinator = SharedLibraryCoordinator(root: root, writerID: writer, witnessDirectory: local, trash: { source in
+        let disposal = root.deletingLastPathComponent().appendingPathComponent("disposed")
+        try FileManager.default.createDirectory(at: disposal, withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: source, to: disposal.appendingPathComponent(source.lastPathComponent))
+      })
+      if args[1] == "job-seed" {
+        let manifest = try await coordinator.enable()
+        _ = try await coordinator.projectOutputs()
+        print(manifest.references.first { $0.entity.kind == .recording }!.entity.id.uuidString)
+        return
+      }
+      let entity = SharedEntityIdentity(id: id, kind: .recording)
+      if args[1] == "job-hold" {
+        guard args.count == 8 else { throw FixtureError.arguments }
+        let token = try await coordinator.pinJob(entity)
+        try Data("ready".utf8).write(to: URL(fileURLWithPath: args[6]), options: .atomic)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        while !FileManager.default.fileExists(atPath: args[7]) {
+          guard ContinuousClock.now < deadline else { throw FixtureError.gateTimedOut }
+          try await Task.sleep(for: .milliseconds(10))
+        }
+        await coordinator.finishJob(token)
+        print("released"); return
+      }
+      if args[1] == "job-delete" {
+        let result = try await coordinator.deleteSharedRecording(filename: "Meeting.mp3")
+        print(result.result == .complete ? "complete" : "waiting"); return
+      }
+      if args[1] == "job-resume" {
+        let result = try await coordinator.resumeRecordingOperation(id: id)
+        print(result.result == .complete ? "complete" : "waiting"); return
+      }
+      if args[1] == "job-probe" {
+        let value = try await coordinator.operationAuthority(entity: entity, paths: ["Meeting.mp3"])
+        print(value.hasPendingWork ? "active" : "idle"); return
+      }
+      throw FixtureError.arguments
+    }
     let repository = SharedLibraryRepository(root: URL(fileURLWithPath: args[2]), writerID: writer)
     let entity = SharedEntityIdentity(id: id, kind: .recording)
     if args[1] == "seed-move" {
