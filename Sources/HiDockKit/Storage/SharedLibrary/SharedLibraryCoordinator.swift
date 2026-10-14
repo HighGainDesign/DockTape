@@ -28,6 +28,11 @@ public struct SharedLibraryJobToken: Sendable {
   let lifecycle: String
   let component: SharedComponent?
   let input: String
+  let output: SharedComponent?
+  let snapshot: SharedLibraryViewSnapshot
+  let inputFile: SharedMaterializationBinding?
+  public let recordingMode: String
+  let lease = SharedMaterializationLease()
 }
 public struct SharedExternalContent: Equatable, Sendable {
   public let libraryID: UUID
@@ -786,21 +791,80 @@ public actor SharedLibraryCoordinator {
     }
   }
 
-  public func pinJob(_ entity: SharedEntityIdentity, input: SharedComponent? = nil) async throws
+  public func pinJob(_ entity: SharedEntityIdentity, input: SharedComponent? = nil, output: SharedComponent? = nil,
+                     audioURL: URL? = nil) async throws
     -> SharedLibraryJobToken
   {
     beginTransition(); defer { endTransition() }
     let snapshot = try await read(entity)
     guard snapshot.state.lifecycle == .alive else { throw SharedLibraryCoordinatorError.staleJob }
+    if output != nil, !(try await mayEdit()) { throw SharedLibraryCoordinatorError.enrollmentPending }
+    try Self.validateProcessingState(snapshot.state, input: input, output: output)
+    let metadata = try SharedRecordingMetadataAdapter.render(snapshot)
+    var inputFile: SharedMaterializationBinding?
+    if let audioURL {
+      let expected = root.appendingPathComponent(try await currentPath(snapshot)).standardizedFileURL.resolvingSymlinksInPath()
+      guard SharedLibraryMaterializer.contained(audioURL, in: root), audioURL.standardizedFileURL.resolvingSymlinksInPath() == expected else { throw SharedLibraryRepositoryError.invalidPath }
+      guard let bytes = try await RecordingFileAccess().readDataIfPresent(at: audioURL, knownToExist: true) else { throw CocoaError(.fileReadNoSuchFile) }
+      let fingerprint = SharedLibraryOperation.fingerprint(bytes)
+      let selected: String?
+      if case .text(let value)? = snapshot.state.value(for: "audioFingerprint") { selected = value } else { selected = metadata.audioSHA256 }
+      if let selected, selected != fingerprint { throw SharedLibraryOperationError.contentChanged(audioURL.lastPathComponent) }
+      inputFile = .init(file: audioURL) { SharedLibraryOperation.fingerprint($0) == fingerprint }
+    }
+    let current = try await read(entity)
+    guard current.libraryID == snapshot.libraryID, current.state.lifecycle == .alive,
+          try Self.lifecycleRevision(current.state) == Self.lifecycleRevision(snapshot.state),
+          try Self.inputRevision(current.state, component: input) == Self.inputRevision(snapshot.state, component: input) else { throw SharedLibraryCoordinatorError.staleJob }
+    try Task.checkCancellation()
+    let title: String
+    if case .text(let value)? = snapshot.state.value(for: "title") { title = value } else { title = "" }
+    let parsed = FilenameParsing.parse(title + ".mp3").mode
+    let mode = metadata.mode ?? (parsed == .unknown ? "" : parsed.rawValue)
     let token = SharedLibraryJobToken(
       id: UUID(), library: snapshot.libraryID, entity: entity,
       lifecycle: try Self.lifecycleRevision(snapshot.state),
-      component: input, input: try Self.inputRevision(snapshot.state, component: input))
+      component: input, input: try Self.inputRevision(snapshot.state, component: input), output: output,
+      snapshot: snapshot, inputFile: inputFile, recordingMode: mode)
     jobs[token.id] = token
     return token
   }
+  public func commitJob(_ token: SharedLibraryJobToken, document: SharedDocument, component: SharedComponent,
+                        beforeCommit: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedLibraryViewSnapshot {
+    beginTransition(); defer { endTransition() }
+    guard let owned = jobs[token.id], owned.library == token.library, owned.entity == token.entity,
+          owned.lifecycle == token.lifecycle, owned.input == token.input, !owned.lease.isRevoked else { throw SharedLibraryCoordinatorError.staleJob }
+    if let output = owned.output, output != component { throw SharedLibraryCoordinatorError.staleJob }
+    let manifest = try await bind(force: true)
+    guard manifest.libraryID == token.library else { throw SharedLibraryCoordinatorError.differentBinding }
+    guard try await mayEdit() else { throw SharedLibraryCoordinatorError.enrollmentPending }
+    let membership = try await memberRepository().load().membership
+    let fresh = try await repository.load(entity: token.entity)
+    guard fresh.writers.isSubset(of: membership.cohort) else { throw SharedLibraryCoordinatorError.unrecognizedWriter }
+    let validate: @Sendable (SharedEntityState) throws -> Void = { state in
+      try Self.validateProcessingState(state, input: token.component, output: component)
+      guard !owned.lease.isRevoked, state.lifecycle == .alive,
+            try Self.lifecycleRevision(state) == token.lifecycle,
+            try Self.inputRevision(state, component: token.component) == token.input else { throw SharedLibraryCoordinatorError.staleJob }
+    }
+    try validate(fresh.state)
+    try await beforeCommit()
+    let format = SharedMaterializationBinding(file: root.appendingPathComponent(".docktape/format.json")) { bytes in
+      guard let current = try? JSONDecoder().decode(SharedBootstrapManifest.self, from: bytes) else { return false }
+      return current.complete && current.libraryID == manifest.libraryID && current.fingerprint == manifest.fingerprint
+    }
+    let accepted: SharedLibrarySnapshot
+    do {
+      accepted = try await repository.commit(.init(base: fresh, changes: [.generation(document, component: component)], validation: validate, bindings: [format] + (owned.inputFile.map { [$0] } ?? [])))
+    } catch SharedLibraryRepositoryError.staleRevision { throw SharedLibraryCoordinatorError.staleJob }
+    let view = SharedLibraryViewSnapshot(libraryID: manifest.libraryID, repository: accepted)
+    publish(view, entity: token.entity, request: beginRead(token.entity))
+    await afterCommit()
+    return view
+  }
   public func finishJob(_ token: SharedLibraryJobToken) {
     guard let existing = jobs[token.id], existing.library == token.library, existing.entity == token.entity else { return }
+    existing.lease.revoke()
     revokeAuthority()
     jobs.removeValue(forKey: token.id)
   }
@@ -811,6 +875,18 @@ public actor SharedLibraryCoordinator {
       try Self.lifecycleRevision(snapshot.state) == token.lifecycle,
       try Self.inputRevision(snapshot.state, component: token.component) == token.input
     else { throw SharedLibraryCoordinatorError.staleJob }
+  }
+  public func transcriptForJob(_ token: SharedLibraryJobToken, filename: String) async throws -> Transcript? {
+    try await validateJob(token)
+    guard let owned = jobs[token.id], owned.component == .transcript else { throw SharedLibraryCoordinatorError.staleJob }
+    return try SharedSidecarAdapter.transcript(owned.snapshot, filename: filename)
+  }
+  private static func validateProcessingState(_ state: SharedEntityState, input: SharedComponent?, output: SharedComponent?) throws {
+    if state.fields["audioFingerprint"]?.isConflicted == true { throw SharedLibraryCoordinatorError.staleJob }
+    for component in [input, output].compactMap({ $0 }) {
+      if state.fields.contains(where: { $0.key.hasPrefix(component.rawValue + ".") && $0.value.isConflicted }) { throw SharedLibraryCoordinatorError.staleJob }
+    }
+    if let input, state.currentDocument(for: input) == nil { throw SharedLibraryCoordinatorError.staleJob }
   }
   private static func lifecycleRevision(_ state: SharedEntityState) throws -> String {
     try SharedStateFingerprint.of(state.fields["$lifecycle"])

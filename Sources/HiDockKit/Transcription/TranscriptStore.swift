@@ -6,7 +6,7 @@ import Foundation
 /// Each transcript is stored as `{recording_basename}.transcript.json`.
 /// Cache is keyed by MP3 filename.
 public actor TranscriptStore {
-    private let baseDirectory: URL
+    public nonisolated let baseDirectory: URL
     private let fileAccess: RecordingFileAccess
     private let shared: SharedSidecarAdapter?
     private var revisions: [String: Int] = [:]
@@ -42,11 +42,11 @@ public actor TranscriptStore {
     }
 
     /// Save a transcript, keyed by MP3 filename.
-    public func save(_ transcript: Transcript, mp3Filename: String) async throws {
+    public func save(_ transcript: Transcript, mp3Filename: String, job: SharedLibraryJobToken? = nil) async throws {
         if let shared {
             try shared.requireRoot(baseDirectory)
             revisions[mp3Filename, default: 0] += 1
-            let accepted = try await shared.save(transcript, filename: mp3Filename)
+            let accepted = try await shared.save(transcript, filename: mp3Filename, job: job)
             revisions[mp3Filename, default: 0] += 1
             cache[mp3Filename] = accepted
             knownFiles.insert(mp3Filename)

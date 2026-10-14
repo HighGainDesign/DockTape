@@ -19,9 +19,13 @@ final class TranscriptionState {
     private var previousStatuses: [String: TranscriptStatus] = [:]
 
     let transcriptStore: TranscriptStore
+    private let recordingStore: RecordingStore?
+    private let shared: SharedLibraryCoordinator?
 
-    init(transcriptStore: TranscriptStore) {
+    init(transcriptStore: TranscriptStore, recordingStore: RecordingStore? = nil, shared: SharedLibraryCoordinator? = nil) {
         self.transcriptStore = transcriptStore
+        self.recordingStore = recordingStore
+        self.shared = shared
     }
 
     var isTranscribing: Bool { transcriptionTask != nil }
@@ -51,7 +55,7 @@ final class TranscriptionState {
                 if pipeline == nil {
                     phase = "Loading models (first time takes ~1 min)..."
                     onStatusMessage(phase)
-                    pipeline = RecordingPipeline(baseDirectory: baseDirectory)
+                    pipeline = RecordingPipeline(recordingStore: recordingStore ?? RecordingStore(baseDirectory: baseDirectory), transcriptStore: transcriptStore, shared: shared)
                     try await pipeline!.setup()
                 }
 
@@ -72,7 +76,8 @@ final class TranscriptionState {
                     let transcript = try await pipeline!.transcribeRecording(filename: rec.filename)
                     try Task.checkCancellation()
 
-                    try await transcriptStore.save(transcript, mp3Filename: rec.filename)
+                    if shared == nil { try await transcriptStore.save(transcript, mp3Filename: rec.filename) }
+                    if let message = await pipeline!.projectionError { onError("Transcript saved, but library files need attention: \(message)") }
                     statuses[rec.filename] = .done
                     queueIndex += 1
                 }

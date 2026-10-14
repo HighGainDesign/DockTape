@@ -40,15 +40,22 @@ public struct SharedLibrarySnapshot: Sendable {
   fileprivate let binding: String
   fileprivate let writer: UUID
   fileprivate let observed: [UUID: UInt64]
+  fileprivate var sourceHeads: [URL: String] = [:]
   public var writers: Set<UUID> { Set(observed.keys) }
 }
 
 public struct SharedLibraryEdit: Sendable {
   public let base: SharedLibrarySnapshot
   public let changes: [SharedLibraryMutation]
-  public init(base: SharedLibrarySnapshot, changes: [SharedLibraryMutation]) {
+  public let validation: (@Sendable (SharedEntityState) throws -> Void)?
+  public let bindings: [SharedMaterializationBinding]
+  public init(base: SharedLibrarySnapshot, changes: [SharedLibraryMutation],
+              validation: (@Sendable (SharedEntityState) throws -> Void)? = nil,
+              bindings: [SharedMaterializationBinding] = []) {
     self.base = base
     self.changes = changes
+    self.validation = validation
+    self.bindings = bindings
   }
 }
 
@@ -112,20 +119,21 @@ public actor SharedLibraryRepository {
       try Self.validateRoot(root)
       return try Self.headFiles(directory)
     }.value
-    let heads = try await withThrowingTaskGroup(of: Envelope.self, returning: [Envelope].self) {
+    let loaded = try await withThrowingTaskGroup(of: (URL, String, Envelope).self, returning: [(URL, String, Envelope)].self) {
       group in
       for file in files {
         try Self.validate(file.url, root: root)
         group.addTask {
           let bytes = try await access.read(at: file.url)
-          return try Self.decode(
-            bytes, entity: entity, expectedWriter: file.writer, foundation: foundation)
+          return (file.url, Self.hash(bytes), try Self.decode(
+            bytes, entity: entity, expectedWriter: file.writer, foundation: foundation))
         }
       }
-      var result: [Envelope] = []
+      var result: [(URL, String, Envelope)] = []
       for try await head in group { result.append(head) }
       return result
     }
+    let heads = loaded.map { $0.2 }
     var observed: [UUID: UInt64] = [:]
     for head in heads {
       for (source, sequence) in head.watermarks {
@@ -190,14 +198,18 @@ public actor SharedLibraryRepository {
         }
       }
     }
-    return try Self.snapshot(
+    var snapshot = try Self.snapshot(
       state, ownerSequence: observed[writer] ?? 0,
       observed: observed, binding: binding, writer: writer, projection: projection, votes: votes,
       membership: membership)
+    snapshot.sourceHeads = Dictionary(uniqueKeysWithValues: loaded.map { ($0.0, $0.1) })
+    return snapshot
   }
 
   public func commit(_ edit: SharedLibraryEdit) async throws -> SharedLibrarySnapshot {
-    try await transact(edit, operation: .edit)
+    var accepted = try await transact(edit, operation: .edit)
+    accepted.sourceHeads = edit.base.sourceHeads
+    return accepted
   }
 
   public func acknowledgeProjection(
@@ -244,6 +256,12 @@ public actor SharedLibraryRepository {
     let destination = Self.directory(entity, root: root).appendingPathComponent(
       writer.uuidString.lowercased() + ".json")
     try Self.validate(destination, root: root)
+    let peerBindings = edit.validation == nil ? [] : edit.base.sourceHeads.filter { $0.key != destination }.map { url, expected in
+      SharedMaterializationBinding(file: url) { Self.hash($0) == expected }
+    }
+    let bindings = edit.bindings + peerBindings.sorted { $0.file.path < $1.file.path }
+    for binding in bindings { try Self.validate(binding.file, root: root) }
+    let expectedSources = Set(edit.base.sourceHeads.keys)
     try await Task.detached {
       try Self.prepareDirectory(entity, root: root)
     }.value
@@ -278,6 +296,12 @@ public actor SharedLibraryRepository {
         var vote = existing?.projectionVote
         switch operation {
         case .edit:
+          if edit.validation != nil {
+            let actual = Set(try Self.headFiles(destination.deletingLastPathComponent()).map(\.url))
+            let expected = FileManager.default.fileExists(atPath: destination.path) ? expectedSources.union([destination]) : expectedSources
+            guard actual == expected else { throw SharedLibraryRepositoryError.staleRevision }
+          }
+          try edit.validation?(current)
           try Self.validateBase(edit, against: current)
           for mutation in edit.changes { try Self.apply(mutation, to: &current, writer: writer) }
         case .vote(let proposal):
@@ -348,11 +372,17 @@ public actor SharedLibraryRepository {
         decode: {
           Self.witnessSummary(
             try Self.decode($0, entity: entity, expectedWriter: writer, foundation: foundation))
-        }, observed: proof, gate: gate, body: execute)
+        }, observed: proof, gate: gate, bindings: bindings, body: execute)
     }
-    return try await access.withWrites([.init(destination)] + gateItems) { scopes in
+    for binding in bindings { try Self.validate(binding.file, root: root); _ = try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) }
+    let writes = [.init(destination)] + gateItems
+    return try await access.withWrites(writes, reading: bindings.map(\.file)) { scopes in
       let scope = scopes[0]
-      if let gate { try gate.validate(scopes[scopes.count - 1], outside: root) }
+      if let gate { try gate.validate(scopes[writes.count - 1], outside: root) }
+      for (binding, read) in zip(bindings, scopes.dropFirst(writes.count)) {
+        guard read.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
+              try binding.validate(Data(contentsOf: read.url)) else { throw SharedLibraryRepositoryError.staleRevision }
+      }
       let data =
         FileManager.default.fileExists(atPath: scope.url.path)
         ? try Data(contentsOf: scope.url) : nil

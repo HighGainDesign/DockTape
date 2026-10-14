@@ -8,8 +8,11 @@ public actor RecordingPipeline {
     private let recordingStore: RecordingStore
     private let transcriptStore: TranscriptStore
 
-    private var transcriber: FluidTranscriber?
-    private var diarizer: SortformerFluidDiarizer?
+    private var transcriber: (any TranscriptionEngine)?
+    private var diarizer: (any DiarizationEngine)?
+    private let shared: SharedLibraryCoordinator?
+    private let usesDefaultDiarizer: Bool
+    public private(set) var projectionError: String?
 
     /// Events emitted during pipeline execution for UI/CLI display.
     public enum Event: Sendable {
@@ -30,6 +33,20 @@ public actor RecordingPipeline {
         let store = RecordingStore(baseDirectory: baseDirectory)
         self.recordingStore = store
         self.transcriptStore = TranscriptStore(baseDirectory: store.baseDirectory)
+        self.shared = nil
+        self.usesDefaultDiarizer = true
+    }
+
+    /// Reuse the caller's actual stores; supplied engines are already prepared.
+    public init(recordingStore: RecordingStore, transcriptStore: TranscriptStore,
+                shared: SharedLibraryCoordinator? = nil, transcriber: (any TranscriptionEngine)? = nil,
+                diarizer: (any DiarizationEngine)? = nil) {
+        self.recordingStore = recordingStore
+        self.transcriptStore = transcriptStore
+        self.shared = shared
+        self.transcriber = transcriber
+        self.diarizer = diarizer
+        self.usesDefaultDiarizer = transcriber == nil
     }
 
     /// The directory where recordings and transcripts are stored.
@@ -39,6 +56,8 @@ public actor RecordingPipeline {
 
     /// Initialize storage directories and load existing metadata.
     public func setup() async throws {
+        guard recordingStore.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() == transcriptStore.baseDirectory.standardizedFileURL.resolvingSymlinksInPath(),
+              shared == nil || shared?.root == recordingStore.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() else { throw SharedLibraryCoordinatorError.differentBinding }
         try await recordingStore.setup()
         try await transcriptStore.loadAll()
     }
@@ -107,28 +126,31 @@ public actor RecordingPipeline {
     }
 
     /// Transcribe a single recording by MP3 filename.
-    public func transcribeRecording(filename: String) async throws -> Transcript {
-        guard let meta = await recordingStore.allRecordings().first(where: { $0.filename == filename }) else {
-            throw HiDockError.fileNotFound(filename)
+    public func transcribeRecording(filename: String, numSpeakers: Int? = nil) async throws -> Transcript {
+        if shared == nil { try LegacyLibraryFileAccess.requireLegacyRoot(recordingStore.baseDirectory) }
+        guard let meta = await recordingStore.allRecordings().first(where: { $0.filename == filename }) else { throw HiDockError.fileNotFound(filename) }
+        let url = recordingStore.baseDirectory.appendingPathComponent(filename)
+        var job: SharedLibraryJobToken?
+        do {
+            if let shared {
+                let view = try await shared.recording(at: filename)
+                job = try await shared.pinJob(.init(id: view.state.id, kind: .recording), output: .transcript, audioURL: url)
+            }
+            try await prepareModels()
+            let mode = job?.recordingMode ?? meta.mode
+            let transcript = try await TranscriptionPipeline.transcribe(audioURL: url, recordingFilename: filename,
+                transcriber: transcriber!, diarizer: mode == "Wip" ? nil : diarizer, numSpeakers: mode == "Wip" ? 1 : numSpeakers)
+            try Task.checkCancellation()
+            try await transcriptStore.save(transcript, mp3Filename: filename, job: job)
+            if let shared {
+                if let job { await shared.finishJob(job) }
+                do { _ = try await shared.projectOutputs(); projectionError = nil } catch { projectionError = error.localizedDescription }
+            } else { try exportPlainText(transcript, basename: (filename as NSString).deletingPathExtension) }
+            return transcript
+        } catch {
+            if let shared, let job { await shared.finishJob(job) }
+            throw error
         }
-
-        try await prepareModels()
-
-        let mp3URL = await recordingStore.mp3URL(for: meta)
-        // Skip diarization for voice memos (single speaker)
-        let skipDiarization = meta.mode == "Wip"
-        let transcript = try await TranscriptionPipeline.transcribe(
-            audioURL: mp3URL,
-            recordingFilename: filename,
-            transcriber: transcriber!,
-            diarizer: skipDiarization ? nil : diarizer
-        )
-
-        try Task.checkCancellation()
-        try await transcriptStore.save(transcript, mp3Filename: filename)
-        try exportPlainText(transcript, basename: (filename as NSString).deletingPathExtension)
-
-        return transcript
     }
 
     // MARK: - Queries
@@ -155,6 +177,22 @@ public actor RecordingPipeline {
         numSpeakers: Int? = nil,
         onEvent: (@Sendable (Event) -> Void)?
     ) async throws {
+        if shared != nil {
+            var count = 0
+            for meta in metas {
+                if await transcriptStore.hasTranscript(for: meta.filename) { onEvent?(.skippedTranscription(filename: meta.filename)); count += 1; continue }
+                onEvent?(.transcribing(filename: meta.filename, duration: DurationCalculator.formatDuration(meta.estimatedDuration)))
+                let start = CFAbsoluteTimeGetCurrent()
+                do {
+                    let result = try await transcribeRecording(filename: meta.filename, numSpeakers: numSpeakers)
+                    count += 1
+                    onEvent?(.transcribed(filename: meta.filename, segments: result.segments.count, speakers: result.speakerIDs.count,
+                        elapsed: String(format: "%.1f", CFAbsoluteTimeGetCurrent() - start)))
+                } catch { onEvent?(.transcriptionFailed(filename: meta.filename, error: error.localizedDescription)) }
+            }
+            onEvent?(.complete(fileCount: count)); return
+        }
+        try LegacyLibraryFileAccess.requireLegacyRoot(recordingStore.baseDirectory)
         onEvent?(.loadingModels)
         try await prepareModels()
         onEvent?(.modelsReady)
@@ -215,7 +253,7 @@ public actor RecordingPipeline {
             try await t.prepare()
             transcriber = t
         }
-        if diarizer == nil {
+        if diarizer == nil && usesDefaultDiarizer {
             let d = SortformerFluidDiarizer()
             do {
                 try await d.prepare()

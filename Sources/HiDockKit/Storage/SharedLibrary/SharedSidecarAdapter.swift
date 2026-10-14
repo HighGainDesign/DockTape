@@ -36,9 +36,17 @@ public actor SharedSidecarAdapter {
         if readRequests[filename] == request { displayed[Key(entity: view.state.id, component: .summary)] = view }
         return result
     }
-    public func save(_ transcript: Transcript, filename: String) async throws -> Transcript {
+    public func save(_ transcript: Transcript, filename: String, job: SharedLibraryJobToken? = nil) async throws -> Transcript {
         readRequests[filename] = UUID()
         guard transcript.recordingFilename == filename else { throw SharedSidecarError.invalidContent }
+        if let job {
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            let document = try SharedDocument(id: UUID(), json: encoder.encode(transcript))
+            let accepted = try await coordinator.commitJob(job, document: document, component: .transcript)
+            displayed[Key(entity: accepted.state.id, component: .transcript)] = accepted
+            guard let result = try Self.transcript(accepted, filename: filename) else { throw SharedSidecarError.invalidContent }
+            return result
+        }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         let fresh = try await coordinator.recording(at: filename)
         let seen = displayed[Key(entity: fresh.state.id, component: .transcript)]
@@ -55,9 +63,17 @@ public actor SharedSidecarAdapter {
         guard let accepted = try Self.transcript(result, filename: filename) else { throw SharedSidecarError.invalidContent }
         return accepted
     }
-    public func save(_ summary: Summary, filename: String) async throws -> Summary {
+    public func save(_ summary: Summary, filename: String, job: SharedLibraryJobToken? = nil) async throws -> Summary {
         readRequests[filename] = UUID()
         guard summary.recordingFilename == filename else { throw SharedSidecarError.invalidContent }
+        if let job {
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            let document = try SharedDocument(id: UUID(), json: encoder.encode(summary))
+            let accepted = try await coordinator.commitJob(job, document: document, component: .summary)
+            displayed[Key(entity: accepted.state.id, component: .summary)] = accepted
+            guard let result = try Self.summary(accepted, filename: filename) else { throw SharedSidecarError.invalidContent }
+            return result
+        }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         let fresh = try await coordinator.recording(at: filename)
         let seen = displayed[Key(entity: fresh.state.id, component: .summary)]

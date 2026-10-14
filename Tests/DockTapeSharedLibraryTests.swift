@@ -12,8 +12,11 @@ struct DockTapeSharedLibraryTests {
         nonisolated let availableModels = ["fixture"]
         func verifyKey() async throws {}
         var calls = 0
+        let action: @Sendable () async throws -> Void
+        init(action: @escaping @Sendable () async throws -> Void = {}) { self.action = action }
         func summarize(transcript: String, systemPrompt: String, model: String) async throws -> String {
             calls += 1
+            try await action()
             return "Synthetic summary"
         }
     }
@@ -67,6 +70,35 @@ struct DockTapeSharedLibraryTests {
         try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.summary.json").path), "App rename must preserve summary companion")
         let after = try await coordinator.recording(at: "Renamed.mp3")
         try expect(after.state.id == entity, "App rename must preserve recording identity")
+        let baseline = try await coordinator.read(.init(id: entity, kind: .recording))
+        let oldSummaryID = baseline.state.currentDocument(for: .summary)?.id
+        let staleProvider = Provider(action: {
+            let current = try await coordinator.read(.init(id: entity, kind: .recording))
+            let newer = Transcript(recordingFilename: "Renamed.mp3", transcriptionModel: "new input", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: "Changed input")])
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            _ = try await coordinator.edit(.init(base: current, changes: [.generation(try SharedDocument(id: UUID(), json: encoder.encode(newer)), component: .transcript)]))
+        })
+        _ = try await state.summarization.summaryStore.loadSummary(for: "Renamed.mp3")
+        state.summarizeRecordings(state.library.recordings, template: TemplateStore.builtInDefaults[0], provider: staleProvider, model: "fixture")
+        let raceDeadline = ContinuousClock.now.advanced(by: .seconds(4))
+        while state.summarization.isSummarizing {
+            guard ContinuousClock.now < raceDeadline else { throw Failure(description: "Summary race timed out") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try expect(await staleProvider.calls == 1, "Ready summary race must reach the synthetic provider")
+        let raced = try await coordinator.read(.init(id: entity, kind: .recording))
+        try expect(raced.state.currentDocument(for: .summary)?.id == oldSummaryID, "Actual summary queue must not save output from an old transcript")
+        state.errorMessage = nil
+        let validProvider = Provider()
+        state.summarizeRecordings(state.library.recordings, template: TemplateStore.builtInDefaults[0], provider: validProvider, model: "fixture")
+        let validDeadline = ContinuousClock.now.advanced(by: .seconds(4))
+        while state.summarization.isSummarizing {
+            guard ContinuousClock.now < validDeadline else { throw Failure(description: "Valid summary timed out") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let completed = try await coordinator.read(.init(id: entity, kind: .recording))
+        try expect(completed.state.currentDocument(for: .summary)?.id != oldSummaryID && state.errorMessage == nil, "Valid app summary must publish once from its pinned transcript")
         await state.sharedLibrary.close()
         let reopened = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: witnesses)
         try await reopened.setup()

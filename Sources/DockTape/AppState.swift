@@ -182,8 +182,8 @@ final class AppState {
         library.selectedFolder = previous.selectedFolder
         library.selectedRecording = previous.selectedRecording
         library.selectedRecordings = previous.selectedRecordings
-        transcription = TranscriptionState(transcriptStore: transcripts)
-        summarization = SummarizationState(summaryStore: SummaryStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator)))
+        transcription = TranscriptionState(transcriptStore: transcripts, recordingStore: store, shared: coordinator)
+        summarization = SummarizationState(summaryStore: SummaryStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator)), shared: coordinator)
         templateStore = TemplateStore(baseDirectory: coordinator.root, shared: SharedTemplateAdapter(coordinator: coordinator))
         if let manager = device.deviceManager { device.syncEngine = SyncEngine(deviceManager: manager, store: store) }
     }

@@ -40,11 +40,11 @@ public actor SummaryStore {
     }
 
     /// Save a summary, keyed by MP3 filename.
-    public func save(_ summary: Summary, mp3Filename: String) async throws {
+    public func save(_ summary: Summary, mp3Filename: String, job: SharedLibraryJobToken? = nil) async throws {
         if let shared {
             try shared.requireRoot(baseDirectory)
             revisions[mp3Filename, default: 0] += 1
-            let accepted = try await shared.save(summary, filename: mp3Filename)
+            let accepted = try await shared.save(summary, filename: mp3Filename, job: job)
             revisions[mp3Filename, default: 0] += 1
             cache[mp3Filename] = accepted
             knownFiles.insert(mp3Filename)

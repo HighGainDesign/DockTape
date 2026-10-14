@@ -15,6 +15,7 @@ final class SummarizationState {
     var hasSummary: Set<String> = []
 
     let summaryStore: SummaryStore
+    private let shared: SharedLibraryCoordinator?
 
     private var summarizationTask: Task<Void, Never>?
     /// Each queued item carries its own template so mixed-mode auto-summarize works.
@@ -28,8 +29,9 @@ final class SummarizationState {
         let customPrompt: String?
     }
 
-    init(summaryStore: SummaryStore) {
+    init(summaryStore: SummaryStore, shared: SharedLibraryCoordinator? = nil) {
         self.summaryStore = summaryStore
+        self.shared = shared
     }
 
     func summarize(
@@ -59,22 +61,31 @@ final class SummarizationState {
                 summarizingFile = rec.filename
                 phase = "Summarizing with \(model)..."
 
+                var job: SharedLibraryJobToken?
                 do {
                     try Task.checkCancellation()
-                    guard let transcript = await transcriptStore.transcript(for: rec.filename) else {
+                    let transcript: Transcript?
+                    if let shared {
+                        let view = try await shared.recording(at: rec.filename)
+                        job = try await shared.pinJob(.init(id: view.state.id, kind: .recording), input: .transcript, output: .summary)
+                        transcript = try await shared.transcriptForJob(job!, filename: rec.filename)
+                    } else { transcript = await transcriptStore.transcript(for: rec.filename) }
+                    guard let transcript else {
+                        if let shared, let job { await shared.finishJob(job) }
                         onError("No transcript found for \(rec.displayTitle)")
                         queueIndex += 1
                         continue
                     }
 
                     try Task.checkCancellation()
-                    let isMemo = rec.mode == "Wip"
+                    let mode = job?.recordingMode ?? rec.mode
+                    let isMemo = mode == "Wip"
                     let transcriptText = transcript.plainText(includeSpeakers: !isMemo)
                     let systemPrompt: String
                     if let customPrompt = entry.customPrompt {
-                        systemPrompt = Template.buildCustomPrompt(customPrompt, mode: rec.mode)
+                        systemPrompt = Template.buildCustomPrompt(customPrompt, mode: mode)
                     } else {
-                        systemPrompt = entry.template.systemPrompt(forMode: rec.mode)
+                        systemPrompt = entry.template.systemPrompt(forMode: mode)
                     }
 
                     let responseText = try await provider.summarize(
@@ -95,13 +106,20 @@ final class SummarizationState {
                         sections: sections
                     )
 
-                    try await summaryStore.save(summary, mp3Filename: rec.filename)
+                    try await summaryStore.save(summary, mp3Filename: rec.filename, job: job)
+                    if let shared {
+                        if let job { await shared.finishJob(job) }
+                        do { _ = try await shared.projectOutputs() }
+                        catch { onError("Summary saved, but library files need attention: \(error.localizedDescription)") }
+                    }
                     hasSummary.insert(rec.filename)
                     queueIndex += 1
                 } catch is CancellationError {
+                    if let shared, let job { await shared.finishJob(job) }
                     resetState()
                     return
                 } catch {
+                    if let shared, let job { await shared.finishJob(job) }
                     if Task.isCancelled {
                         resetState()
                         return

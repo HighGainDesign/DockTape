@@ -143,6 +143,7 @@ public struct SharedOwnerWitness: Sendable {
     afterPublish: @escaping @Sendable () throws -> Void = {},
     observed: SharedOwnerHeadSummary? = nil,
     gate: SharedLibraryLocalGate? = nil,
+    bindings: [SharedMaterializationBinding] = [],
     body:
       @escaping @Sendable (CoordinatedFileAccess.Scope, Data?) throws -> SharedOwnerPreparedWrite<
         Output
@@ -165,9 +166,15 @@ public struct SharedOwnerWitness: Sendable {
     let directory = self.directory
     let intendedHead = head.standardizedFileURL.resolvingSymlinksInPath()
     let gateItems = try gate?.items(outside: head.deletingLastPathComponent()) ?? []
-    return try await access.withWrites([.init(head), .init(file)] + gateItems) { scopes in
+    for binding in bindings { _ = try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) }
+    let writes = [.init(head), .init(file)] + gateItems
+    return try await access.withWrites(writes, reading: bindings.map(\.file)) { scopes in
       let target = scopes[0]
       let checkpoint = scopes[1]
+      for (binding, read) in zip(bindings, scopes.dropFirst(writes.count)) {
+        guard read.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
+              try binding.validate(Data(contentsOf: read.url)) else { throw SharedLibraryRepositoryError.staleRevision }
+      }
       if let gate { try gate.validate(scopes[2], outside: head.deletingLastPathComponent()) }
       guard target.url.standardizedFileURL.resolvingSymlinksInPath() == intendedHead,
         SharedLibraryMaterializer.contained(checkpoint.url, in: directory)
