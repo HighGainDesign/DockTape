@@ -1,5 +1,6 @@
 // © 2026 High Gain Design. All rights reserved.
 import XCTest
+
 @testable import HiDockKit
 
 final class SharedLibraryRepositoryTests: XCTestCase {
@@ -21,16 +22,19 @@ final class SharedLibraryRepositoryTests: XCTestCase {
     }
 
     private func head(_ root: URL, writer: UUID) -> URL {
-        root.appendingPathComponent(".docktape/records/\(id.uuidString.lowercased())/\(writer.uuidString.lowercased()).json")
+        root.appendingPathComponent(
+            ".docktape/records/\(id.uuidString.lowercased())/\(writer.uuidString.lowercased()).json")
     }
 
     private func deliver(_ source: URL, to destination: URL) throws {
-        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(contentsOf: source).write(to: destination, options: .atomic)
     }
 
     func testIndependentOfflineEditsSurviveRealFileDeliveryAndRestart() async throws {
-        let leftRoot = try root(), rightRoot = try root()
+        let leftRoot = try root()
+        let rightRoot = try root()
         let left = SharedLibraryRepository(root: leftRoot, writerID: a)
         let right = SharedLibraryRepository(root: rightRoot, writerID: b)
         let entity = SharedEntityIdentity(id: id, kind: .recording)
@@ -59,7 +63,8 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         let baseOne = try await one.load(entity: entity)
         let baseTwo = try await two.load(entity: entity)
         _ = try await one.commit(.init(base: baseOne, changes: [.assign(field: "title", value: .text("Alpha"))]))
-        let result = try await two.commit(.init(base: baseTwo, changes: [.assign(field: "folder", value: .text("Calls"))]))
+        let result = try await two.commit(
+            .init(base: baseTwo, changes: [.assign(field: "folder", value: .text("Calls"))]))
         XCTAssertEqual(result.state.value(for: "title"), .text("Alpha"))
         XCTAssertEqual(result.state.value(for: "folder"), .text("Calls"))
         XCTAssertEqual(result.ownerSequence, 2)
@@ -81,7 +86,8 @@ final class SharedLibraryRepositoryTests: XCTestCase {
     }
 
     func testOldAndRepeatedDeliveryCannotUndoAResolvedPublishedObservation() async throws {
-        let leftRoot = try root(), rightRoot = try root()
+        let leftRoot = try root()
+        let rightRoot = try root()
         let left = SharedLibraryRepository(root: leftRoot, writerID: a)
         let right = SharedLibraryRepository(root: rightRoot, writerID: b)
         let entity = SharedEntityIdentity(id: id, kind: .recording)
@@ -100,8 +106,37 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         XCTAssertEqual(afterRestart.state.value(for: "title"), .text("Current"))
     }
 
+    func testRepeatedObservationDoesNotCreateAnEndlessMetadataWriteLoop() async throws {
+        let leftRoot = try root()
+        let rightRoot = try root()
+        let left = SharedLibraryRepository(root: leftRoot, writerID: a)
+        let right = SharedLibraryRepository(root: rightRoot, writerID: b)
+        let entity = SharedEntityIdentity(id: id, kind: .recording)
+        let base = try await left.load(entity: entity)
+        _ = try await left.commit(.init(base: base, changes: [.assign(field: "title", value: .text("Alpha"))]))
+        try deliver(head(leftRoot, writer: a), to: head(rightRoot, writer: a))
+        let observed = try await right.load(entity: entity)
+        _ = try await right.commit(.init(base: observed, changes: []))
+        try deliver(head(rightRoot, writer: b), to: head(leftRoot, writer: b))
+        let first = try await left.load(entity: entity)
+        _ = try await left.commit(.init(base: first, changes: []))
+        let beforeLeft = try Data(contentsOf: head(leftRoot, writer: a))
+        let beforeRight = try Data(contentsOf: head(rightRoot, writer: b))
+        for _ in 0..<4 {
+            try deliver(head(leftRoot, writer: a), to: head(rightRoot, writer: a))
+            let second = try await right.load(entity: entity)
+            _ = try await right.commit(.init(base: second, changes: []))
+            try deliver(head(rightRoot, writer: b), to: head(leftRoot, writer: b))
+            let third = try await left.load(entity: entity)
+            _ = try await left.commit(.init(base: third, changes: []))
+        }
+        XCTAssertEqual(try Data(contentsOf: head(leftRoot, writer: a)), beforeLeft)
+        XCTAssertEqual(try Data(contentsOf: head(rightRoot, writer: b)), beforeRight)
+    }
+
     func testOwnerRollbackUsesReplicatedHighWaterRatherThanReusingSequence() async throws {
-        let leftRoot = try root(), rightRoot = try root()
+        let leftRoot = try root()
+        let rightRoot = try root()
         let left = SharedLibraryRepository(root: leftRoot, writerID: a)
         let right = SharedLibraryRepository(root: rightRoot, writerID: b)
         let entity = SharedEntityIdentity(id: id, kind: .recording)
@@ -122,8 +157,11 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         try deliver(head(rightRoot, writer: b), to: head(leftRoot, writer: b))
         try obsoleteOwner.write(to: head(leftRoot, writer: a), options: .atomic)
         let restored = try await left.load(entity: entity)
-        let accepted = try await left.commit(.init(base: restored, changes: [.assign(field: "note", value: .text("Next"))]))
-        XCTAssertEqual(accepted.ownerSequence, 3, "Use this writer's observed high water, not the old file or another writer's sequence")
+        let accepted = try await left.commit(
+            .init(base: restored, changes: [.assign(field: "note", value: .text("Next"))]))
+        XCTAssertEqual(
+            accepted.ownerSequence, 3,
+            "Use this writer's observed high water, not the old file or another writer's sequence")
         XCTAssertEqual(accepted.state.value(for: "folder"), .text("Calls"))
         XCTAssertEqual(accepted.state.value(for: "peer-two"), .text("Two"))
     }
@@ -138,18 +176,23 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: accepted) as? [String: Any])
         object["schemaVersion"] = 999
         try JSONSerialization.data(withJSONObject: object).write(to: head(directory, writer: a), options: .atomic)
-        do { _ = try await repository.load(entity: entity); XCTFail("Unknown schema must fail") }
-        catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .unsupportedSchema(999)) }
+        do {
+            _ = try await repository.load(entity: entity)
+            XCTFail("Unknown schema must fail")
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .unsupportedSchema(999)) }
         try accepted.write(to: head(directory, writer: a), options: .atomic)
         object = try XCTUnwrap(JSONSerialization.jsonObject(with: accepted) as? [String: Any])
         object["checksum"] = String(repeating: "0", count: 64)
         try JSONSerialization.data(withJSONObject: object).write(to: head(directory, writer: a), options: .atomic)
-        do { _ = try await repository.load(entity: entity); XCTFail("Corruption must not become an empty state") }
-        catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .invalidEnvelope) }
+        do {
+            _ = try await repository.load(entity: entity)
+            XCTFail("Corruption must not become an empty state")
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .invalidEnvelope) }
     }
 
     func testProviderConflictCopyIsValidatedByContentAndRemainsPresent() async throws {
-        let leftRoot = try root(), rightRoot = try root()
+        let leftRoot = try root()
+        let rightRoot = try root()
         let entity = SharedEntityIdentity(id: id, kind: .recording)
         let left = SharedLibraryRepository(root: leftRoot, writerID: a)
         let right = SharedLibraryRepository(root: rightRoot, writerID: b)
@@ -157,7 +200,8 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         let second = try await right.load(entity: entity)
         _ = try await left.commit(.init(base: first, changes: [.assign(field: "title", value: .text("Alpha"))]))
         _ = try await right.commit(.init(base: second, changes: [.assign(field: "title", value: .text("Beta"))]))
-        let copy = head(leftRoot, writer: a).deletingLastPathComponent().appendingPathComponent("provider conflict copy.json")
+        let copy = head(leftRoot, writer: a).deletingLastPathComponent().appendingPathComponent(
+            "provider conflict copy.json")
         try deliver(head(rightRoot, writer: b), to: copy)
         let result = try await left.load(entity: entity)
         XCTAssertEqual(result.state.fields["title"]?.values, [.text("Alpha"), .text("Beta")])
@@ -165,8 +209,10 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         let identities = try await left.scan()
         XCTAssertEqual(identities, [entity])
         try Data("{\"schemaVersion\":1,\"state\":{}".utf8).write(to: copy, options: .atomic)
-        do { _ = try await left.load(entity: entity); XCTFail("Partial conflict state must be an error") }
-        catch { XCTAssertTrue(error is DecodingError) }
+        do {
+            _ = try await left.load(entity: entity)
+            XCTFail("Partial conflict state must be an error")
+        } catch { XCTAssertTrue(error is DecodingError) }
         XCTAssertTrue(FileManager.default.fileExists(atPath: copy.path))
     }
 
@@ -175,13 +221,19 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         let repository = SharedLibraryRepository(root: directory, writerID: a)
         let entity = SharedEntityIdentity(id: id, kind: .recording)
         let base = try await repository.load(entity: entity)
-        let current = try await repository.commit(.init(base: base, changes: [.assign(field: "title", value: .text("Accepted"))]))
+        let current = try await repository.commit(
+            .init(base: base, changes: [.assign(field: "title", value: .text("Accepted"))]))
         let url = head(directory, writer: a)
         let bytes = try Data(contentsOf: url)
-        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: url.deletingLastPathComponent().path)
-        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.deletingLastPathComponent().path) }
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o555], ofItemAtPath: url.deletingLastPathComponent().path)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: url.deletingLastPathComponent().path)
+        }
         do {
-            _ = try await repository.commit(.init(base: current, changes: [.assign(field: "title", value: .text("Not accepted"))]))
+            _ = try await repository.commit(
+                .init(base: current, changes: [.assign(field: "title", value: .text("Not accepted"))]))
             XCTFail("Write into non-writable fixture must fail")
         } catch {}
         XCTAssertEqual(try Data(contentsOf: url), bytes)
@@ -195,22 +247,31 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         _ = try await repository.commit(.init(base: base, changes: [.assign(field: "title", value: .text("Alpha"))]))
         let bytes = try Data(contentsOf: head(directory, writer: a))
         try bytes.write(to: head(directory, writer: b), options: .atomic)
-        do { _ = try await repository.load(entity: entity); XCTFail("Filename/header writer mismatch must not be accepted") }
-        catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .invalidEnvelope) }
+        do {
+            _ = try await repository.load(entity: entity)
+            XCTFail("Filename/header writer mismatch must not be accepted")
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .invalidEnvelope) }
     }
 
     func testSnapshotFromAnotherLibraryOrWriterCannotBeCommitted() async throws {
-        let directory = try root(), other = try root()
+        let directory = try root()
+        let other = try root()
         let repository = SharedLibraryRepository(root: directory, writerID: a)
         let foreign = SharedLibraryRepository(root: other, writerID: a)
         let entity = SharedEntityIdentity(id: id, kind: .recording)
         let snapshot = try await foreign.load(entity: entity)
-        do { _ = try await repository.commit(.init(base: snapshot, changes: [.assign(field: "title", value: .text("Wrong library"))])); XCTFail() }
-        catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .differentBinding) }
+        do {
+            _ = try await repository.commit(
+                .init(base: snapshot, changes: [.assign(field: "title", value: .text("Wrong library"))]))
+            XCTFail()
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .differentBinding) }
         let otherWriter = SharedLibraryRepository(root: directory, writerID: b)
         let wrongWriter = try await otherWriter.load(entity: entity)
-        do { _ = try await repository.commit(.init(base: wrongWriter, changes: [.assign(field: "title", value: .text("Wrong writer"))])); XCTFail() }
-        catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .differentBinding) }
+        do {
+            _ = try await repository.commit(
+                .init(base: wrongWriter, changes: [.assign(field: "title", value: .text("Wrong writer"))]))
+            XCTFail()
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .differentBinding) }
     }
 
     func testUnavailableLibraryRootIsNotRecreatedAsAnEmptyLocalLibrary() async throws {
@@ -219,28 +280,40 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         let entity = SharedEntityIdentity(id: id, kind: .recording)
         let base = try await repository.load(entity: entity)
         try FileManager.default.removeItem(at: directory)
-        do { _ = try await repository.load(entity: entity); XCTFail("Unavailable library is not an empty library") }
-        catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .unavailableRoot) }
-        do { _ = try await repository.commit(.init(base: base, changes: [.assign(field: "title", value: .text("Do not recreate"))])); XCTFail() }
-        catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .unavailableRoot) }
-        do { _ = try await repository.scan(); XCTFail("Scan must not present an absent root as empty") }
-        catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .unavailableRoot) }
+        do {
+            _ = try await repository.load(entity: entity)
+            XCTFail("Unavailable library is not an empty library")
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .unavailableRoot) }
+        do {
+            _ = try await repository.commit(
+                .init(base: base, changes: [.assign(field: "title", value: .text("Do not recreate"))]))
+            XCTFail()
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .unavailableRoot) }
+        do {
+            _ = try await repository.scan()
+            XCTFail("Scan must not present an absent root as empty")
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .unavailableRoot) }
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
     }
 
     func testMetadataSymlinkCannotReadOrReplaceAnOutsideFile() async throws {
-        let directory = try root(), outside = try root()
+        let directory = try root()
+        let outside = try root()
         let repository = SharedLibraryRepository(root: directory, writerID: a)
         let entity = SharedEntityIdentity(id: id, kind: .recording)
         let base = try await repository.load(entity: entity)
         let destination = head(directory, writer: a)
-        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         let foreign = outside.appendingPathComponent("untouched.json")
         let bytes = Data("Do not read or overwrite outside the selected library".utf8)
         try bytes.write(to: foreign)
         try FileManager.default.createSymbolicLink(at: destination, withDestinationURL: foreign)
-        do { _ = try await repository.commit(.init(base: base, changes: [.assign(field: "title", value: .text("Wrong"))])); XCTFail() }
-        catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .invalidPath) }
+        do {
+            _ = try await repository.commit(
+                .init(base: base, changes: [.assign(field: "title", value: .text("Wrong"))]))
+            XCTFail()
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .invalidPath) }
         XCTAssertEqual(try Data(contentsOf: foreign), bytes)
     }
 }
