@@ -20,22 +20,26 @@ import Foundation
 //   hidock clock sync                — sync device clock to system time
 //   hidock help                      — show this help
 
-let args = Array(CommandLine.arguments.dropFirst())
-let command = args.first ?? "help"
+let rawArguments = Array(CommandLine.arguments.dropFirst())
 
 Task {
     do {
+        let invocation = try CLIInvocation(arguments: rawArguments)
+        let args = invocation.arguments
+        let command = args.first ?? "help"
         switch command {
         case "status":
             try await runStatus()
         case "sync":
-            try await runSync(args: Array(args.dropFirst()))
+            try await runSync(args: Array(args.dropFirst()), root: invocation.root)
         case "transcribe":
-            try await runTranscribe(args: Array(args.dropFirst()))
+            try await runTranscribe(args: Array(args.dropFirst()), root: invocation.root)
         case "recordings":
-            try await runRecordings()
+            try await runRecordings(root: invocation.root)
         case "export":
-            try await runExport(args: Array(args.dropFirst()))
+            try await runExport(args: Array(args.dropFirst()), root: invocation.root)
+        case "shared":
+            try await runShared(args: Array(args.dropFirst()), root: invocation.root)
         case "settings":
             try await runSettings(args: Array(args.dropFirst()))
         case "clock":
@@ -47,11 +51,11 @@ Task {
         case "help", "--help", "-h":
             printHelp()
         default:
-            print("Unknown command: \(command)")
-            printHelp()
+            throw CLIUsageError.message("Unknown command: \(command). Run 'hidock help'.")
         }
     } catch {
-        print("Error: \(error.localizedDescription)")
+        FileHandle.standardError.write(Data("Error: \(error.localizedDescription)\n".utf8))
+        exit(1)
     }
     exit(0)
 }
@@ -93,15 +97,16 @@ func runStatus() async throws {
     }
 }
 
-func runSync(args: [String]) async throws {
+func runSync(args: [String], root: URL) async throws {
     let skipTranscribe = args.contains("--skip-transcribe")
     let deleteAfter = args.contains("--delete-after")
     let numSpeakers = parseIntFlag(args, flag: "--speakers")
 
+    let session = try await RecordingLibrarySession.open(root: root)
+    try await session.requireWritable()
+    let pipeline = session.pipeline
     let (manager, _) = try await connectDevice()
-
-    let pipeline = RecordingPipeline()
-    try await pipeline.setup()
+    defer { Task { await manager.disconnect() } }
     print("Storage: \(pipeline.storageDirectory.path)\n")
 
     if deleteAfter {
@@ -120,12 +125,13 @@ func runSync(args: [String]) async throws {
     await manager.disconnect()
 }
 
-func runTranscribe(args: [String]) async throws {
+func runTranscribe(args: [String], root: URL) async throws {
     let numSpeakers = parseIntFlag(args, flag: "--speakers")
-    let pipeline = RecordingPipeline()
-    try await pipeline.setup()
+    let session = try await RecordingLibrarySession.open(root: root)
+    try await session.requireWritable()
+    let pipeline = session.pipeline
 
-    let positionalArgs = args.filter { !$0.hasPrefix("-") && Int($0) == nil }
+    let positionalArgs = CLIInvocation.removingFlag("--speakers", from: args).filter { !$0.hasPrefix("-") }
     if let filename = positionalArgs.first {
         // Transcribe specific file
         print("Transcribing \(filename)...")
@@ -139,9 +145,8 @@ func runTranscribe(args: [String]) async throws {
     }
 }
 
-func runRecordings() async throws {
-    let pipeline = RecordingPipeline()
-    try await pipeline.setup()
+func runRecordings(root: URL) async throws {
+    let pipeline = try await RecordingLibrarySession.open(root: root).pipeline
 
     let recordings = await pipeline.allRecordings()
     if recordings.isEmpty {
@@ -166,7 +171,7 @@ func runRecordings() async throws {
     }
 }
 
-func runExport(args: [String]) async throws {
+func runExport(args: [String], root: URL) async throws {
     guard let filename = args.first, !filename.hasPrefix("-") else {
         print("Usage: hidock export FILENAME [--format txt|jsonl|srt|json]")
         return
@@ -181,8 +186,7 @@ func runExport(args: [String]) async throws {
         format = "txt"
     }
 
-    let pipeline = RecordingPipeline()
-    try await pipeline.setup()
+    let pipeline = try await RecordingLibrarySession.open(root: root).pipeline
 
     guard let transcript = await pipeline.transcript(for: filename) else {
         print("No transcript found for \(filename). Run 'hidock transcribe \(filename)' first.")
@@ -268,6 +272,22 @@ func runClockSync() async throws {
     print("Device clock synced to system time.")
 }
 
+func runShared(args: [String], root: URL) async throws {
+    let action = args.first ?? "status"
+    guard ["status", "enable", "request-access"].contains(action), args.count <= 1 else {
+        throw CLIUsageError.message("Usage: hidock shared [status|enable|request-access] --library PATH")
+    }
+    let session = try await RecordingLibrarySession.open(root: root, enable: action == "enable")
+    if action == "request-access" { try await session.requestAccess() }
+    guard let coordinator = session.coordinator else {
+        print("Legacy library: \(root.path)"); return
+    }
+    if action == "enable" { _ = try await coordinator.projectOutputs() }
+    let writable = try await coordinator.mayEdit()
+    print("Shared library: \(root.path)")
+    print(writable ? "Access: ready" : "Access: read-only; request access and sync with an enrolled Mac")
+}
+
 // MARK: - Helpers
 
 func parseIntFlag(_ args: [String], flag: String) -> Int? {
@@ -308,7 +328,7 @@ func printEvent(_ event: RecordingPipeline.Event) {
         print("Models loaded.\n")
     case .transcribing(let filename, let duration):
         print("  Transcribing \(filename) (~\(duration))...")
-    case .transcribed(let filename, let segments, let speakers, let elapsed):
+    case .transcribed(_, let segments, let speakers, let elapsed):
         print("    \(segments) segments, \(speakers) speakers in \(elapsed)s")
     case .skippedTranscription(let filename):
         print("  Already transcribed \(filename)")
@@ -331,6 +351,8 @@ func printHelp() {
       transcribe [FILE]              Transcribe recordings (all or specific)
                [--speakers N]        Hint: expected number of speakers
       recordings                     List local recordings
+      shared [status|enable|request-access]
+                                     Inspect or explicitly enable shared access
       export FILE [--format FMT]     Export transcript (txt, jsonl, srt, json)
       settings                       Show device settings
       settings set KEY VALUE         Update setting (auto-record, auto-play, notification)
@@ -338,6 +360,9 @@ func printHelp() {
       clock sync                     Sync device clock to system time
       help                           Show this help
 
-    Storage: ~/Documents/HiDock Recordings/
+    Library: --library PATH can be used with sync/transcribe/recordings/export/shared.
+    Default: ~/Documents/HiDock Recordings/
+    Shared libraries require the signed CLI supplied inside DockTape.app:
+      DockTape.app/Contents/Helpers/DockTapeCLI.bundle/Contents/MacOS/hidock
     """)
 }

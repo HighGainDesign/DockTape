@@ -169,6 +169,45 @@ final class SyncEngineTests: XCTestCase {
         }
     }
 
+    func testCLIPipelineVerifiesExistingAudioInLegacyAndSharedLibraries() async throws {
+        for shared in [false, true] {
+            for corrupt in [true, false] {
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                let directory = parent.appendingPathComponent("library")
+                defer { try? FileManager.default.removeItem(at: parent) }
+                let store = RecordingStore(baseDirectory: directory)
+                try await store.setup()
+                let bytes = Data([0xFF, 0xFB, 0xAA, 0xAA])
+                let entry = FileEntry(filename: "recording.hda", size: 4, md5: "bb8e5c306ef0dfbe6fa05803f2ed69ab")
+                try await store.storeRecording(hdaData: bytes, entry: entry)
+                let witness = parent.appendingPathComponent("local-witness")
+                let identity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("local-writer.json"), installationAnchor: "fixture").load()
+                if shared {
+                    let coordinator = SharedLibraryCoordinator(root: directory, writerID: identity.writer, witnessDirectory: witness)
+                    _ = try await coordinator.enable(); _ = try await coordinator.projectOutputs()
+                }
+                let session = try await RecordingLibrarySession.open(root: directory, witnessDirectory: witness, identity: { identity })
+                if corrupt { try Data([0xBB]).write(to: directory.appendingPathComponent("recording.mp3")) }
+                let model = await DeviceModel(id: "test")
+                let manager = DeviceManager(device: model)
+                let transport = MockDeviceTransport()
+                transport.queueFrameResponse(command: .fileCount, sequence: 1, body: Data([0, 0, 0, 1]))
+                var fileList = Data([0, 0, 0, 13])
+                fileList.append(Data("recording.hda".utf8))
+                fileList.append(Data([0, 0, 0, 4]))
+                fileList.append(Data(repeating: 0, count: 6))
+                fileList.append(Data([0xbb, 0x8e, 0x5c, 0x30, 0x6e, 0xf0, 0xdf, 0xbe, 0x6f, 0xa0, 0x58, 0x03, 0xf2, 0xed, 0x69, 0xab]))
+                transport.queueFrameResponse(command: .fileList, sequence: 2, body: fileList)
+                if corrupt { transport.queueFrameResponse(command: .transferFile, sequence: 3, body: bytes) }
+                await manager.connect(via: transport)
+                try await session.pipeline.downloadAndTranscribeAll(deviceManager: manager, skipTranscription: true)
+                XCTAssertEqual(transport.sentData.count, corrupt ? 3 : 2)
+                XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("recording.mp3")), bytes)
+                await manager.disconnect()
+            }
+        }
+    }
+
     func testSyncAllContinuesAfterAnExistingFileCannotBeVerified() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -27,8 +27,7 @@ final class SharedLibraryState {
          trash: @escaping @Sendable (URL) throws -> Void = { try SharedLibraryMaterializer.moveToTrash($0) }) {
         self.identity = identity
         self.trash = trash
-        self.witnessDirectory = witnessDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("DockTape/SharedLibraries/Witnesses")
+        self.witnessDirectory = witnessDirectory ?? RecordingLibrarySession.defaultWitnessDirectory
     }
     func connect(root: URL, enable: Bool = false) async throws -> SharedLibraryCoordinator? {
         let target = root.standardizedFileURL.resolvingSymlinksInPath()

@@ -351,7 +351,7 @@ public actor RecordingStore {
         SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
-    private func existingRecording(for entry: FileEntry) throws -> RecordingMetadata? {
+    func existingRecording(for entry: FileEntry) throws -> RecordingMetadata? {
         let mp3Name = entry.filename.replacingOccurrences(of: ".hda", with: ".mp3", options: .caseInsensitive)
         let matches = allRecordings().filter { recording in
             let key = metadataKey(for: recording.filename)

@@ -52,6 +52,7 @@ jobs:
           swift test
           ./scripts/test-playback.sh
           ./scripts/test-import.sh
+          ./scripts/test-cli.sh
       - name: Build, sign, notarize, and staple DMG
         run: ./scripts/release.sh
       - name: Verify release artifact

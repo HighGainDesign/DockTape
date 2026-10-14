@@ -76,30 +76,23 @@ public actor RecordingPipeline {
         let files = try await deviceManager.queryFileList()
         var metas: [RecordingMetadata] = []
 
+        let imports = SyncEngine(deviceManager: deviceManager, store: recordingStore)
         for file in files {
-            let alreadyHave = await recordingStore.isDownloaded(filename: file.filename)
-            if alreadyHave {
-                onEvent?(.skippedDownload(filename: file.filename))
-                // Find by MP3 filename
-                let mp3Name = file.filename.replacingOccurrences(of: ".hda", with: ".mp3")
-                if let meta = await recordingStore.allRecordings().first(where: { $0.filename == mp3Name }) {
-                    metas.append(meta)
-                }
-                continue
-            }
-
+            try Task.checkCancellation()
             let sizeMB = String(format: "%.1f", Double(file.size) / 1_048_576)
-            onEvent?(.downloading(filename: file.filename, sizeMB: sizeMB))
-
             do {
-                let hdaData = try await deviceManager.downloadFile(entry: file)
-                let meta = try await recordingStore.storeRecording(hdaData: hdaData, entry: file)
-                metas.append(meta)
-                onEvent?(.downloaded(filename: meta.filename))
-
-                if deleteAfterDownload {
-                    try await deviceManager.deleteFile(entry: file)
+                let meta = try await imports.downloadFile(file, deleteAfterDownload: deleteAfterDownload) { progress in
+                    if progress.phase == .downloading { onEvent?(.downloading(filename: file.filename, sizeMB: sizeMB)) }
                 }
+                if let meta {
+                    metas.append(meta)
+                    onEvent?(.downloaded(filename: meta.filename))
+                } else {
+                    onEvent?(.skippedDownload(filename: file.filename))
+                    if let existing = try await recordingStore.existingRecording(for: file) { metas.append(existing) }
+                }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 onEvent?(.downloadFailed(filename: file.filename, error: error.localizedDescription))
             }
