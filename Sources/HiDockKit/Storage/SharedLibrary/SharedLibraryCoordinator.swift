@@ -790,6 +790,142 @@ public actor SharedLibraryCoordinator {
     return .init(id: view.state.id, name: destination, result: result, projectionError: projectionError)
   }
 
+  private struct FolderDeletionMember: Codable, Sendable {
+    let id: UUID
+    let kind: SharedEntityKind
+    let path: String
+    let revision: String
+  }
+  private struct FolderDeletionRequest: Codable, Sendable {
+    let library: UUID
+    let folder: UUID
+    let path: String
+    let members: [FolderDeletionMember]
+  }
+  public func deleteFolder(named name: String, beforeFinalRemoval: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedFolderFileOutcome {
+    _ = try SharedLibraryIdentity.normalized(name)
+    guard !name.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
+    let views = try await snapshots(kinds: [.recording, .folder])
+    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    let matches = views.filter { $0.state.kind == .folder && index.resolvedPaths[$0.state.id] == name }
+    guard matches.count == 1, let base = matches.first else { throw SharedLibraryPathError.ambiguousPath }
+    if case .document = base.state.value(for: "deletionRequest") {
+      return try await resumeFolderDeletion(id: base.state.id, beforeFinalRemoval: beforeFinalRemoval)
+    }
+    guard base.state.lifecycle == .alive, base.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
+    let members = views.filter { $0.state.id != base.state.id && (index.resolvedPaths[$0.state.id]?.hasPrefix(name + "/") == true) }
+    guard members.allSatisfy({ $0.state.lifecycle == .alive && $0.state.conflicts.isEmpty }) else { throw SharedSidecarError.conflictedContent }
+    let request = FolderDeletionRequest(library: base.libraryID, folder: base.state.id, path: name,
+      members: members.map { .init(id: $0.state.id, kind: $0.state.kind, path: index.resolvedPaths[$0.state.id]!, revision: $0.fingerprint) }.sorted { $0.path < $1.path })
+    _ = try await commit(.init(base: base, changes: [.assign(field: "deletionRequest", value: .document(try SharedDocument(id: UUID(), json: JSONEncoder().encode(request))))]), review: false, exact: true)
+    return try await resumeFolderDeletion(id: base.state.id, beforeFinalRemoval: beforeFinalRemoval)
+  }
+  public func resumeFolderDeletion(id: UUID, beforeFinalRemoval: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedFolderFileOutcome {
+    let rootEntity = SharedEntityIdentity(id: id, kind: .folder)
+    let view = try await read(rootEntity)
+    guard view.state.conflicts.isEmpty, case .document(let document)? = view.state.value(for: "deletionRequest") else { throw SharedSidecarError.conflictedContent }
+    let request = try JSONDecoder().decode(FolderDeletionRequest.self, from: document.json)
+    guard request.library == view.libraryID, request.folder == id, !request.path.contains("/"),
+          Set(request.members.map(\.id)).count == request.members.count,
+          request.members.allSatisfy({ $0.path.hasPrefix(request.path + "/") }) else { throw SharedLibraryOperationError.differentBinding }
+    let views = try await snapshots(kinds: [.recording, .folder])
+    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    let expected = Set(request.members.map(\.id))
+    let actual = Set(views.filter { $0.state.id != id && index.resolvedPaths[$0.state.id]?.hasPrefix(request.path + "/") == true }.map { $0.state.id })
+    guard actual == expected, index.resolvedPaths[id] == request.path else { return .init(id: id, name: request.path, result: .needsReplanning, projectionError: nil) }
+    if view.state.lifecycle == .deleted {
+      let permission = try await operationAuthority(entity: rootEntity, paths: [request.path])
+      if try await acknowledgedFolderRemovalIsPresent(path: request.path, permission: permission) {
+        return .init(id: id, name: request.path, result: .complete, projectionError: nil)
+      }
+    }
+    for member in request.members {
+      guard let current = views.first(where: { $0.state.id == member.id && $0.state.kind == member.kind }),
+            current.state.conflicts.isEmpty,
+            current.state.lifecycle == .deleted || current.fingerprint == member.revision else { return .init(id: id, name: request.path, result: .needsReplanning, projectionError: nil) }
+    }
+    let permission = try await operationAuthority(entity: rootEntity, paths: [])
+    if permission.hasPendingWork { return .init(id: id, name: request.path, result: .waitingForActiveWork, projectionError: nil) }
+    for member in request.members where member.kind == .recording {
+      let entity = SharedEntityIdentity(id: member.id, kind: .recording)
+      let current = try await read(entity)
+      let receipts = try operationReceipts(library: view.libraryID)
+      let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
+      if let progress = try await reader.progress(entity: entity, libraryID: view.libraryID),
+         progress.operation.steps.allSatisfy({ if case .trash = $0 { return true }; return false }) {
+        if progress.completedSteps < progress.operation.steps.count {
+          let result = try await resumeRecordingOperation(id: member.id)
+          if result.result != .complete { return .init(id: id, name: request.path, result: result.result, projectionError: result.projectionError) }
+        }
+      } else {
+        if current.state.lifecycle == .deleted && !FileManager.default.fileExists(atPath: root.appendingPathComponent(member.path).path) {
+          return .init(id: id, name: request.path, result: .waitingForFile(member.path), projectionError: nil)
+        }
+        let result = try await deleteSharedRecording(filename: member.path)
+        if result.result != .complete { return .init(id: id, name: request.path, result: result.result, projectionError: result.projectionError) }
+      }
+    }
+    let folders = request.members.filter { $0.kind == .folder }.sorted { $0.path.count > $1.path.count }
+    for member in folders {
+      let outcome = try await removeDeletedEmptyFolder(id: member.id, path: member.path)
+      if outcome.result != .complete { return .init(id: id, name: request.path, result: outcome.result, projectionError: outcome.projectionError) }
+    }
+    try await beforeFinalRemoval()
+    return try await removeDeletedEmptyFolder(id: id, path: request.path)
+  }
+  /// A mirrored deletion is complete only with exact cohort permission and
+  /// coordinated absence of both the directory and any iCloud placeholder.
+  /// This does not claim that this Mac moved the original files to Trash.
+  private func acknowledgedFolderRemovalIsPresent(path: String, permission: SharedMaterializationAuthority) async throws -> Bool {
+    guard permission.mayDestroy(.delete), let gate else { return false }
+    let bindings = permission.additionalBindings + (permission.binding.map { [$0] } ?? [])
+    for binding in bindings { _ = try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) }
+    let items = try gate.items(outside: root)
+    let root = self.root
+    return try await CoordinatedFileAccess().withWrites(items, reading: [root] + bindings.map(\.file)) { scopes in
+      try gate.validate(scopes[0], outside: root)
+      guard !permission.revisionLease.isRevoked, try permission.validateLocalCommit() else { return false }
+      let directory = scopes[items.count].url
+      try SharedLibraryMaterializer.checkRoot(directory)
+      guard directory.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath() else { throw SharedLibraryOperationError.unsafePath }
+      for (binding, scope) in zip(bindings, scopes.dropFirst(items.count + 1)) {
+        guard scope.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
+              try binding.validate(Data(contentsOf: scope.url)) else { return false }
+      }
+      try scopes[0].checkCancellation()
+      let target = directory.appendingPathComponent(path)
+      let placeholder = target.deletingLastPathComponent().appendingPathComponent("." + target.lastPathComponent + ".icloud")
+      return !FileManager.default.fileExists(atPath: target.path) && !FileManager.default.fileExists(atPath: placeholder.path)
+    }
+  }
+
+  private func removeDeletedEmptyFolder(id: UUID, path: String) async throws -> SharedFolderFileOutcome {
+    let entity = SharedEntityIdentity(id: id, kind: .folder)
+    let base = try await read(entity)
+    let target = root.appendingPathComponent(path)
+    if FileManager.default.fileExists(atPath: target.path), !(try FileManager.default.contentsOfDirectory(atPath: target.path)).isEmpty {
+      return .init(id: id, name: path, result: .directoryNotEmpty(path), projectionError: nil)
+    }
+    let before = try await operationAuthority(entity: entity, paths: [path])
+    if before.hasLiveDescendants { return .init(id: id, name: path, result: .needsReplanning, projectionError: nil) }
+    let accepted = base.state.lifecycle == .deleted ? base : try await commit(.init(base: base, changes: [.delete]), review: false, exact: true)
+    let materializer = try await makeMaterializer(entity: entity, paths: [path], receipts: operationReceipts(library: base.libraryID))
+    let progress = try await materializer.progress(entity: entity, libraryID: base.libraryID)
+    let operation: SharedLibraryOperation
+    if let progress, progress.operation.steps == [.removeEmptyDirectory(path: path)] { operation = progress.operation }
+    else {
+      operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
+        inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state), steps: [.removeEmptyDirectory(path: path)])
+      try await Task.detached { try await materializer.recordIntent(operation) }.value
+    }
+    let permission = try await operationAuthority(entity: entity, paths: [path])
+    if !permission.hasPendingWork && !permission.hasLiveDescendants { try await acknowledgeOperation(entity: entity, purpose: .delete) }
+    let result = try await materializer.replay(operation)
+    var projectionError: String?
+    if result == .complete { do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription } }
+    return .init(id: id, name: path, result: result, projectionError: projectionError)
+  }
+
   public func createSharedFolder(named name: String) async throws {
     _ = try SharedLibraryIdentity.normalized(name)
     guard !name.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
@@ -1138,6 +1274,9 @@ public actor SharedLibraryCoordinator {
       libraryID: manifest.libraryID, state: selected.state, membership: membership,
       acknowledgments: acknowledgments, hasPendingWork: localPending || jobs.values.contains { affected.contains($0.entity.id) }, pathOwners: owners)
     result.jobGates = jobGates
+    result.hasLiveDescendants = entity.kind == .folder && snapshots.contains {
+      $0.state.id != entity.id && affected.contains($0.state.id) && ($0.state.lifecycle != .deleted || !$0.state.conflicts.isEmpty)
+    }
     let formatURL = root.appendingPathComponent(".docktape/format.json")
     result.additionalBindings = authoritySources.filter { $0.key != formatURL }.map { url, expected in
       SharedMaterializationBinding(file: url) { SharedLibraryOperation.fingerprint($0) == expected }

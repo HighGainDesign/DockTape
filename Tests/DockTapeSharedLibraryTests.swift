@@ -163,7 +163,8 @@ struct DockTapeSharedLibraryTests {
         await reopened.sharedLibrary.close()
         try await mergeSelectionChecks(parent: parent, identity: identity)
         try await folderRenameChecks(parent: parent, identity: identity)
-        print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions, reconnect and ID-bound merge/original deletion and folder rename.")
+        try await folderDeleteLibraryChecks(parent: parent)
+        print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions, reconnect and ID-bound merge/original deletion and folder rename/delete.")
     }
     @MainActor static func mergeSelectionChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {
         let root = parent.appendingPathComponent("merge-library")
@@ -237,6 +238,31 @@ struct DockTapeSharedLibraryTests {
         try expect(try await shared.reference(to: "Renamed/A.mp3") == reference, "App folder action must preserve child IDs")
         let transcript = await state.transcription.transcriptStore.transcript(for: "Renamed/A.mp3")
         try expect(transcript?.recordingFilename == "Renamed/A.mp3", "Actual transcript adapter must read the relocated companion")
+        await state.sharedLibrary.close()
+    }
+
+    @MainActor static func folderDeleteLibraryChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("folder-delete-library")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder/Nested"), withIntermediateDirectories: true)
+        for name in ["Folder/A.mp3", "Folder/Nested/B.mp3"] { try Data("synthetic deletion audio".utf8).write(to: root.appendingPathComponent(name)) }
+        let legacy = RecordingStore(baseDirectory: root)
+        try await legacy.setup()
+        let recycled = parent.appendingPathComponent("folder-delete-recycled")
+        let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("folder-delete-writer.json"), installationAnchor: "synthetic deletion installation").load()
+        }
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: parent.appendingPathComponent("folder-delete-witnesses"), sharedTrash: { url in
+            try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: url, to: recycled.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent))
+        })
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable actual app deletion library")
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        state.library.selectedFolder = "Folder"
+        state.selectedView = .folder("Folder")
+        await state.deleteFolder(named: "Folder")
+        try expect(state.errorMessage == nil && state.selectedView == .allRecordings && state.library.selectedFolder == nil && state.library.folders.isEmpty && state.library.recordings.isEmpty, "Actual app action must clear the removed folder and refresh descendants: " + (state.errorMessage ?? ""))
+        try expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path), "Actual app action must complete acknowledged empty-directory cleanup")
         await state.sharedLibrary.close()
     }
 

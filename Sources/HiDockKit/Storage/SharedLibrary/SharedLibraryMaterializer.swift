@@ -444,6 +444,7 @@ public actor SharedLibraryMaterializer {
       case .trash:
         guard authority.mayDestroy(.delete) else { return .waitingForAcknowledgments }
       case .removeEmptyDirectory:
+        if authority.hasLiveDescendants { return .needsReplanning }
         if authority.state.lifecycle == .deleted {
           guard authority.mayDestroy(.delete) else { return .waitingForAcknowledgments }
         } else if authority.state.lifecycle != .alive {

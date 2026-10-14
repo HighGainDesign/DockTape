@@ -18,7 +18,11 @@ final class SharedFolderStoreTests: XCTestCase {
         try await legacy.setMeta(mode: "Mee", deviceFilename: "a.hda", for: "Folder/A.mp3")
         try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Folder/A.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
             segments: [.init(startTime: 0, endTime: 1, text: "Preserve transcript")]), mp3Filename: "Folder/A.mp3")
-        let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"), trash: { url in
+            let recycled = parent.appendingPathComponent("recycled")
+            try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: url, to: recycled.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent))
+        })
         _ = try await coordinator.enable(); _ = try await coordinator.projectOutputs()
         let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
         try await store.setup()
@@ -112,6 +116,153 @@ final class SharedFolderStoreTests: XCTestCase {
         let complete = try await original.resumeFolderOperation(id: id)
         XCTAssertEqual(complete.result, .complete)
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed/A.mp3").path))
+    }
+
+    func testSharedFolderDeleteDisposesOwnedRecordingsAndOnlyEmptyDirectories() async throws {
+        let (root, coordinator, store) = try await fixture()
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Folder/.notes"))
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Folder/Notes.txt"))
+        try await store.deleteFolder(named: "Folder")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path))
+        let views = try await coordinator.snapshots(kinds: [.recording, .folder])
+        XCTAssertTrue(views.allSatisfy { $0.state.lifecycle == .deleted })
+        let recycled = root.deletingLastPathComponent().appendingPathComponent("recycled")
+        XCTAssertEqual(LibraryFileDiscovery.files(in: recycled, suffix: ".mp3").count, 2)
+    }
+    func testSharedFolderDeletePreservesUnknownAndHiddenFilesAndRemainsPending() async throws {
+        let (root, _, store) = try await fixture()
+        do { try await store.deleteFolder(named: "Folder"); XCTFail("Keep unknown entries") }
+        catch SharedLibraryOperationError.unfinishedOperation {}
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Folder/.notes")), Data("keep hidden notes".utf8))
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Folder/Notes.txt")), Data("keep unknown document".utf8))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path))
+    }
+
+    func testActiveNestedWorkKeepsAllFolderAudioUntilDeletionResumes() async throws {
+        let (root, coordinator, store) = try await fixture()
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Folder/.notes"))
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Folder/Notes.txt"))
+        let reference = try await coordinator.reference(to: "Folder/Nested/B.mp3")
+        let token = try await coordinator.pinJob(.init(id: reference.entityID, kind: .recording), audioURL: root.appendingPathComponent("Folder/Nested/B.mp3"))
+        do { try await store.deleteFolder(named: "Folder"); XCTFail("Wait for nested work") }
+        catch SharedLibraryOperationError.unfinishedOperation {}
+        let pending = await store.sharedFolderOperation
+        XCTAssertEqual(pending?.result, .waitingForActiveWork)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder/A.mp3").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder/Nested/B.mp3").path))
+        await coordinator.finishJob(token)
+        try await store.deleteFolder(named: "Folder")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path))
+    }
+    func testNewChildAfterFrozenDeletionRequestRequiresReplanning() async throws {
+        let (root, coordinator, store) = try await fixture()
+        let reference = try await coordinator.reference(to: "Folder/A.mp3")
+        let token = try await coordinator.pinJob(.init(id: reference.entityID, kind: .recording))
+        do { try await store.deleteFolder(named: "Folder"); XCTFail() } catch SharedLibraryOperationError.unfinishedOperation {}
+        let folders = try await coordinator.snapshots(kinds: [.folder])
+        let id = try XCTUnwrap(folders.first { $0.state.value(for: "name") == .text("Folder") }?.state.id)
+        let entity = SharedEntityIdentity(id: UUID(), kind: .recording)
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [
+            .assign(field: "initialPath", value: .text("Folder/Late.mp3")), .assign(field: "title", value: .text("Late")), .assign(field: "folder", value: .text(id.uuidString))]))
+        await coordinator.finishJob(token)
+        let result = try await coordinator.resumeFolderDeletion(id: id)
+        XCTAssertEqual(result.result, .needsReplanning)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder/A.mp3").path))
+    }
+    func testMetadataOnlyChildAtFinalRemovalCannotLoseItsParent() async throws {
+        let (root, coordinator, _) = try await fixture()
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Folder/.notes"))
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Folder/Notes.txt"))
+        let folders = try await coordinator.snapshots(kinds: [.folder])
+        let id = try XCTUnwrap(folders.first { $0.state.value(for: "name") == .text("Folder") }?.state.id)
+        let result = try await coordinator.deleteFolder(named: "Folder", beforeFinalRemoval: {
+            let entity = SharedEntityIdentity(id: UUID(), kind: .recording)
+            _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [
+                .assign(field: "initialPath", value: .text("Folder/Late.mp3")), .assign(field: "title", value: .text("Late")), .assign(field: "folder", value: .text(id.uuidString))]))
+        })
+        XCTAssertEqual(result.result, .needsReplanning)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path), "Metadata can arrive before audio; preserve the parent")
+    }
+
+    private func deliver(_ source: URL, to destination: URL, writer: UUID) throws {
+        let tree = source.appendingPathComponent(".docktape").resolvingSymlinksInPath()
+        let iterator = try XCTUnwrap(FileManager.default.enumerator(at: tree, includingPropertiesForKeys: nil))
+        for case let file as URL in iterator where file.pathExtension == "json" {
+            let bytes = try Data(contentsOf: file)
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+            let payload = object["payload"] as? [String: Any]
+            let owner = (object["writerID"] as? String) ?? (payload?["writer"] as? String) ?? (object["founder"] as? String)
+            guard owner.flatMap(UUID.init(uuidString:)) == writer else { continue }
+            let path = String(file.resolvingSymlinksInPath().path.dropFirst(tree.path.count + 1))
+            let target = destination.appendingPathComponent(".docktape/" + path)
+            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try bytes.write(to: target, options: .atomic)
+        }
+    }
+    func testOfflineCohortKeepsFolderAudioUntilEachDeletionIsAcknowledged() async throws {
+        let (left, a, store) = try await fixture()
+        try FileManager.default.removeItem(at: left.appendingPathComponent("Folder/.notes"))
+        try FileManager.default.removeItem(at: left.appendingPathComponent("Folder/Notes.txt"))
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let right = parent.appendingPathComponent("library")
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Fixture B")
+        try deliver(right, to: left, writer: b.writerID); try await a.refresh()
+        try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+        try deliver(right, to: left, writer: b.writerID); try await a.refresh()
+        do { try await store.deleteFolder(named: "Folder"); XCTFail("Wait for offline peer") }
+        catch SharedLibraryOperationError.unfinishedOperation {}
+        let currentOutcome = await store.sharedFolderOperation
+        let pending = try XCTUnwrap(currentOutcome)
+        XCTAssertEqual(pending.result, .waitingForAcknowledgments)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: left.appendingPathComponent("Folder/A.mp3").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: left.appendingPathComponent("Folder/Nested/B.mp3").path))
+        var outcome = pending
+        for _ in 0..<6 {
+            try deliver(left, to: right, writer: a.writerID)
+            try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+            try await b.refresh()
+            let views = try await b.snapshots(kinds: [.recording, .folder])
+            for view in views where view.state.lifecycle == .deleted {
+                try await b.acknowledgeOperation(entity: .init(id: view.state.id, kind: view.state.kind), purpose: .delete)
+            }
+            try deliver(right, to: left, writer: b.writerID)
+            outcome = try await a.resumeFolderDeletion(id: pending.id)
+            if outcome.result == .complete { break }
+        }
+        XCTAssertEqual(outcome.result, .complete)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: left.appendingPathComponent("Folder").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: right.appendingPathComponent("Folder/A.mp3").path), "Synthetic delivery has not applied physical provider removal")
+        // Deliver the provider's completed removal to this disposable replica.
+        try deliver(left, to: right, writer: a.writerID)
+        try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+        try FileManager.default.removeItem(at: right.appendingPathComponent("Folder"))
+        let mirrored = try await b.resumeFolderDeletion(id: pending.id)
+        XCTAssertEqual(mirrored.result, .complete, "A complete acknowledged provider removal does not wait for absent original audio")
+    }
+
+    func testCancelledFolderDeletionRequestResumesFromSharedState() async throws {
+        let (root, original, _) = try await fixture()
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Folder/.notes"))
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Folder/Notes.txt"))
+        let folders = try await original.snapshots(kinds: [.folder])
+        let id = try XCTUnwrap(folders.first { $0.state.value(for: "name") == .text("Folder") }?.state.id)
+        let recycled = root.deletingLastPathComponent().appendingPathComponent("recycled")
+        let cancelled = SharedLibraryCoordinator(root: root, writerID: original.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"), afterCommit: { withUnsafeCurrentTask { $0?.cancel() } },
+            trash: { url in
+                try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: url, to: recycled.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent))
+            })
+        let task = Task { try await cancelled.deleteFolder(named: "Folder") }
+        do { _ = try await task.value; XCTFail("Cancel after requested scope is accepted") } catch is CancellationError {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder/A.mp3").path))
+        let result = try await original.resumeFolderDeletion(id: id)
+        XCTAssertEqual(result.result, .complete)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path))
     }
 
 }

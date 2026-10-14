@@ -17,13 +17,16 @@ final class SharedLibraryState {
     var isBusy: Bool { phase == .connecting }
     private let identity: @Sendable () async throws -> SharedLibraryWriterIdentity
     private let witnessDirectory: URL
+    private let trash: @Sendable (URL) throws -> Void
     private var installation: SharedLibraryWriterIdentity?
     private var request = UUID()
     private var eventsTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
 
-    init(identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity, witnessDirectory: URL?) {
+    init(identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity, witnessDirectory: URL?,
+         trash: @escaping @Sendable (URL) throws -> Void = { try SharedLibraryMaterializer.moveToTrash($0) }) {
         self.identity = identity
+        self.trash = trash
         self.witnessDirectory = witnessDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("DockTape/SharedLibraries/Witnesses")
     }
@@ -37,7 +40,7 @@ final class SharedLibraryState {
         do {
             let writer = try await identity()
             guard request == token, !Task.isCancelled else { throw CancellationError() }
-            let candidate = SharedLibraryCoordinator(root: target, writerID: writer.writer, witnessDirectory: witnessDirectory)
+            let candidate = SharedLibraryCoordinator(root: target, writerID: writer.writer, witnessDirectory: witnessDirectory, trash: trash)
             if enable { _ = try await candidate.enable() }
             let writable = try await candidate.mayEdit()
             guard request == token, !Task.isCancelled else { throw CancellationError() }

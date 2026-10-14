@@ -96,8 +96,9 @@ final class AppState {
 
     init(baseDirectory: URL? = nil,
          sharedIdentity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity = { try await SharedWriterIdentityFactory().load() },
-         sharedWitnessDirectory: URL? = nil) {
-        self.sharedLibrary = SharedLibraryState(identity: sharedIdentity, witnessDirectory: sharedWitnessDirectory)
+         sharedWitnessDirectory: URL? = nil,
+         sharedTrash: @escaping @Sendable (URL) throws -> Void = { try SharedLibraryMaterializer.moveToTrash($0) }) {
+        self.sharedLibrary = SharedLibraryState(identity: sharedIdentity, witnessDirectory: sharedWitnessDirectory, trash: sharedTrash)
         let defaults = UserDefaults.standard
 
         // One-time migration: determine storage mode for pre-iCloud installs
@@ -552,6 +553,17 @@ final class AppState {
         } catch {
             errorMessage = "Move failed: \(error.localizedDescription)"
         }
+    }
+
+    func deleteFolder(named name: String) async {
+        guard requireWritableLibrary() else { return }
+        if let playing = playback.playingFile, playing.hasPrefix(name + "/") { playback.stop() }
+        let affected = library.recordings.filter { $0.filename.hasPrefix(name + "/") }
+        do {
+            try await library.deleteFolder(named: name)
+            if selectedView == .folder(name) { selectedView = .allRecordings }
+            for recording in affected { summarization.hasSummary.remove(recording.filename) }
+        } catch { errorMessage = "Folder delete failed: \(error.localizedDescription)" }
     }
 
     func renameFolder(from oldName: String, to newName: String) async {

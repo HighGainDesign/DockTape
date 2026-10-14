@@ -78,10 +78,7 @@ struct SidebarView: View {
                             }
                             Divider()
                             Button("Delete Folder", role: .destructive) {
-                                Task {
-                                    do { try await state.library.deleteFolder(named: folder) }
-                                    catch { state.errorMessage = error.localizedDescription }
-                                }
+                                Task { await state.deleteFolder(named: folder) }
                             }
                         }
                         .dropDestination(for: String.self) { filenames, _ in

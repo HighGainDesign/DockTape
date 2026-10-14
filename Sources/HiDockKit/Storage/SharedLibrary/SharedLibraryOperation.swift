@@ -61,6 +61,7 @@ public struct SharedMaterializationAuthority: Sendable {
   public var hasPendingWork: Bool
   public var jobGate: SharedLibraryJobGate? = nil
   public var jobGates: [SharedLibraryJobGate] = []
+  public var hasLiveDescendants: Bool = false
   /// Exact owners from the current identity/path index plus retained operation
   /// claims. An empty set is unowned, multiple IDs is a path conflict.
   public var pathOwners: [String: Set<UUID>]
@@ -88,6 +89,7 @@ public struct SharedMaterializationAuthority: Sendable {
   }
   public func mayDestroy(_ purpose: SharedDestructivePurpose) -> Bool {
     guard membership.libraryID == libraryID, state.conflicts.isEmpty, !hasPendingWork,
+      !(state.kind == .folder && hasLiveDescendants),
       membership.pendingWriters.isEmpty, !membership.hasConcurrentEnrollment,
       purpose == .delete ? state.lifecycle == .deleted : state.lifecycle == .alive,
       let revision = try? SharedStateFingerprint.of(state)
@@ -103,6 +105,7 @@ public struct SharedMaterializationAuthority: Sendable {
     -> SharedOperationAcknowledgment
   {
     guard !hasPendingWork, state.conflicts.isEmpty, membership.mayEdit(writer),
+      !(state.kind == .folder && hasLiveDescendants),
       membership.pendingWriters.isEmpty, !membership.hasConcurrentEnrollment,
       purpose == .delete ? state.lifecycle == .deleted : state.lifecycle == .alive
     else { throw SharedLibraryOperationError.invalidOperation }

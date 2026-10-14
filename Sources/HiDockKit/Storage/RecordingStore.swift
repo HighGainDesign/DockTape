@@ -99,7 +99,17 @@ public actor RecordingStore {
     }
 
     /// Delete a top-level folder and all its contents.
-    public func deleteFolder(named name: String) throws {
+    public func deleteFolder(named name: String) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            metadataTicket += 1
+            await beforeSharedFileOperation()
+            let result = try await shared.coordinator.deleteFolder(named: name)
+            sharedFolderOperation = result
+            guard result.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
+            try await loadLibraryMeta()
+            return
+        }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let sanitized = Self.sanitizeFilename(name)
         guard !sanitized.isEmpty else { throw HiDockError.invalidFilename(name) }
