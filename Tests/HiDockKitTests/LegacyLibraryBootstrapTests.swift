@@ -152,4 +152,27 @@ final class LegacyLibraryBootstrapTests: XCTestCase {
         catch { XCTAssertEqual(error as? LegacyBootstrapError, .unsupportedSchema(999)) }
         XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent(".docktape/format.json")), bytes)
     }
+    func testBootstrapReadsActualStoreISODateSidecarsWithoutRewritingThem() async throws {
+        let directory = try root(); defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("synthetic audio".utf8).write(to: directory.appendingPathComponent("call.mp3"))
+        let transcript = Transcript(recordingFilename: "call.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Synthetic")])
+        let summary = Summary(recordingFilename: "call.mp3", model: "fixture", provider: "fixture", templateUsed: "meeting",
+            sections: [.init(heading: "Summary", content: "Synthetic")])
+        try await TranscriptStore(baseDirectory: directory).save(transcript, mp3Filename: "call.mp3")
+        try await SummaryStore(baseDirectory: directory).save(summary, mp3Filename: "call.mp3")
+        let t = directory.appendingPathComponent("call.transcript.json"), s = directory.appendingPathComponent("call.summary.json")
+        let originalT = try Data(contentsOf: t), originalS = try Data(contentsOf: s)
+        let writer = UUID()
+        let bootstrap = LegacyLibraryBootstrap(root: directory, writerID: writer)
+        let manifest = try await bootstrap.enable()
+        XCTAssertTrue(manifest.complete)
+        XCTAssertEqual(try Data(contentsOf: t), originalT); XCTAssertEqual(try Data(contentsOf: s), originalS)
+        let repository = SharedLibraryRepository(root: directory, writerID: writer, manifest: manifest)
+        let entity = try XCTUnwrap(manifest.references.first { $0.entity.kind == .recording }).entity
+        let state = try await repository.load(entity: entity).state
+        XCTAssertEqual(state.currentDocument(for: .transcript)?.json, try SharedDocument(id: UUID(), json: originalT).json)
+        XCTAssertEqual(state.currentDocument(for: .summary)?.json, try SharedDocument(id: UUID(), json: originalS).json)
+    }
+
 }

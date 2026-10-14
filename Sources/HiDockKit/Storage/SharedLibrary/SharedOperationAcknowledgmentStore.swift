@@ -8,10 +8,12 @@ public actor SharedOperationAcknowledgmentStore {
   private let libraryID: UUID
   private let writer: UUID
   private let access = CoordinatedFileAccess()
-  public init(root: URL, libraryID: UUID, writer: UUID) {
+  private let witness: SharedOwnerWitness?
+  public init(root: URL, libraryID: UUID, writer: UUID, witness: SharedOwnerWitness? = nil) {
     self.root = root.standardizedFileURL.resolvingSymlinksInPath()
     self.libraryID = libraryID
     self.writer = writer
+    self.witness = witness
   }
   private struct Payload: Codable, Equatable, Sendable {
     let schema: Int
@@ -58,29 +60,54 @@ public actor SharedOperationAcknowledgmentStore {
     // device-local counter witness is also required at app integration.
     let known = try await payloads(entity: entity)
     let highWater = known.filter { $0.writer == writer }.map(\.sequence).max() ?? 0
-    try await access.withWrite(at: file) { scope in
-      guard lease?.isRevoked != true else { throw SharedLibraryOperationError.staleAuthority }
-      try SharedLibraryMaterializer.checkRoot(root)
-      guard SharedLibraryMaterializer.contained(scope.url, in: directory) else {
-        throw SharedLibraryOperationError.unsafePath
+    let execute:
+      @Sendable (CoordinatedFileAccess.Scope, Data?) throws -> SharedOwnerPreparedWrite<Void> = {
+        scope, data in
+        guard lease?.isRevoked != true else { throw SharedLibraryOperationError.staleAuthority }
+        try SharedLibraryMaterializer.checkRoot(root)
+        guard SharedLibraryMaterializer.contained(scope.url, in: directory) else {
+          throw SharedLibraryOperationError.unsafePath
+        }
+        var old: Payload?
+        if let data {
+          old = try Self.decode(data, library: library, entity: entity)
+          guard old?.writer == writer else { throw SharedLibraryOperationError.invalidReceipt }
+          if old?.acknowledgment == acknowledgment, old?.sequence == highWater {
+            return .init(bytes: nil, result: ())
+          }
+        }
+        let sequence = max(highWater, old?.sequence ?? 0)
+        guard sequence < UInt64.max else { throw SharedLibraryOperationError.invalidReceipt }
+        let payload = Payload(
+          schema: 1, library: library, writer: writer, entity: entity,
+          sequence: sequence + 1, acknowledgment: acknowledgment)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let bytes = try encoder.encode(
+          Envelope(payload: payload, checksum: SharedStateFingerprint.of(payload)))
+        try scope.checkCancellation()
+        return .init(bytes: bytes, result: ())
       }
-      var old: Payload?
-      if FileManager.default.fileExists(atPath: scope.url.path) {
-        old = try Self.decode(Data(contentsOf: scope.url), library: library, entity: entity)
-        guard old?.writer == writer else { throw SharedLibraryOperationError.invalidReceipt }
-        if old?.acknowledgment == acknowledgment, old?.sequence == highWater { return }
+    if let witness {
+      guard witness.isOutside(root), witness.matches(library: library, writer: writer) else {
+        throw SharedLibraryOperationError.differentBinding
       }
-      let sequence = max(highWater, old?.sequence ?? 0)
-      guard sequence < UInt64.max else { throw SharedLibraryOperationError.invalidReceipt }
-      let payload = Payload(
-        schema: 1, library: library, writer: writer, entity: entity,
-        sequence: sequence + 1, acknowledgment: acknowledgment)
-      let encoder = JSONEncoder()
-      encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-      let bytes = try encoder.encode(
-        Envelope(payload: payload, checksum: SharedStateFingerprint.of(payload)))
-      try scope.checkCancellation()
-      try bytes.write(to: scope.url, options: .atomic)
+      try await witness.withWrite(
+        at: file, key: "ack." + entity.uuidString,
+        decode: {
+          try Self.summary(Self.decode($0, library: library, entity: entity))
+        }, body: execute)
+    } else {
+      try await access.withWrite(at: file) { scope in
+        let data =
+          FileManager.default.fileExists(atPath: scope.url.path)
+          ? try Data(contentsOf: scope.url) : nil
+        let prepared = try execute(scope, data)
+        if let bytes = prepared.bytes {
+          try scope.checkCancellation()
+          try bytes.write(to: scope.url, options: .atomic)
+        }
+      }
     }
   }
   public func load(entity: UUID) async throws -> [SharedOperationAcknowledgment] {
@@ -108,7 +135,7 @@ public actor SharedOperationAcknowledgmentStore {
     let files = LibraryFileDiscovery.files(in: directory, suffix: ".json")
     let access = self.access
     let library = libraryID
-    return try await withThrowingTaskGroup(of: Payload.self) { group in
+    var result: [Payload] = try await withThrowingTaskGroup(of: Payload.self) { group in
       for file in files {
         group.addTask {
           guard SharedLibraryMaterializer.contained(file.url, in: directory) else {
@@ -123,6 +150,32 @@ public actor SharedOperationAcknowledgmentStore {
       for try await acknowledgment in group { result.append(acknowledgment) }
       return result
     }
+    if let witness {
+      guard witness.isOutside(root), witness.matches(library: library, writer: writer) else {
+        throw SharedLibraryOperationError.differentBinding
+      }
+      let file = directory.appendingPathComponent(writer.uuidString + ".json")
+      if FileManager.default.fileExists(atPath: file.path)
+        || FileManager.default.fileExists(
+          atPath: witness.fileURL(for: "ack." + entity.uuidString).path)
+      {
+        let recovered: Payload? = try await witness.withWrite(
+          at: file, key: "ack." + entity.uuidString,
+          decode: {
+            try Self.summary(Self.decode($0, library: library, entity: entity))
+          }
+        ) { _, bytes in
+          .init(
+            bytes: nil,
+            result: try bytes.map { try Self.decode($0, library: library, entity: entity) })
+        }
+        if let recovered { result.append(recovered) }
+      }
+    }
+    return result
+  }
+  private static func summary(_ payload: Payload) throws -> SharedOwnerHeadSummary {
+    .init(sequence: payload.sequence, fingerprint: try SharedStateFingerprint.of(payload))
   }
   private func ensureDirectory(entity: UUID) async throws -> URL {
     try SharedLibraryMaterializer.checkRoot(root)
