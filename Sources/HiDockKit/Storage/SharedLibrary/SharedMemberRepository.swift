@@ -87,7 +87,10 @@ actor SharedMemberRepository {
         return .init(membership: membership, votes: votes, sequences: sequences)
     }
 
-    func commit(base: SharedMemberSnapshot, membership: SharedLibraryMembership, vote: SharedMembershipVote? = nil)
+    func commit(
+        base: SharedMemberSnapshot, membership: SharedLibraryMembership, vote: SharedMembershipVote? = nil,
+        observing: Bool = false
+    )
         async throws -> SharedMemberSnapshot
     {
         _ = try initial.merged(with: membership)
@@ -114,7 +117,11 @@ actor SharedMemberRepository {
             let existing =
                 FileManager.default.fileExists(atPath: scope.url.path)
                 ? try Self.decode(Data(contentsOf: scope.url), expected: writer) : nil
-            let current = try membership.rebased(from: base.membership, onto: existing?.membership ?? base.membership)
+            let latest = existing?.membership ?? base.membership
+            let current =
+                try observing
+                ? latest.merged(with: base.membership).merged(with: membership)
+                : membership.rebased(from: base.membership, onto: latest)
             var sequences = base.sequences
             var votes = base.votes
             if let existing {

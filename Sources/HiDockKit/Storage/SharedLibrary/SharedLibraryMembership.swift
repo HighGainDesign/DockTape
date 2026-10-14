@@ -1,5 +1,5 @@
-import CryptoKit
 // © 2026 High Gain Design. All rights reserved.
+import CryptoKit
 import Foundation
 
 public enum SharedMembershipError: Error, Equatable, Sendable {

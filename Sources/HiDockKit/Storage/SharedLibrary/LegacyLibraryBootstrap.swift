@@ -92,7 +92,7 @@ public actor LegacyLibraryBootstrap {
     public func readiness() async throws -> SharedBootstrapReadiness {
         let header = try await publishedManifest()
         guard case .ready(let selected) = header else { return header }
-        let repository = SharedLibraryRepository(root: root, writerID: selected.founder)
+        let repository = SharedLibraryRepository(root: root, writerID: selected.founder, manifest: selected)
         for reference in selected.references {
             guard
                 try await repository.containsBootstrapReference(
@@ -155,7 +155,7 @@ public actor LegacyLibraryBootstrap {
     }
 
     private func finish(_ manifest: SharedBootstrapManifest, seeds: [Seed]) async throws -> SharedBootstrapManifest {
-        let repository = SharedLibraryRepository(root: root, writerID: writer)
+        let repository = SharedLibraryRepository(root: root, writerID: writer, manifest: manifest)
         for seed in seeds {
             let existing = try await repository.load(entity: seed.entity)
             if existing.state.lifecycle == .uninitialized {

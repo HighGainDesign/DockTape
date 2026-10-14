@@ -271,6 +271,25 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), bytes)
     }
 
+    func testReusedOwnerSequenceWithDifferentFieldsIsAnErrorRatherThanAnImplicitCloneMerge() async throws {
+        let leftRoot = try root()
+        let rightRoot = try root()
+        let left = SharedLibraryRepository(root: leftRoot, writerID: a)
+        let right = SharedLibraryRepository(root: rightRoot, writerID: a)
+        let entity = SharedEntityIdentity(id: id, kind: .recording)
+        let leftBase = try await left.load(entity: entity)
+        let rightBase = try await right.load(entity: entity)
+        _ = try await left.commit(.init(base: leftBase, changes: [.assign(field: "title", value: .text("Accepted"))]))
+        _ = try await right.commit(.init(base: rightBase, changes: [.assign(field: "folder", value: .text("Clone"))]))
+        let copy = head(leftRoot, writer: a).deletingLastPathComponent().appendingPathComponent("clone conflict.json")
+        try deliver(head(rightRoot, writer: a), to: copy)
+        do {
+            _ = try await left.load(entity: entity)
+            XCTFail("One writer cannot publish different states under one owner sequence")
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .invalidEnvelope) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: copy.path))
+    }
+
     func testForeignWriterEnvelopeCannotClaimTheOwnerPath() async throws {
         let directory = try root()
         let repository = SharedLibraryRepository(root: directory, writerID: a)

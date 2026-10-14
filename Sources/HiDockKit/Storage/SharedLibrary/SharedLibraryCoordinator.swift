@@ -9,6 +9,7 @@ public struct SharedLibraryViewSnapshot: Sendable {
     let repository: SharedLibrarySnapshot
     public var state: SharedEntityState { repository.state }
     public var fingerprint: String { repository.fingerprint }
+    public var confirmedState: SharedEntityState? { repository.projection?.state }
 }
 public struct SharedCoordinatorEdit: Sendable {
     public let base: SharedLibraryViewSnapshot
@@ -61,19 +62,20 @@ public actor SharedLibraryCoordinator {
     }
     public func enable() async throws -> SharedBootstrapManifest {
         let manifest = try await bootstrap.enable()
-        try install(manifest)
+        try await install(manifest)
         let members = try memberRepository()
         let initial = try await members.load()
         _ = try await members.commit(base: initial, membership: initial.membership)
         return manifest
     }
-    private func install(_ manifest: SharedBootstrapManifest) throws {
+    private func install(_ manifest: SharedBootstrapManifest) async throws {
         if let previous = self.manifest,
             previous.libraryID != manifest.libraryID || previous.fingerprint != manifest.fingerprint
         {
             cache.removeAll()
             throw SharedLibraryCoordinatorError.differentBinding
         }
+        try await repository.configure(manifest: manifest)
         self.manifest = manifest
         if members == nil { members = SharedMemberRepository(root: root, writer: writerID, manifest: manifest) }
     }
@@ -83,7 +85,7 @@ public actor SharedLibraryCoordinator {
         switch header {
         case .notEnabled: throw SharedLibraryCoordinatorError.notEnabled
         case .ready(let manifest), .pending(let manifest):
-            try install(manifest)
+            try await install(manifest)
             return manifest
         }
     }
@@ -192,6 +194,16 @@ public actor SharedLibraryCoordinator {
                 publish(.init(libraryID: manifest.libraryID, repository: snapshot), entity: entity, request: ticket)
             }
         }
+        var observedMembership = membershipSnapshot.membership
+        for snapshot in snapshots {
+            if let proof = snapshot.observedMembership {
+                observedMembership = try observedMembership.merged(with: proof)
+            }
+        }
+        if observedMembership != membershipSnapshot.membership {
+            membershipSnapshot = try await members.commit(
+                base: membershipSnapshot, membership: observedMembership, observing: true)
+        }
         let membership = membershipSnapshot.membership
         if membership.mayEdit(writerID) {
             membershipSnapshot = try await members.commit(base: membershipSnapshot, membership: membership)
@@ -201,7 +213,10 @@ public actor SharedLibraryCoordinator {
             membership.cohort.contains(writerID) || membership.pendingWriters.contains(writerID),
             snapshots.allSatisfy({ $0.state.conflicts.isEmpty }),
             case .ready = try await bootstrap.readiness()
-        else { return }
+        else {
+            try await advanceProjections(entities)
+            return
+        }
         struct Checkpoint: Encodable {
             struct Entry: Encodable {
                 let id: UUID
@@ -228,6 +243,45 @@ public actor SharedLibraryCoordinator {
         var accepted = membershipSnapshot.membership
         try accepted.accept(certificate)
         _ = try await members.commit(base: membershipSnapshot, membership: accepted)
+        try await advanceProjections(entities)
+    }
+
+    private func advanceProjections(_ entities: [SharedEntityIdentity]) async throws {
+        let members = try memberRepository()
+        for entity in entities {
+            try Task.checkCancellation()
+            var memberSnapshot = try await members.load()
+            let base = try await repository.load(entity: entity)
+            if let proof = base.observedMembership {
+                let observed = try memberSnapshot.membership.merged(with: proof)
+                if observed != memberSnapshot.membership {
+                    memberSnapshot = try await members.commit(
+                        base: memberSnapshot, membership: observed, observing: true)
+                }
+            }
+            let membership = memberSnapshot.membership
+            guard membership.mayEdit(writerID), membership.pendingWriters.isEmpty,
+                !membership.hasConcurrentEnrollment, base.writers.isSubset(of: membership.cohort),
+                base.state.conflicts.isEmpty
+            else { continue }
+            let proposal = try SharedProjectionProposal(state: base.state, membership: membership)
+            do {
+                _ = try await repository.acknowledgeProjection(proposal, base: base)
+            } catch SharedLibraryRepositoryError.staleRevision { continue }
+            let observed = try await repository.load(entity: entity)
+            let currentMembership = try await members.load().membership
+            guard currentMembership.fingerprint == proposal.cohort else { continue }
+            let actual = try? SharedProjectionProposal(state: observed.state, membership: currentMembership)
+            guard actual?.revision == proposal.revision else { continue }
+            let votes = observed.projectionVotes.values.filter {
+                membership.cohort.contains($0.writer) && $0.revision == proposal.revision
+                    && $0.cohort == proposal.cohort
+            }
+            guard votes.count == membership.cohort.count else { continue }
+            let certificate = try proposal.certify(votes: Array(votes))
+            _ = try await repository.publishProjection(certificate, base: observed, membership: currentMembership)
+            _ = try await read(entity)
+        }
     }
 
     public func edit(_ edit: SharedCoordinatorEdit) async throws -> SharedLibraryViewSnapshot {
@@ -302,7 +356,12 @@ public actor SharedLibraryCoordinator {
     }
     private static func inputRevision(_ state: SharedEntityState, component: SharedComponent?) throws -> String {
         if let component {
-            return try SharedStateFingerprint.of(state.fields.filter { $0.key.hasPrefix(component.rawValue + ".") })
+            struct Input: Encodable {
+                let document: SharedDocument?
+                let edits: [String: SharedFieldValue]
+            }
+            return try SharedStateFingerprint.of(
+                Input(document: state.currentDocument(for: component), edits: state.generationEdits(for: component)))
         }
         return try SharedStateFingerprint.of(state.value(for: "audioFingerprint") ?? state.value(for: "legacyMetadata"))
     }
