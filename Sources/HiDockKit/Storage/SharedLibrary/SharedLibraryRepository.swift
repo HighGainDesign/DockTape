@@ -148,6 +148,21 @@ public actor SharedLibraryRepository {
         }.value
     }
 
+    /// Verify a bootstrap's referenced owner head before enrolling a writer.
+    /// Later heads may supersede its seed, but retain the immutable initial claim.
+    public func containsBootstrapReference(entity: SharedEntityIdentity, writer: UUID,
+        sequence: UInt64, fingerprint: String, initialPath: String) async throws -> Bool {
+        let destination = Self.directory(entity, root: root).appendingPathComponent(writer.uuidString.lowercased() + ".json")
+        try Self.validateRoot(root)
+        try Self.validate(destination, root: root)
+        let files = try await Task.detached { try Self.headFiles(destination.deletingLastPathComponent()) }.value
+        guard files.contains(where: { $0.url == destination }) else { return false }
+        let envelope = try Self.decode(await access.read(at: destination), entity: entity, expectedWriter: writer)
+        guard envelope.sequence >= sequence, envelope.state.value(for: "initialPath") == .text(initialPath) else { return false }
+        if envelope.sequence > sequence { return true }
+        return try Self.hash(Self.encode(envelope.state)) == fingerprint
+    }
+
     private static func validateBase(_ edit: SharedLibraryEdit, against current: SharedEntityState) throws {
         for mutation in edit.changes {
             let fields: Set<String>
