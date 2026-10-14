@@ -255,6 +255,212 @@ final class SharedLibraryCoordinatorTests: XCTestCase {
         _ = try await listener.value
     }
 
+    func testRemoteSummaryTemplateAndNewEntityRefreshUseOneExistingCoordinator() async throws {
+        let (left, right, one, two, record) = try await pair()
+        let template = SharedEntityIdentity(id: UUID(), kind: .template)
+        let firstTemplate = try await one.read(template)
+        _ = try await one.edit(
+            .init(
+                base: firstTemplate,
+                changes: [
+                    .assign(field: "name", value: .text("Template")),
+                    .assign(field: "prompt", value: .text("First prompt")),
+                ]))
+        let before = try await one.read(record)
+        let summary = try SharedDocument(id: UUID(), json: Data("{\"summary\":\"First\"}".utf8))
+        _ = try await one.edit(.init(base: before, changes: [.generation(summary, component: .summary)]))
+        try deliver(left, to: right)
+        try await two.refresh()
+        let initial = try await two.read(record)
+        let initialTemplate = try await two.read(template)
+        XCTAssertEqual(initial.state.currentDocument(for: .summary)?.json, Data("{\"summary\":\"First\"}".utf8))
+        XCTAssertEqual(initialTemplate.state.value(for: "prompt"), .text("First prompt"))
+        let changedTemplate = try await one.read(template)
+        let changedRecord = try await one.read(record)
+        _ = try await one.edit(
+            .init(base: changedTemplate, changes: [.assign(field: "prompt", value: .text("Remote replacement"))]))
+        _ = try await one.edit(
+            .init(
+                base: changedRecord,
+                changes: [
+                    .generation(
+                        try SharedDocument(id: UUID(), json: Data("{\"summary\":\"Second\"}".utf8)), component: .summary
+                    )
+                ]))
+        try deliver(left, to: right)
+        try await two.refresh()
+        let updated = try await two.read(record)
+        let updatedTemplate = try await two.read(template)
+        XCTAssertEqual(updated.state.currentDocument(for: .summary)?.json, Data("{\"summary\":\"Second\"}".utf8))
+        XCTAssertEqual(updatedTemplate.state.value(for: "prompt"), .text("Remote replacement"))
+        XCTAssertNotEqual(updated.fingerprint, initial.fingerprint)
+    }
+
+    func testHeldRecordingReadDoesNotBlockAnotherEntityAndCancelledReadNeverPublishesLater() async throws {
+        let (left, _, one, _, entity) = try await pair()
+        let second = SharedEntityIdentity(id: UUID(), kind: .recording)
+        let empty = try await one.read(second)
+        let doc = try SharedDocument(id: UUID(), json: Data("{\"text\":\"Resident B\"}".utf8))
+        _ = try await one.edit(.init(base: empty, changes: [.generation(doc, component: .transcript)]))
+        let file = left.appendingPathComponent(
+            ".docktape/records/\(entity.id.uuidString.lowercased())/\(a.uuidString.lowercased()).json")
+        let held = expectation(description: "Actual writer holds recording A")
+        let released = DispatchSemaphore(value: 0)
+        let holder = Task.detached {
+            var error: NSError?
+            NSFileCoordinator().coordinate(writingItemAt: file, options: .forMerging, error: &error) { _ in
+                held.fulfill()
+                _ = released.wait(timeout: .now() + 5)
+            }
+            if let error { throw error }
+        }
+        await fulfillment(of: [held], timeout: 1)
+        let started = expectation(description: "Recording A emitted its library-bound loading event")
+        let stream = await one.events()
+        let listener = Task {
+            for await event in stream {
+                if case .loading(_, let id) = event, id == entity {
+                    started.fulfill()
+                    return
+                }
+            }
+        }
+        let waiting = Task { try await one.read(entity) }
+        await fulfillment(of: [started], timeout: 1)
+        let start = ContinuousClock.now
+        let resident = try await one.read(second)
+        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
+        XCTAssertEqual(resident.state.currentDocument(for: .transcript)?.json, Data("{\"text\":\"Resident B\"}".utf8))
+        waiting.cancel()
+        do {
+            _ = try await waiting.value
+            XCTFail()
+        } catch { XCTAssertTrue(error is CancellationError) }
+        released.signal()
+        try await holder.value
+        listener.cancel()
+        await listener.value
+        let stillResident = try await one.read(second)
+        XCTAssertEqual(stillResident.state.currentDocument(for: .transcript)?.id, doc.id)
+    }
+    func testJobAndEditReviewCannotCrossLibraryBindingsWithIdenticalEntityAndDocumentIDs() async throws {
+        let (_, _, one, _, entity) = try await pair()
+        let before = try await one.read(entity)
+        let doc = try SharedDocument(id: UUID(), json: Data("{\"text\":\"Same data\"}".utf8))
+        let original = try await one.edit(.init(base: before, changes: [.generation(doc, component: .transcript)]))
+        let token = try await one.pinJob(entity, input: .transcript)
+        let destination = try root(writer: a)
+        let other = SharedLibraryCoordinator(root: destination, writerID: a)
+        _ = try await other.enable()
+        let empty = try await other.read(entity)
+        _ = try await other.edit(.init(base: empty, changes: [.generation(doc, component: .transcript)]))
+        do {
+            try await other.validateJob(token)
+            XCTFail()
+        } catch { XCTAssertEqual(error as? SharedLibraryCoordinatorError, .staleJob) }
+        do {
+            _ = try await other.resolve(
+                .init(base: original, changes: [.assign(field: "title", value: .text("Old window draft"))]))
+            XCTFail()
+        } catch { XCTAssertEqual(error as? SharedLibraryCoordinatorError, .differentBinding) }
+    }
+
+    func testProviderConflictVersionIsReviewedAgainstItsCanonicalSourceAndNeverRemovedDuringAdoption() async throws {
+        let directory = try root(writer: a)
+        let canonical = directory.appendingPathComponent("Meeting.transcript.json")
+        let hidden = directory.appendingPathComponent("provider-version.json")
+        let current = Data("{\"text\":\"Current\"}".utf8)
+        let other = Data("{\"text\":\"Provider conflict\"}".utf8)
+        try current.write(to: canonical)
+        try other.write(to: hidden)
+        let version = RecordingFileVersion(
+            id: "provider-conflict", sourceURL: canonical, modifiedAt: nil, isConflict: true, isResolved: false,
+            accessURL: hidden)
+        let access = RecordingFileVersionAccess(
+            lookup: { _ in [version] }, read: { version in try Data(contentsOf: version.accessURL) })
+        let coordinator = SharedLibraryCoordinator(root: directory, writerID: a, versionAccess: access)
+        _ = try await coordinator.enable()
+        let entity = SharedEntityIdentity(id: UUID(), kind: .recording)
+        let empty = try await coordinator.read(entity)
+        _ = try await coordinator.edit(
+            .init(
+                base: empty,
+                changes: [.generation(try SharedDocument(id: UUID(), json: current), component: .transcript)]))
+        let candidates = try await coordinator.inspectExternalVersions(entity, component: .transcript, at: canonical)
+        XCTAssertEqual(candidates.count, 1)
+        let candidate = try XCTUnwrap(candidates.first)
+        XCTAssertEqual(
+            candidate.url, canonical, "Never expose the private version-store path as its canonical location")
+        let review = try await coordinator.read(entity)
+        let accepted = try await coordinator.adoptExternal(candidate, review: review)
+        XCTAssertEqual(accepted.state.currentDocument(for: .transcript)?.json, other)
+        XCTAssertEqual(try Data(contentsOf: canonical), current)
+        XCTAssertEqual(
+            try Data(contentsOf: hidden), other, "Version cleanup waits for a durable materialization receipt")
+        try Data("{\"text\":\"Later provider bytes\"}".utf8).write(to: hidden)
+        do {
+            _ = try await coordinator.adoptExternal(candidate, review: review)
+            XCTFail()
+        } catch { XCTAssertEqual(error as? SharedLibraryCoordinatorError, .externalChanged) }
+    }
+
+    func testExternalJSONAdoptionIsExplicitAndRepeatingAcceptedIntentDoesNotRegenerateContent() async throws {
+        let (left, _, one, _, entity) = try await pair()
+        let before = try await one.read(entity)
+        let url = left.appendingPathComponent("Meeting.transcript.json")
+        let bytes = Data("{\"text\":\"External transcript\"}".utf8)
+        try bytes.write(to: url)
+        let inspected = try await one.inspectExternal(entity, component: .transcript, at: url)
+        let candidate = try XCTUnwrap(inspected)
+        let unchanged = try await one.read(entity)
+        XCTAssertNil(unchanged.state.currentDocument(for: .transcript))
+        let adopted = try await one.adoptExternal(candidate, review: before)
+        XCTAssertEqual(adopted.state.currentDocument(for: .transcript)?.json, bytes)
+        let repeated = try await one.adoptExternal(candidate, review: before)
+        XCTAssertEqual(repeated.fingerprint, adopted.fingerprint)
+        XCTAssertEqual(
+            repeated.state.currentDocument(for: .transcript)?.id, adopted.state.currentDocument(for: .transcript)?.id)
+        XCTAssertEqual(try Data(contentsOf: url), bytes, "Logical adoption does not prematurely replace external bytes")
+    }
+    func testExternalAdoptionRejectsNewFileBytesAndAnUnseenInternalGeneration() async throws {
+        let (left, _, one, _, entity) = try await pair()
+        let before = try await one.read(entity)
+        let url = left.appendingPathComponent("Meeting.transcript.json")
+        try Data("{\"text\":\"Reviewed\"}".utf8).write(to: url)
+        let inspectedFirst = try await one.inspectExternal(entity, component: .transcript, at: url)
+        let first = try XCTUnwrap(inspectedFirst)
+        let newer = Data("{\"text\":\"New external change\"}".utf8)
+        try newer.write(to: url)
+        do {
+            _ = try await one.adoptExternal(first, review: before)
+            XCTFail()
+        } catch { XCTAssertEqual(error as? SharedLibraryCoordinatorError, .externalChanged) }
+        let inspectedSecond = try await one.inspectExternal(entity, component: .transcript, at: url)
+        let second = try XCTUnwrap(inspectedSecond)
+        let internalDoc = try SharedDocument(id: UUID(), json: Data("{\"text\":\"New internal generation\"}".utf8))
+        _ = try await one.edit(.init(base: before, changes: [.generation(internalDoc, component: .transcript)]))
+        do {
+            _ = try await one.adoptExternal(second, review: before)
+            XCTFail()
+        } catch { XCTAssertEqual(error as? SharedLibraryCoordinatorError, .staleReview) }
+        XCTAssertEqual(try Data(contentsOf: url), newer)
+    }
+    func testExternalCandidateCannotCrossLibraryBindingsEvenForTheSameEntityID() async throws {
+        let (left, _, one, _, entity) = try await pair()
+        let url = left.appendingPathComponent("Meeting.transcript.json")
+        try Data("{\"text\":\"External\"}".utf8).write(to: url)
+        let inspected = try await one.inspectExternal(entity, component: .transcript, at: url)
+        let candidate = try XCTUnwrap(inspected)
+        let otherRoot = try root(writer: a)
+        let other = SharedLibraryCoordinator(root: otherRoot, writerID: a)
+        _ = try await other.enable()
+        let otherView = try await other.read(entity)
+        do {
+            _ = try await other.adoptExternal(candidate, review: otherView)
+            XCTFail()
+        } catch { XCTAssertEqual(error as? SharedLibraryCoordinatorError, .differentBinding) }
+    }
+
     func testRefreshDoesNotRestoreDeletionAndUntrackedJSONIsOneStableCandidate() async throws {
         let (left, right, one, two, entity) = try await pair()
         let base = try await one.read(entity)

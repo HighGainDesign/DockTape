@@ -2,7 +2,8 @@
 import Foundation
 
 public enum SharedLibraryCoordinatorError: Error, Equatable, Sendable {
-    case notEnabled, bootstrapPending, enrollmentPending, differentBinding, staleReview, staleJob, unrecognizedWriter
+    case notEnabled, bootstrapPending, enrollmentPending, differentBinding, staleReview, staleJob, unrecognizedWriter,
+        externalChanged
 }
 public struct SharedLibraryViewSnapshot: Sendable {
     public let libraryID: UUID
@@ -27,6 +28,8 @@ public struct SharedLibraryJobToken: Sendable {
     let input: String
 }
 public struct SharedExternalContent: Equatable, Sendable {
+    public let libraryID: UUID
+    public let versionID: String?
     public let id: UUID
     public let entity: SharedEntityIdentity
     public let component: SharedComponent
@@ -35,6 +38,7 @@ public struct SharedExternalContent: Equatable, Sendable {
     public let document: SharedDocument
 }
 public enum SharedLibraryChange: Sendable {
+    case loading(UUID, SharedEntityIdentity)
     case entity(UUID, SharedEntityIdentity, String)
     case failure(String)
 }
@@ -46,6 +50,7 @@ public actor SharedLibraryCoordinator {
     public nonisolated let root: URL
     public nonisolated let writerID: UUID
     private let bootstrap: LegacyLibraryBootstrap
+    private let versionAccess: RecordingFileVersionAccess
     private let repository: SharedLibraryRepository
     private var manifest: SharedBootstrapManifest?
     private var members: SharedMemberRepository?
@@ -54,9 +59,10 @@ public actor SharedLibraryCoordinator {
     private var monitor: SharedLibraryChangeMonitor?
     private var monitorRefresh: Task<Void, Never>?
     private var listeners: [UUID: AsyncStream<SharedLibraryChange>.Continuation] = [:]
-    public init(root: URL, writerID: UUID) {
+    public init(root: URL, writerID: UUID, versionAccess: RecordingFileVersionAccess = .init()) {
         self.root = root.standardizedFileURL.resolvingSymlinksInPath()
         self.writerID = writerID
+        self.versionAccess = versionAccess
         bootstrap = LegacyLibraryBootstrap(root: root, writerID: writerID)
         repository = SharedLibraryRepository(root: root, writerID: writerID)
     }
@@ -166,6 +172,9 @@ public actor SharedLibraryCoordinator {
     private func beginRead(_ entity: SharedEntityIdentity) -> UInt64 {
         let next = (requests[entity] ?? 0) &+ 1
         requests[entity] = next
+        if let manifest {
+            for listener in listeners.values { listener.yield(.loading(manifest.libraryID, entity)) }
+        }
         return next
     }
     public func read(_ entity: SharedEntityIdentity) async throws -> SharedLibraryViewSnapshot {
@@ -365,6 +374,81 @@ public actor SharedLibraryCoordinator {
         }
         return try SharedStateFingerprint.of(state.value(for: "audioFingerprint") ?? state.value(for: "legacyMetadata"))
     }
+    /// Explicitly accept the reviewed external document. Materialization and
+    /// provider-version cleanup follow a durable operation receipt, not this read.
+    public func adoptExternal(_ candidate: SharedExternalContent, review: SharedLibraryViewSnapshot) async throws
+        -> SharedLibraryViewSnapshot
+    {
+        let manifest = try await bind(force: true)
+        guard candidate.libraryID == manifest.libraryID, review.libraryID == manifest.libraryID,
+            candidate.entity.id == review.state.id, candidate.entity.kind == review.state.kind,
+            candidate.url.resolvingSymlinksInPath().path.hasPrefix(root.path + "/")
+        else {
+            throw SharedLibraryCoordinatorError.differentBinding
+        }
+        let bytes: Data
+        if let versionID = candidate.versionID {
+            let versions = try await versionAccess.versions(at: candidate.url)
+            guard
+                let version = versions.first(where: {
+                    $0.id == versionID && $0.isConflict && !$0.isResolved
+                        && $0.sourceURL.standardizedFileURL == candidate.url.standardizedFileURL
+                })
+            else {
+                throw SharedLibraryCoordinatorError.externalChanged
+            }
+            bytes = try await versionAccess.read(version)
+        } else {
+            bytes = try await CoordinatedFileAccess().read(at: candidate.url)
+        }
+        guard try SharedStateFingerprint.of(bytes) == candidate.fingerprint else {
+            throw SharedLibraryCoordinatorError.externalChanged
+        }
+        let fresh = try await read(candidate.entity)
+        let marker = "externalAdoption." + candidate.component.rawValue
+        if fresh.state.value(for: marker) == .text(candidate.fingerprint),
+            fresh.state.currentDocument(for: candidate.component)?.json == candidate.document.json
+        {
+            return fresh
+        }
+        // A fresh generation prevents adoption replay from carrying edits from
+        // an earlier occurrence of these same bytes into unrelated new content.
+        let document = try SharedDocument(id: UUID(), json: candidate.document.json)
+        return try await resolve(
+            .init(
+                base: review,
+                changes: [
+                    .generation(document, component: candidate.component),
+                    .assign(field: marker, value: .text(candidate.fingerprint)),
+                ]))
+    }
+
+    public func inspectExternalVersions(_ entity: SharedEntityIdentity, component: SharedComponent, at url: URL)
+        async throws -> [SharedExternalContent]
+    {
+        guard url.resolvingSymlinksInPath().path.hasPrefix(root.path + "/") else {
+            throw SharedLibraryRepositoryError.invalidPath
+        }
+        let snapshot = try await read(entity)
+        let versions = try await versionAccess.versions(at: url)
+        var result: [SharedExternalContent] = []
+        for version in versions where version.isConflict && !version.isResolved {
+            guard version.sourceURL.standardizedFileURL == url.standardizedFileURL else {
+                throw SharedLibraryRepositoryError.invalidPath
+            }
+            let bytes = try await versionAccess.read(version)
+            let fingerprint = try SharedStateFingerprint.of(bytes)
+            let id = try SharedLibraryIdentity.legacy(
+                relativePath: "version-\(entity.id.uuidString)-\(component.rawValue)-\(version.id)-\(fingerprint).json")
+            let document = try SharedDocument(id: id, json: bytes)
+            result.append(
+                .init(
+                    libraryID: snapshot.libraryID, versionID: version.id, id: id, entity: entity,
+                    component: component, url: url, fingerprint: fingerprint, document: document))
+        }
+        return result
+    }
+
     public func inspectExternal(_ entity: SharedEntityIdentity, component: SharedComponent, at url: URL) async throws
         -> SharedExternalContent?
     {
@@ -379,6 +463,7 @@ public actor SharedLibraryCoordinator {
         let document = try SharedDocument(id: id, json: bytes)
         if snapshot.state.currentDocument(for: component)?.json == document.json { return nil }
         return .init(
-            id: id, entity: entity, component: component, url: url, fingerprint: fingerprint, document: document)
+            libraryID: snapshot.libraryID, versionID: nil, id: id, entity: entity, component: component, url: url,
+            fingerprint: fingerprint, document: document)
     }
 }

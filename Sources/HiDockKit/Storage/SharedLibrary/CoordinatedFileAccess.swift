@@ -26,8 +26,10 @@ public struct CoordinatedFileAccess: Sendable {
         let queue = OperationQueue()
 
         init(url: URL, writing: Bool) {
-            intent = writing ? .writingIntent(with: url, options: .forMerging)
-                             : .readingIntent(with: url, options: [])
+            intent =
+                writing
+                ? .writingIntent(with: url, options: .forMerging)
+                : .readingIntent(with: url, options: [])
             queue.maxConcurrentOperationCount = 1
             queue.qualityOfService = .userInitiated
         }
@@ -52,16 +54,31 @@ public struct CoordinatedFileAccess: Sendable {
         return bytes
     }
 
+    /// Read a provider-owned promised/version URL through coordination directly.
+    /// Its bytes need not exist locally before the provider grants this access.
+    public func withRead<Output: Sendable>(
+        at url: URL,
+        accessor: @escaping @Sendable (Scope) throws -> Output
+    ) async throws -> Output {
+        let result = try await perform(at: url, writing: false, accessor: accessor)
+        try Task.checkCancellation()
+        return result
+    }
+
     /// Check cancellation before committing a write. After its atomic commit
     /// point, return the accepted result even if cancellation raced with it;
     /// reporting a rollback that never happened would corrupt the caller's state.
-    public func withWrite<Output: Sendable>(at url: URL,
-        accessor: @escaping @Sendable (Scope) throws -> Output) async throws -> Output {
+    public func withWrite<Output: Sendable>(
+        at url: URL,
+        accessor: @escaping @Sendable (Scope) throws -> Output
+    ) async throws -> Output {
         try await perform(at: url, writing: true, accessor: accessor)
     }
 
-    private func perform<Output: Sendable>(at url: URL, writing: Bool,
-        accessor: @escaping @Sendable (Scope) throws -> Output) async throws -> Output {
+    private func perform<Output: Sendable>(
+        at url: URL, writing: Bool,
+        accessor: @escaping @Sendable (Scope) throws -> Output
+    ) async throws -> Output {
         try Task.checkCancellation()
         let request = Request(url: url, writing: writing)
         return try await withTaskCancellationHandler {
@@ -70,8 +87,9 @@ public struct CoordinatedFileAccess: Sendable {
                 request.coordinator.coordinate(with: [request.intent], queue: request.queue) { error in
                     if let error {
                         let cocoa = error as NSError
-                        if request.cancellation.isCancelled ||
-                            (cocoa.domain == NSCocoaErrorDomain && cocoa.code == NSUserCancelledError) {
+                        if request.cancellation.isCancelled
+                            || (cocoa.domain == NSCocoaErrorDomain && cocoa.code == NSUserCancelledError)
+                        {
                             continuation.resume(throwing: CancellationError())
                         } else {
                             continuation.resume(throwing: error)
