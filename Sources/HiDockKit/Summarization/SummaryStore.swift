@@ -8,12 +8,15 @@ import Foundation
 public actor SummaryStore {
     private let baseDirectory: URL
     private let fileAccess: RecordingFileAccess
+    private let shared: SharedSidecarAdapter?
     private var revisions: [String: Int] = [:]
     private var cache: [String: Summary] = [:]  // keyed by MP3 filename
 
-    public init(baseDirectory: URL, fileAccess: RecordingFileAccess = RecordingFileAccess()) {
+    public init(baseDirectory: URL, fileAccess: RecordingFileAccess = RecordingFileAccess(),
+                shared: SharedSidecarAdapter? = nil) {
         self.baseDirectory = baseDirectory
         self.fileAccess = fileAccess
+        self.shared = shared
     }
 
     /// Set of MP3 filenames that have summary files on disk.
@@ -37,7 +40,16 @@ public actor SummaryStore {
     }
 
     /// Save a summary, keyed by MP3 filename.
-    public func save(_ summary: Summary, mp3Filename: String) throws {
+    public func save(_ summary: Summary, mp3Filename: String) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            revisions[mp3Filename, default: 0] += 1
+            try await shared.save(summary, filename: mp3Filename)
+            revisions[mp3Filename, default: 0] += 1
+            cache[mp3Filename] = try await shared.summary(for: mp3Filename)
+            knownFiles.insert(mp3Filename)
+            return
+        }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let url = fileURL(for: mp3Filename)
         let encoder = JSONEncoder()
@@ -60,11 +72,18 @@ public actor SummaryStore {
     public func loadSummary(for mp3Filename: String,
                                onWaiting: @Sendable () async -> Void = {}) async throws -> Summary? {
         let revision = revisions[mp3Filename, default: 0]
-        let loaded = try await loadFromDisk(mp3Filename: mp3Filename,
+        let loaded: Summary?
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            loaded = try await shared.summary(for: mp3Filename)
+        } else {
+            loaded = try await loadFromDisk(mp3Filename: mp3Filename,
                                             knownToExist: knownFiles.contains(mp3Filename), onWaiting: onWaiting)
+        }
         try Task.checkCancellation()
         guard revisions[mp3Filename, default: 0] == revision else { return cache[mp3Filename] }
-        if let loaded { cache[mp3Filename] = loaded }
+        cache[mp3Filename] = loaded
+        if loaded != nil { knownFiles.insert(mp3Filename) } else { knownFiles.remove(mp3Filename) }
         return loaded
     }
 
@@ -75,6 +94,14 @@ public actor SummaryStore {
 
     /// Toggle an action item's completion state and persist.
     public func toggleItem(_ itemID: UUID, inSummaryFor mp3Filename: String) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            revisions[mp3Filename, default: 0] += 1
+            try await shared.toggleItem(itemID, filename: mp3Filename)
+            cache[mp3Filename] = try await shared.summary(for: mp3Filename)
+            revisions[mp3Filename, default: 0] += 1
+            return
+        }
         guard let base = cache[mp3Filename],
               let item = base.sections.flatMap({ $0.items ?? [] }).first(where: { $0.id == itemID }) else {
             throw HiDockError.storageError("Reload this summary before editing.")
@@ -158,7 +185,7 @@ public actor SummaryStore {
             customPrompt: oldSummary.customPrompt,
             sections: oldSummary.sections
         )
-        try save(updated, mp3Filename: newMp3)
+        try await save(updated, mp3Filename: newMp3)
         if oldMp3 != newMp3 {
             revisions[oldMp3, default: 0] += 1
             cache.removeValue(forKey: oldMp3)

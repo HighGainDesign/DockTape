@@ -8,14 +8,17 @@ import Foundation
 public actor TranscriptStore {
     private let baseDirectory: URL
     private let fileAccess: RecordingFileAccess
+    private let shared: SharedSidecarAdapter?
     private var revisions: [String: Int] = [:]
     private var cache: [String: Transcript] = [:]  // keyed by MP3 filename
     private var dirtyTxtFiles: Set<String> = []
     private var txtFlushTask: Task<Void, Never>?
 
-    public init(baseDirectory: URL, fileAccess: RecordingFileAccess = RecordingFileAccess()) {
+    public init(baseDirectory: URL, fileAccess: RecordingFileAccess = RecordingFileAccess(),
+                shared: SharedSidecarAdapter? = nil) {
         self.baseDirectory = baseDirectory
         self.fileAccess = fileAccess
+        self.shared = shared
     }
 
     /// Set of MP3 filenames that have transcript files on disk.
@@ -39,7 +42,16 @@ public actor TranscriptStore {
     }
 
     /// Save a transcript, keyed by MP3 filename.
-    public func save(_ transcript: Transcript, mp3Filename: String) throws {
+    public func save(_ transcript: Transcript, mp3Filename: String) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            revisions[mp3Filename, default: 0] += 1
+            try await shared.save(transcript, filename: mp3Filename)
+            revisions[mp3Filename, default: 0] += 1
+            cache[mp3Filename] = try await shared.transcript(for: mp3Filename)
+            knownFiles.insert(mp3Filename)
+            return
+        }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let url = fileURL(for: mp3Filename)
         let encoder = JSONEncoder()
@@ -61,11 +73,18 @@ public actor TranscriptStore {
     public func loadTranscript(for mp3Filename: String,
                                onWaiting: @Sendable () async -> Void = {}) async throws -> Transcript? {
         let revision = revisions[mp3Filename, default: 0]
-        let loaded = try await loadFromDisk(mp3Filename: mp3Filename,
+        let loaded: Transcript?
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            loaded = try await shared.transcript(for: mp3Filename)
+        } else {
+            loaded = try await loadFromDisk(mp3Filename: mp3Filename,
                                             knownToExist: knownFiles.contains(mp3Filename), onWaiting: onWaiting)
+        }
         try Task.checkCancellation()
         guard revisions[mp3Filename, default: 0] == revision else { return cache[mp3Filename] }
-        if let loaded { cache[mp3Filename] = loaded }
+        cache[mp3Filename] = loaded
+        if loaded != nil { knownFiles.insert(mp3Filename) } else { knownFiles.remove(mp3Filename) }
         return loaded
     }
 
@@ -96,6 +115,14 @@ public actor TranscriptStore {
 
     /// Update speaker names in a transcript. JSON is written immediately; TXT regeneration is debounced.
     public func updateSpeakerNames(for mp3Filename: String, names: [String: String]) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            revisions[mp3Filename, default: 0] += 1
+            try await shared.updateSpeakerNames(filename: mp3Filename, names: names)
+            cache[mp3Filename] = try await shared.transcript(for: mp3Filename)
+            revisions[mp3Filename, default: 0] += 1
+            return
+        }
         guard let base = cache[mp3Filename] else { throw HiDockError.storageError("Reload this transcript before editing.") }
         let original = try Self.generationFingerprint(base)
         let beforeNames = base.speakerNames
@@ -116,7 +143,7 @@ public actor TranscriptStore {
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
         let current = try decoder.decode(Transcript.self, from: bytes)
         if revisions[mp3Filename, default: 0] == revision { cache[mp3Filename] = current }
-        markTxtDirty(mp3Filename)
+        if shared == nil { markTxtDirty(mp3Filename) }
     }
 
     private static func generationFingerprint(_ transcript: Transcript) throws -> String {
@@ -127,7 +154,7 @@ public actor TranscriptStore {
     }
 
     /// Merge speaker IDs: reassign all segments from `sourceID` to `targetID`, remove sourceID from names.
-    public func mergeSpeakers(for mp3Filename: String, source sourceID: String, into targetID: String) throws {
+    public func mergeSpeakers(for mp3Filename: String, source sourceID: String, into targetID: String) async throws {
         guard var transcript = cache[mp3Filename] else { return }
         transcript.segments = transcript.segments.map { seg in
             guard seg.speakerID == sourceID else { return seg }
@@ -138,14 +165,14 @@ public actor TranscriptStore {
         }
         // Keep target's name, remove source
         transcript.speakerNames.removeValue(forKey: sourceID)
-        try save(transcript, mp3Filename: mp3Filename)
-        markTxtDirty(mp3Filename)
+        try await save(transcript, mp3Filename: mp3Filename)
+        if shared == nil { markTxtDirty(mp3Filename) }
     }
 
     /// Split a speaker at a specific segment, assigning a new speaker ID.
     /// If `allFollowing` is true, all segments from this one to the end that share the same speaker ID get the new ID.
     /// If `allFollowing` is false, only the specific segment gets the new ID.
-    public func splitSpeaker(for mp3Filename: String, segmentID: UUID, allFollowing: Bool) throws {
+    public func splitSpeaker(for mp3Filename: String, segmentID: UUID, allFollowing: Bool) async throws {
         guard var transcript = cache[mp3Filename] else { return }
         guard let segIndex = transcript.segments.firstIndex(where: { $0.id == segmentID }),
               let oldSID = transcript.segments[segIndex].speakerID else { return }
@@ -186,8 +213,8 @@ public actor TranscriptStore {
             transcript.speakerNames[newSID] = newSID
         }
 
-        try save(transcript, mp3Filename: mp3Filename)
-        markTxtDirty(mp3Filename)
+        try await save(transcript, mp3Filename: mp3Filename)
+        if shared == nil { markTxtDirty(mp3Filename) }
     }
 
     /// Re-key a transcript after a recording rename.
@@ -203,7 +230,7 @@ public actor TranscriptStore {
             hasSpeakerLabels: transcript.hasSpeakerLabels, segments: transcript.segments,
             speakerNames: transcript.speakerNames, language: transcript.language
         )
-        try save(updated, mp3Filename: newMp3)
+        try await save(updated, mp3Filename: newMp3)
         if oldMp3 != newMp3 {
             revisions[oldMp3, default: 0] += 1
             cache.removeValue(forKey: oldMp3)

@@ -202,6 +202,48 @@ public actor SharedLibraryCoordinator {
     return view
   }
 
+  /// Resolve an existing identity, never derive a new ID from an unfamiliar
+  /// filename. Initial-path hits read only that recording and its ancestors,
+  /// so a cold unrelated recording cannot block a resident one.
+  public func recording(at relativePath: String) async throws -> SharedLibraryViewSnapshot {
+    let path = try SharedLibraryIdentity.normalized(relativePath)
+    let manifest = try await bind()
+    if let reference = manifest.references.first(where: { $0.entity.kind == .recording && $0.initialPath == path }) {
+      let view = try await read(reference.entity)
+      guard try await currentPath(view) == path else { throw SharedSidecarError.unknownRecording }
+      return view
+    }
+    var matches: [SharedLibraryViewSnapshot] = []
+    for entity in try await repository.scan() where entity.kind == .recording {
+      let view = try await read(entity)
+      if try await currentPath(view) == path { matches.append(view) }
+    }
+    guard matches.count == 1 else {
+      throw matches.isEmpty ? SharedSidecarError.unknownRecording : SharedSidecarError.ambiguousPath
+    }
+    return matches[0]
+  }
+  private func currentPath(_ view: SharedLibraryViewSnapshot) async throws -> String {
+    guard case .text(let title)? = view.state.value(for: "title"), !title.contains("/") else {
+      throw SharedSidecarError.ambiguousPath
+    }
+    var parts = [title + ".mp3"]
+    var parent = view.state.value(for: "folder")
+    var visited: Set<UUID> = [view.state.id]
+    while let value = parent {
+      guard case .text(let text) = value, let id = UUID(uuidString: text), visited.insert(id).inserted else {
+        throw SharedSidecarError.ambiguousPath
+      }
+      let folder = try await read(.init(id: id, kind: .folder)).state
+      guard folder.lifecycle == .alive, case .text(let name)? = folder.value(for: "name"), !name.contains("/") else {
+        throw SharedSidecarError.ambiguousPath
+      }
+      parts.insert(name, at: 0)
+      parent = folder.value(for: "parent")
+    }
+    return try SharedLibraryIdentity.normalized(parts.joined(separator: "/"))
+  }
+
   public func refresh() async throws {
     let manifest = try await bind(force: true)
     let members = try memberRepository()
