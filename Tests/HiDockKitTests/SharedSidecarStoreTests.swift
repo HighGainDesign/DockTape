@@ -190,4 +190,35 @@ final class SharedSidecarStoreTests: XCTestCase {
         } catch SharedLibraryCoordinatorError.differentBinding {}
     }
 
+    func testCommittedSpeakerEditSurvivesCancellationWithoutReportingRollback() async throws {
+        let (root, original) = try await fixture()
+        let cancelled = SharedLibraryCoordinator(root: root, writerID: original.writerID,
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let store = TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: cancelled))
+        _ = try await store.loadTranscript(for: "Meeting.mp3")
+        let work = Task { try await store.updateSpeakerNames(for: "Meeting.mp3", names: ["A": "Accepted", "B": "Bob"]) }
+        do { try await work.value }
+        catch { XCTFail("Committed speaker edit must return its accepted result: \(error)") }
+        let reopened = TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: original))
+        let result = try await reopened.loadTranscript(for: "Meeting.mp3")
+        XCTAssertEqual(result?.speakerNames["A"], "Accepted")
+    }
+    func testCommittedSummaryEditSurvivesCancellationWithoutReportingRollback() async throws {
+        let (root, original) = try await fixture()
+        let item = Summary.Item(text: "Task")
+        let summary = Summary(recordingFilename: "Meeting.mp3", model: "fixture", provider: "fixture", templateUsed: "fixture",
+                              sections: [.init(heading: "Tasks", content: "", items: [item])])
+        try await SummaryStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: original)).save(summary, mp3Filename: "Meeting.mp3")
+        let cancelled = SharedLibraryCoordinator(root: root, writerID: original.writerID,
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let store = SummaryStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: cancelled))
+        _ = try await store.loadSummary(for: "Meeting.mp3")
+        let work = Task { try await store.toggleItem(item.id, inSummaryFor: "Meeting.mp3") }
+        do { try await work.value }
+        catch { XCTFail("Committed checkbox edit must return its accepted result: \(error)") }
+        let reopened = SummaryStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: original))
+        let result = try await reopened.loadSummary(for: "Meeting.mp3")
+        XCTAssertTrue(result?.sections.first?.items?.first?.isCompleted == true)
+    }
+
 }

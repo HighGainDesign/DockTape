@@ -36,7 +36,8 @@ public actor SharedSidecarAdapter {
         if readRequests[filename] == request { displayed[Key(entity: view.state.id, component: .summary)] = view }
         return result
     }
-    public func save(_ transcript: Transcript, filename: String) async throws {
+    public func save(_ transcript: Transcript, filename: String) async throws -> Transcript {
+        readRequests[filename] = UUID()
         guard transcript.recordingFilename == filename else { throw SharedSidecarError.invalidContent }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         let fresh = try await coordinator.recording(at: filename)
@@ -51,8 +52,11 @@ public actor SharedSidecarAdapter {
         let document = try SharedDocument(id: UUID(), json: encoder.encode(transcript))
         let result = try await coordinator.edit(.init(base: base, changes: [.generation(document, component: .transcript)]))
         displayed[Key(entity: fresh.state.id, component: .transcript)] = result
+        guard let accepted = try Self.transcript(result, filename: filename) else { throw SharedSidecarError.invalidContent }
+        return accepted
     }
-    public func save(_ summary: Summary, filename: String) async throws {
+    public func save(_ summary: Summary, filename: String) async throws -> Summary {
+        readRequests[filename] = UUID()
         guard summary.recordingFilename == filename else { throw SharedSidecarError.invalidContent }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         let fresh = try await coordinator.recording(at: filename)
@@ -67,8 +71,11 @@ public actor SharedSidecarAdapter {
         let document = try SharedDocument(id: UUID(), json: encoder.encode(summary))
         let result = try await coordinator.edit(.init(base: base, changes: [.generation(document, component: .summary)]))
         displayed[Key(entity: fresh.state.id, component: .summary)] = result
+        guard let accepted = try Self.summary(result, filename: filename) else { throw SharedSidecarError.invalidContent }
+        return accepted
     }
-    public func updateSpeakerNames(filename: String, names: [String: String]) async throws {
+    public func updateSpeakerNames(filename: String, names: [String: String]) async throws -> Transcript? {
+        readRequests[filename] = UUID()
         let fresh = try await coordinator.recording(at: filename)
         let key = Key(entity: fresh.state.id, component: .transcript)
         guard let base = displayed[key], let generation = base.state.currentDocument(for: .transcript),
@@ -84,10 +91,13 @@ public actor SharedSidecarAdapter {
                 guard base.state.fields[field]?.isConflicted != true else { throw SharedSidecarError.conflictedContent }
             }
         }
-        if changes.isEmpty { return }
-        displayed[key] = try await coordinator.edit(.init(base: base, changes: changes))
+        if changes.isEmpty { return try Self.transcript(fresh, filename: filename) }
+        let accepted = try await coordinator.edit(.init(base: base, changes: changes))
+        displayed[key] = accepted
+        return try Self.transcript(accepted, filename: filename)
     }
-    public func toggleItem(_ item: UUID, filename: String) async throws {
+    public func toggleItem(_ item: UUID, filename: String) async throws -> Summary? {
+        readRequests[filename] = UUID()
         let fresh = try await coordinator.recording(at: filename)
         let key = Key(entity: fresh.state.id, component: .summary)
         guard let base = displayed[key], let generation = base.state.currentDocument(for: .summary),
@@ -96,10 +106,12 @@ public actor SharedSidecarAdapter {
         else { throw SharedSidecarError.reloadRequired }
         let field = "summary.edits.\(generation.id.uuidString.lowercased()).\(item.uuidString.lowercased())"
         guard base.state.fields[field]?.isConflicted != true else { throw SharedSidecarError.conflictedContent }
-        displayed[key] = try await coordinator.edit(.init(base: base, changes: [
+        let accepted = try await coordinator.edit(.init(base: base, changes: [
             .generationEdit(component: .summary, generation: generation.id,
                             key: item.uuidString.lowercased(), value: .flag(!before.isCompleted))
         ]))
+        displayed[key] = accepted
+        return try Self.summary(accepted, filename: filename)
     }
     private static func content(_ view: SharedLibraryViewSnapshot, component: SharedComponent) throws -> SharedEntityState? {
         guard view.state.lifecycle == .alive else { throw SharedSidecarError.conflictedContent }

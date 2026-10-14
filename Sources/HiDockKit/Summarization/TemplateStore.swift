@@ -12,11 +12,13 @@ public actor TemplateStore {
     private var builtInOverrides: [String: Template] = [:]
     private var userTemplates: [Template] = []
     private let baseDirectory: URL
+    private let shared: SharedTemplateAdapter?
 
     // MARK: - Init
 
-    public init(baseDirectory: URL) {
+    public init(baseDirectory: URL, shared: SharedTemplateAdapter? = nil) {
         self.baseDirectory = baseDirectory
+        self.shared = shared
     }
 
     // MARK: - Built-in defaults
@@ -154,15 +156,36 @@ public actor TemplateStore {
 
     /// Add a new user-created template without replacing another store's additions.
     public func addUserTemplate(_ template: Template) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            persistenceTicket += 1
+            let accepted = try await shared.save(template, before: nil, adding: true)
+            cacheAccepted(accepted)
+            return
+        }
         try await mutateTemplate(template, adding: true)
     }
 
     /// Updates only changed editable fields against freshly coordinated JSON.
     public func update(_ template: Template) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            persistenceTicket += 1
+            let accepted = try await shared.save(template, before: self.template(forID: template.id), adding: false)
+            cacheAccepted(accepted)
+            return
+        }
         try await mutateTemplate(template, adding: false)
     }
 
     public func delete(id: String) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            persistenceTicket += 1
+            try await shared.delete(id: id)
+            userTemplates.removeAll { $0.id == id }
+            return
+        }
         guard !Self.builtInDefaults.contains(where: { $0.id == id }) else { return }
         try await mutateStored { object in
             var values = object["userTemplates"] as! [[String: Any]]
@@ -172,12 +195,25 @@ public actor TemplateStore {
     }
 
     public func resetToDefault(id: String) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            persistenceTicket += 1
+            if let accepted = try await shared.reset(id: id) { cacheAccepted(accepted) }
+            return
+        }
         guard Self.builtInDefaults.contains(where: { $0.id == id }) else { return }
         try await mutateStored { object in
             var values = object["builtInOverrides"] as! [[String: Any]]
             values.removeAll { $0["id"] as? String == id }
             object["builtInOverrides"] = values
         }
+    }
+
+    private func cacheAccepted(_ template: Template) {
+        persistenceTicket += 1
+        if template.isBuiltIn { builtInOverrides[template.id] = template }
+        else if let index = userTemplates.firstIndex(where: { $0.id == template.id }) { userTemplates[index] = template }
+        else { userTemplates.append(template) }
     }
 
     private func mutateTemplate(_ template: Template, adding: Bool) async throws {
@@ -210,6 +246,16 @@ public actor TemplateStore {
     private var storeURL: URL { baseDirectory.appendingPathComponent(".templates.json") }
 
     public func load() async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            persistenceTicket += 1; let ticket = persistenceTicket
+            let values = try await shared.load()
+            if persistenceTicket == ticket {
+                builtInOverrides = Dictionary(uniqueKeysWithValues: values.filter(\.isBuiltIn).map { ($0.id, $0) })
+                userTemplates = values.filter { !$0.isBuiltIn }
+            }
+            return
+        }
         persistenceTicket += 1; let ticket = persistenceTicket
         let bytes = try await RecordingFileAccess().readDataIfPresent(at: storeURL)
         let stored = try bytes.map { try JSONDecoder().decode(StoredTemplates.self, from: $0) }

@@ -55,6 +55,7 @@ public actor SharedLibraryCoordinator {
   private let versionAccess: RecordingFileVersionAccess
   private let repository: SharedLibraryRepository
   private let witnessDirectory: URL?
+  private let afterCommit: @Sendable () async -> Void
   private var manifest: SharedBootstrapManifest?
   private var members: SharedMemberRepository?
   private var gate: SharedLibraryLocalGate?
@@ -81,12 +82,13 @@ public actor SharedLibraryCoordinator {
   private var listeners: [UUID: AsyncStream<SharedLibraryChange>.Continuation] = [:]
   public init(
     root: URL, writerID: UUID, versionAccess: RecordingFileVersionAccess = .init(),
-    witnessDirectory: URL? = nil
+    witnessDirectory: URL? = nil, afterCommit: @escaping @Sendable () async -> Void = {}
   ) {
     self.root = root.standardizedFileURL.resolvingSymlinksInPath()
     self.writerID = writerID
     self.versionAccess = versionAccess
     self.witnessDirectory = witnessDirectory
+    self.afterCommit = afterCommit
     bootstrap = LegacyLibraryBootstrap(
       root: root, writerID: writerID, witnessDirectory: witnessDirectory)
     repository = SharedLibraryRepository(root: root, writerID: writerID)
@@ -226,6 +228,17 @@ public actor SharedLibraryCoordinator {
     let view = SharedLibraryViewSnapshot(libraryID: manifest.libraryID, repository: snapshot)
     publish(view, entity: entity, request: request)
     return view
+  }
+
+  public func snapshots(kinds: Set<SharedEntityKind>) async throws -> [SharedLibraryViewSnapshot] {
+    _ = try await bind(force: true)
+    let entities = try await repository.scan().filter { kinds.contains($0.kind) }
+    return try await withThrowingTaskGroup(of: SharedLibraryViewSnapshot.self) { group in
+      for entity in entities { group.addTask { try await self.read(entity) } }
+      var result: [SharedLibraryViewSnapshot] = []
+      for try await view in group { result.append(view) }
+      return result.sorted { ($0.state.kind.rawValue, $0.state.id.uuidString) < ($1.state.kind.rawValue, $1.state.id.uuidString) }
+    }
   }
 
   /// Resolve an existing identity, never derive a new ID from an unfamiliar
@@ -507,10 +520,14 @@ public actor SharedLibraryCoordinator {
         throw SharedLibraryCoordinatorError.staleReview
       }
     }
-    _ = try await repository.commit(.init(base: fresh, changes: edit.changes))
-    // A remote write can arrive after preflight. Its unseen dot survives the
-    // commit and appears here as a conflict; no distributed lock is claimed.
-    return try await read(entity)
+    let accepted = try await repository.commit(.init(base: fresh, changes: edit.changes))
+    let view = SharedLibraryViewSnapshot(libraryID: manifest.libraryID, repository: accepted)
+    publish(view, entity: entity, request: beginRead(entity))
+    await afterCommit()
+    // Return the accepted write even if cancellation or a later read failure
+    // crosses this boundary. Refresh joins any subsequently arriving peer dots;
+    // a failed read cannot retroactively turn this commit into a rollback.
+    return view
   }
   private static func reviewMatches(
     _ before: SharedEntityState, _ after: SharedEntityState, change: SharedLibraryMutation,

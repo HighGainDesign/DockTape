@@ -46,9 +46,9 @@ public actor TranscriptStore {
         if let shared {
             try shared.requireRoot(baseDirectory)
             revisions[mp3Filename, default: 0] += 1
-            try await shared.save(transcript, filename: mp3Filename)
+            let accepted = try await shared.save(transcript, filename: mp3Filename)
             revisions[mp3Filename, default: 0] += 1
-            cache[mp3Filename] = try await shared.transcript(for: mp3Filename)
+            cache[mp3Filename] = accepted
             knownFiles.insert(mp3Filename)
             return
         }
@@ -118,8 +118,7 @@ public actor TranscriptStore {
         if let shared {
             try shared.requireRoot(baseDirectory)
             revisions[mp3Filename, default: 0] += 1
-            try await shared.updateSpeakerNames(filename: mp3Filename, names: names)
-            cache[mp3Filename] = try await shared.transcript(for: mp3Filename)
+            cache[mp3Filename] = try await shared.updateSpeakerNames(filename: mp3Filename, names: names)
             revisions[mp3Filename, default: 0] += 1
             return
         }

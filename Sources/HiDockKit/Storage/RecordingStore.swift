@@ -9,11 +9,14 @@ public actor RecordingStore {
     public nonisolated let baseDirectory: URL
     private let fileAccess: RecordingFileAccess
     private let metadataFileAccess: RecordingFileAccess
+    private let shared: SharedRecordingMetadataAdapter?
 
     public init(baseDirectory: URL? = nil, fileAccess: RecordingFileAccess = RecordingFileAccess(),
-                metadataFileAccess: RecordingFileAccess = RecordingFileAccess()) {
+                metadataFileAccess: RecordingFileAccess = RecordingFileAccess(),
+                shared: SharedRecordingMetadataAdapter? = nil) {
         self.fileAccess = fileAccess
         self.metadataFileAccess = metadataFileAccess
+        self.shared = shared
         if let dir = baseDirectory {
             self.baseDirectory = dir
         } else {
@@ -24,6 +27,7 @@ public actor RecordingStore {
 
     /// Ensure the storage directory exists and load persisted metadata.
     public func setup() async throws {
+        try shared?.requireRoot(baseDirectory)
         try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
         try await loadLibraryMeta()
     }
@@ -495,6 +499,13 @@ public actor RecordingStore {
 
     /// Load library.json from disk. Also migrates modes.json if present.
     public func loadLibraryMeta() async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            metadataTicket += 1; let ticket = metadataTicket
+            let loaded = try await shared.load()
+            if metadataTicket == ticket { meta = loaded; metaBaseline = loaded }
+            return
+        }
         let url = baseDirectory.appendingPathComponent("library.json")
         metadataTicket += 1
         let ticket = metadataTicket
@@ -517,6 +528,22 @@ public actor RecordingStore {
     /// Only changed fields/paths enter the coordinated read-modify-write. Raw
     /// unknown fields and unrelated edits from another local store stay intact.
     private func saveLibraryMeta() async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            metadataTicket += 1
+            let changes = Set(meta.keys).union(metaBaseline.keys).sorted().filter { meta[$0] != metaBaseline[$0] }
+            do {
+                for key in changes {
+                    guard let desired = meta[key] else { throw SharedSidecarError.invalidContent }
+                    let accepted = try await shared.save(filename: key, before: metaBaseline[key], after: desired)
+                    meta[key] = accepted; metaBaseline[key] = accepted
+                }
+            } catch {
+                meta = metaBaseline
+                throw error
+            }
+            return
+        }
         struct Change: Sendable { let key: String; let before: Data?; let after: Data? }
         let encoder = JSONEncoder()
         let changes = try Set(meta.keys).union(metaBaseline.keys).sorted().compactMap { key -> Change? in
@@ -593,6 +620,7 @@ public actor RecordingStore {
 
     /// Update library.json when a recording is renamed.
     public func renameMeta(from oldFilename: String, to newFilename: String) async throws {
+        guard shared == nil else { throw SharedSidecarError.invalidContent }
         let oldKey = metadataKey(for: oldFilename)
         let newKey = try SharedLibraryIdentity.normalized(newFilename)
         if let m = meta.removeValue(forKey: oldKey) {
@@ -603,6 +631,7 @@ public actor RecordingStore {
 
     /// Remove a metadata entry when a recording is deleted.
     public func removeMeta(for filename: String) async throws {
+        guard shared == nil else { throw SharedSidecarError.invalidContent }
         let key = metadataKey(for: filename)
         meta.removeValue(forKey: key)
         try await saveLibraryMeta()

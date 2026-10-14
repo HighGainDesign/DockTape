@@ -44,9 +44,9 @@ public actor SummaryStore {
         if let shared {
             try shared.requireRoot(baseDirectory)
             revisions[mp3Filename, default: 0] += 1
-            try await shared.save(summary, filename: mp3Filename)
+            let accepted = try await shared.save(summary, filename: mp3Filename)
             revisions[mp3Filename, default: 0] += 1
-            cache[mp3Filename] = try await shared.summary(for: mp3Filename)
+            cache[mp3Filename] = accepted
             knownFiles.insert(mp3Filename)
             return
         }
@@ -97,8 +97,7 @@ public actor SummaryStore {
         if let shared {
             try shared.requireRoot(baseDirectory)
             revisions[mp3Filename, default: 0] += 1
-            try await shared.toggleItem(itemID, filename: mp3Filename)
-            cache[mp3Filename] = try await shared.summary(for: mp3Filename)
+            cache[mp3Filename] = try await shared.toggleItem(itemID, filename: mp3Filename)
             revisions[mp3Filename, default: 0] += 1
             return
         }
