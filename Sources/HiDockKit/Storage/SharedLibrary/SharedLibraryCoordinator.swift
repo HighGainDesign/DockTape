@@ -835,7 +835,7 @@ public actor SharedLibraryCoordinator {
     guard actual == expected, index.resolvedPaths[id] == request.path else { return .init(id: id, name: request.path, result: .needsReplanning, projectionError: nil) }
     if view.state.lifecycle == .deleted {
       let permission = try await operationAuthority(entity: rootEntity, paths: [request.path])
-      if try await acknowledgedFolderRemovalIsPresent(path: request.path, permission: permission) {
+      if try await acknowledgedRemovalIsPresent(paths: [request.path], permission: permission) {
         return .init(id: id, name: request.path, result: .complete, projectionError: nil)
       }
     }
@@ -859,6 +859,10 @@ public actor SharedLibraryCoordinator {
         }
       } else {
         if current.state.lifecycle == .deleted && !FileManager.default.fileExists(atPath: root.appendingPathComponent(member.path).path) {
+          let stem = String(member.path.dropLast(4))
+          let paths = [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"].map { stem + $0 }
+          let permission = try await operationAuthority(entity: entity, paths: paths)
+          if try await acknowledgedRemovalIsPresent(paths: paths, permission: permission) { continue }
           return .init(id: id, name: request.path, result: .waitingForFile(member.path), projectionError: nil)
         }
         let result = try await deleteSharedRecording(filename: member.path)
@@ -874,9 +878,9 @@ public actor SharedLibraryCoordinator {
     return try await removeDeletedEmptyFolder(id: id, path: request.path)
   }
   /// A mirrored deletion is complete only with exact cohort permission and
-  /// coordinated absence of both the directory and any iCloud placeholder.
+  /// coordinated absence of every owned path and any iCloud placeholders.
   /// This does not claim that this Mac moved the original files to Trash.
-  private func acknowledgedFolderRemovalIsPresent(path: String, permission: SharedMaterializationAuthority) async throws -> Bool {
+  private func acknowledgedRemovalIsPresent(paths: [String], permission: SharedMaterializationAuthority) async throws -> Bool {
     guard permission.mayDestroy(.delete), let gate else { return false }
     let bindings = permission.additionalBindings + (permission.binding.map { [$0] } ?? [])
     for binding in bindings { _ = try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) }
@@ -893,9 +897,11 @@ public actor SharedLibraryCoordinator {
               try binding.validate(Data(contentsOf: scope.url)) else { return false }
       }
       try scopes[0].checkCancellation()
-      let target = directory.appendingPathComponent(path)
-      let placeholder = target.deletingLastPathComponent().appendingPathComponent("." + target.lastPathComponent + ".icloud")
-      return !FileManager.default.fileExists(atPath: target.path) && !FileManager.default.fileExists(atPath: placeholder.path)
+      return paths.allSatisfy { path in
+        let target = directory.appendingPathComponent(path)
+        let placeholder = target.deletingLastPathComponent().appendingPathComponent("." + target.lastPathComponent + ".icloud")
+        return !FileManager.default.fileExists(atPath: target.path) && !FileManager.default.fileExists(atPath: placeholder.path)
+      }
     }
   }
 

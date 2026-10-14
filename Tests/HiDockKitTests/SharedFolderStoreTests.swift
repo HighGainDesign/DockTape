@@ -208,7 +208,11 @@ final class SharedFolderStoreTests: XCTestCase {
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         let right = parent.appendingPathComponent("library")
         try FileManager.default.copyItem(at: left, to: right)
-        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"), trash: { url in
+            let recycled = parent.appendingPathComponent("recycled")
+            try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: url, to: recycled.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent))
+        })
         try await b.requestEnrollment(requestID: UUID(), label: "Fixture B")
         try deliver(right, to: left, writer: b.writerID); try await a.refresh()
         try deliver(left, to: right, writer: a.writerID); try await b.refresh()
@@ -231,15 +235,42 @@ final class SharedFolderStoreTests: XCTestCase {
             }
             try deliver(right, to: left, writer: b.writerID)
             outcome = try await a.resumeFolderDeletion(id: pending.id)
+            if !FileManager.default.fileExists(atPath: left.appendingPathComponent("Folder/A.mp3").path),
+               FileManager.default.fileExists(atPath: right.appendingPathComponent("Folder/A.mp3").path),
+               outcome.result != .complete {
+                // Apply only A's completed child removal to the disposable
+                // replica while the parent request is still pending.
+                try deliver(left, to: right, writer: a.writerID)
+                try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+                for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+                    let file = right.appendingPathComponent("Folder/A" + suffix)
+                    if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+                }
+                let leftover = right.appendingPathComponent("Folder/A.summary.md")
+                try Data("provider has not removed this sidecar".utf8).write(to: leftover)
+                let incomplete = try await b.resumeFolderDeletion(id: pending.id)
+                XCTAssertEqual(incomplete.result, .waitingForFile("Folder/A.mp3"), "A remaining sidecar is not a completed removal")
+                XCTAssertEqual(try Data(contentsOf: leftover), Data("provider has not removed this sidecar".utf8))
+                try FileManager.default.removeItem(at: leftover)
+                let placeholder = right.appendingPathComponent("Folder/.A.mp3.icloud")
+                try Data().write(to: placeholder)
+                let cold = try await b.resumeFolderDeletion(id: pending.id)
+                XCTAssertEqual(cold.result, .waitingForFile("Folder/A.mp3"), "An online-only placeholder is not a completed removal")
+                try FileManager.default.removeItem(at: placeholder)
+                let continued = try await b.resumeFolderDeletion(id: pending.id)
+                XCTAssertNotEqual(continued.result, .waitingForFile("Folder/A.mp3"), "Acknowledged partial removal must not wait for already removed audio")
+            }
             if outcome.result == .complete { break }
         }
         XCTAssertEqual(outcome.result, .complete)
         XCTAssertFalse(FileManager.default.fileExists(atPath: left.appendingPathComponent("Folder").path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: right.appendingPathComponent("Folder/A.mp3").path), "Synthetic delivery has not applied physical provider removal")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: right.appendingPathComponent("Folder/A.mp3").path), "Synthetic delivery applied only the acknowledged first child")
         // Deliver the provider's completed removal to this disposable replica.
         try deliver(left, to: right, writer: a.writerID)
         try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
-        try FileManager.default.removeItem(at: right.appendingPathComponent("Folder"))
+        if FileManager.default.fileExists(atPath: right.appendingPathComponent("Folder").path) {
+            try FileManager.default.removeItem(at: right.appendingPathComponent("Folder"))
+        }
         let mirrored = try await b.resumeFolderDeletion(id: pending.id)
         XCTAssertEqual(mirrored.result, .complete, "A complete acknowledged provider removal does not wait for absent original audio")
     }
