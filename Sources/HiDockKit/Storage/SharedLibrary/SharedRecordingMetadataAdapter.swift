@@ -62,7 +62,10 @@ public actor SharedRecordingMetadataAdapter {
     private static func bytes(_ value: Any) throws -> Data {
         try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed, .sortedKeys, .withoutEscapingSlashes])
     }
-    private static func render(_ view: SharedLibraryViewSnapshot) throws -> RecordingStore.RecordingMeta {
+    static func render(_ view: SharedLibraryViewSnapshot) throws -> RecordingStore.RecordingMeta {
+        try JSONDecoder().decode(RecordingStore.RecordingMeta.self, from: JSONSerialization.data(withJSONObject: renderObject(view), options: [.sortedKeys]))
+    }
+    static func renderObject(_ view: SharedLibraryViewSnapshot) throws -> [String: Any] {
         var object: [String: Any] = [:]
         if case .document(let seed)? = view.state.value(for: "legacyMetadata") {
             guard let original = try JSONSerialization.jsonObject(with: seed.json) as? [String: Any] else {
@@ -80,7 +83,6 @@ public actor SharedRecordingMetadataAdapter {
             default: throw SharedSidecarError.invalidContent
             }
         }
-        return try JSONDecoder().decode(RecordingStore.RecordingMeta.self,
-                                       from: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+        return object
     }
 }

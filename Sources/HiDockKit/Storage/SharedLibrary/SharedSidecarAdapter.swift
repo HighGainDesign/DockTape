@@ -113,7 +113,7 @@ public actor SharedSidecarAdapter {
         displayed[key] = accepted
         return try Self.summary(accepted, filename: filename)
     }
-    private static func content(_ view: SharedLibraryViewSnapshot, component: SharedComponent) throws -> SharedEntityState? {
+    static func content(_ view: SharedLibraryViewSnapshot, component: SharedComponent) throws -> SharedEntityState? {
         guard view.state.lifecycle == .alive else { throw SharedSidecarError.conflictedContent }
         if view.state.currentDocument(for: component) != nil { return view.state }
         if view.state.generationValues(for: component).isEmpty { return nil }
@@ -134,7 +134,7 @@ public actor SharedSidecarAdapter {
         }
         return result
     }
-    private static func transcript(_ view: SharedLibraryViewSnapshot, filename: String) throws -> Transcript? {
+    static func transcript(_ view: SharedLibraryViewSnapshot, filename: String) throws -> Transcript? {
         guard let state = try content(view, component: .transcript), let document = state.currentDocument(for: .transcript) else { return nil }
         var transcript = try SharedContentCoding.decoder().decode(Transcript.self, from: document.json)
         for (speaker, value) in edits(state, confirmed: view.confirmedState, component: .transcript) {
@@ -148,7 +148,7 @@ public actor SharedSidecarAdapter {
                           transcriptionModel: transcript.transcriptionModel, hasSpeakerLabels: transcript.hasSpeakerLabels,
                           segments: transcript.segments, speakerNames: transcript.speakerNames, language: transcript.language)
     }
-    private static func summary(_ view: SharedLibraryViewSnapshot, filename: String) throws -> Summary? {
+    static func summary(_ view: SharedLibraryViewSnapshot, filename: String) throws -> Summary? {
         guard let state = try content(view, component: .summary), let document = state.currentDocument(for: .summary) else { return nil }
         let summary = try SharedContentCoding.decoder().decode(Summary.self, from: document.json)
         let edits = edits(state, confirmed: view.confirmedState, component: .summary)

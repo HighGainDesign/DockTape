@@ -405,6 +405,33 @@ public actor SharedLibraryCoordinator {
     }
   }
 
+  public func projectOutputs(beforeWrite: @escaping @Sendable () async -> Void = {},
+                             afterOutput: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedProjectionWriteResult {
+    let context = try await projectionContext()
+    return try await SharedLibraryProjectionWriter.project(context, writer: writerID, beforeWrite: beforeWrite, afterOutput: afterOutput)
+  }
+  private func projectionContext() async throws -> SharedLibraryProjectionContext {
+    guard transitions == 0 else { throw SharedProjectionWriteError.stale }
+    let manifest = try await bind(force: true)
+    guard try await mayEdit(), let gate, let directory = witnessDirectory else { throw SharedLibraryCoordinatorError.enrollmentPending }
+    let epoch = authorityEpoch
+    let witness = SharedOwnerWitness(directory: directory, libraryID: manifest.libraryID, writerID: writerID)
+    let checkpoint = try witness.checkpointFingerprint()
+    let before = try await SharedLibraryProjectionWriter.authoritySources(root: root)
+    let views = try await snapshots(kinds: [.recording, .folder, .template])
+    let after = try await SharedLibraryProjectionWriter.authoritySources(root: root)
+    let membership = try await memberRepository().load().membership
+    guard transitions == 0, authorityEpoch == epoch, before == after,
+          try witness.checkpointFingerprint() == checkpoint,
+          membership.pendingWriters.isEmpty, !membership.hasConcurrentEnrollment,
+          views.allSatisfy({ $0.repository.writers.isSubset(of: membership.cohort) }) else { throw SharedProjectionWriteError.stale }
+    let lease = authorityLease ?? SharedMaterializationLease()
+    authorityLease = lease
+    leasedRevisions = Dictionary(uniqueKeysWithValues: views.map { (SharedEntityIdentity(id: $0.state.id, kind: $0.state.kind), $0.fingerprint) })
+    return .init(root: root, manifest: manifest, views: views, sources: after, gate: gate, lease: lease,
+                 validate: { try witness.checkpointFingerprint() == checkpoint }, membership: membership)
+  }
+
   public func makeMaterializer(
     entity: SharedEntityIdentity, paths: [String], receipts: URL,
     afterMutation: @escaping @Sendable (Int) throws -> Void = { _ in }

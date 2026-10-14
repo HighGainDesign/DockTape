@@ -114,7 +114,9 @@ public actor LegacyLibraryBootstrap {
 
   public func enable() async throws -> SharedBootstrapManifest {
     guard try await readiness() == .notEnabled else { throw LegacyBootstrapError.alreadyEnabled }
+    let inputHashes = try await SharedProjectionInputs.capture(root: root)
     let seeds = try await legacySeeds()
+    guard try await SharedProjectionInputs.capture(root: root) == inputHashes else { throw LegacyBootstrapError.changedLegacyInput }
     let references = try seeds.map { seed -> SharedBootstrapReference in
       var state = SharedEntityState(id: seed.entity.id, kind: seed.entity.kind)
       try seed.apply(to: &state, writer: writer)
@@ -129,7 +131,10 @@ public actor LegacyLibraryBootstrap {
     let claim = claimURL
     let root = self.root
     let bytes = try encoded(manifest)
-    try await access.withWrite(at: format) { scope in
+    let inputs = try SharedProjectionInputs(manifest: manifest, files: inputHashes).encoded()
+    let inputURL = SharedProjectionInputs.file(in: root)
+    try await access.withWrites([.init(format), .init(claim), .init(inputURL)]) { scopes in
+      let scope = scopes[0]
       guard !FileManager.default.fileExists(atPath: scope.url.path) else {
         throw LegacyBootstrapError.alreadyEnabled
       }
@@ -140,7 +145,8 @@ public actor LegacyLibraryBootstrap {
         throw SharedLibraryRepositoryError.unavailableRoot
       }
       try scope.checkCancellation()
-      try bytes.write(to: claim, options: .atomic)
+      try inputs.write(to: scopes[2].url, options: .atomic)
+      try bytes.write(to: scopes[1].url, options: .atomic)
       try bytes.write(to: scope.url, options: .atomic)
     }
     return try await finish(manifest, seeds: seeds)
@@ -152,6 +158,9 @@ public actor LegacyLibraryBootstrap {
     else {
       throw LegacyBootstrapError.alreadyEnabled
     }
+    let inputs = try JSONDecoder().decode(SharedProjectionInputs.self, from: await access.read(at: SharedProjectionInputs.file(in: root)))
+    try inputs.validate(manifest: manifest)
+    guard try await SharedProjectionInputs.capture(root: root) == inputs.files else { throw LegacyBootstrapError.changedLegacyInput }
     let seeds = try await legacySeeds()
     let references = try seeds.map { seed -> SharedBootstrapReference in
       var state = SharedEntityState(id: seed.entity.id, kind: seed.entity.kind)

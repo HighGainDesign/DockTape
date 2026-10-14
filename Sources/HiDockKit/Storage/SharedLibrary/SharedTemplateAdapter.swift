@@ -82,7 +82,7 @@ public actor SharedTemplateAdapter {
         displayed[id] = accepted
         return try Self.render(accepted)
     }
-    private static func render(_ view: SharedLibraryViewSnapshot) throws -> Template {
+    static func render(_ view: SharedLibraryViewSnapshot) throws -> Template {
         guard case .text(let id)? = view.state.value(for: "templateID"),
               case .flag(let builtIn)? = view.state.value(for: "isBuiltIn") else { throw SharedSidecarError.invalidContent }
         let fallback = TemplateStore.builtInDefaults.first { $0.id == id }
