@@ -1,5 +1,6 @@
 // © 2026 High Gain Design. All rights reserved.
 import XCTest
+import CryptoKit
 @testable import HiDockKit
 
 final class SharedRecordingFileStoreTests: XCTestCase {
@@ -149,7 +150,7 @@ final class SharedRecordingFileStoreTests: XCTestCase {
     private func deliverOwner(_ source: URL, to destination: URL, writer: UUID) throws {
         let tree = source.appendingPathComponent(".docktape").resolvingSymlinksInPath()
         let iterator = try XCTUnwrap(FileManager.default.enumerator(at: tree, includingPropertiesForKeys: [.isDirectoryKey]))
-        for case let file as URL in iterator {
+        for case let file as URL in iterator where file.pathExtension == "json" {
             guard (try file.resourceValues(forKeys: [.isDirectoryKey])).isDirectory != true else { continue }
             let bytes = try Data(contentsOf: file)
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
@@ -269,6 +270,172 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         let reference = try await first.reference(to: "Meeting.mp3")
         do { _ = try await second.resolve(reference); XCTFail("Reference is library-bound") }
         catch SharedLibraryCoordinatorError.differentBinding {}
+    }
+
+    func testSharedImportPublishesStableIdentityAndSkipsIdenticalBytesAfterRename() async throws {
+        let (root, coordinator, store) = try await fixture()
+        let data = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+        let entry = FileEntry(filename: "New.hda", size: UInt32(data.count))
+        let imported = try await store.importRecording(hdaData: data, entry: entry)
+        XCTAssertEqual(imported?.filename, "New.mp3")
+        XCTAssertNotNil(imported?.reference)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("New.mp3")), data)
+        let identity = try await coordinator.reference(to: "New.mp3")
+        _ = try await store.renameRecording(filename: "New.mp3", to: "Personal title")
+        let duplicate = try await store.importRecording(hdaData: data, entry: entry)
+        XCTAssertNil(duplicate)
+        let resolved = try await coordinator.resolve(identity)
+        XCTAssertEqual(resolved, "Personal title.mp3")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("New.mp3").path))
+    }
+    func testSharedImportRepairsKnownAudioWithoutDiscardingSidecars() async throws {
+        let (root, coordinator, store) = try await fixture()
+        let data = Data([0xFF, 0xFB, 0x90, 0x64, 5, 6, 7, 8])
+        let entry = FileEntry(filename: "Repair.hda", size: UInt32(data.count))
+        _ = try await store.importRecording(hdaData: data, entry: entry)
+        let identity = try await coordinator.reference(to: "Repair.mp3")
+        let transcript = Transcript(recordingFilename: "Repair.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Keep this transcript")])
+        try await TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: coordinator)).save(transcript, mp3Filename: "Repair.mp3")
+        _ = try await coordinator.projectOutputs()
+        try Data("corrupted".utf8).write(to: root.appendingPathComponent("Repair.mp3"))
+        _ = try await store.importRecording(hdaData: data, entry: entry)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Repair.mp3")), data)
+        let saved = await TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: coordinator)).transcript(for: "Repair.mp3")
+        XCTAssertEqual(saved?.segments.first?.text, "Keep this transcript")
+        let repairedReference = try await coordinator.reference(to: "Repair.mp3")
+        XCTAssertEqual(repairedReference, identity)
+        XCTAssertTrue(LibraryFileDiscovery.files(in: root, suffix: ".mp3").allSatisfy { !$0.relativePath.contains("backup") })
+    }
+
+    func testSharedRepairWorksWithOfflinePeerButChangedAudioWaitsAndResumes() async throws {
+        let (left, a, store) = try await fixture()
+        let original = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+        let entry = FileEntry(filename: "Offline.hda", size: UInt32(original.count))
+        _ = try await store.importRecording(hdaData: original, entry: entry)
+        let entity = SharedEntityIdentity(id: try await a.reference(to: "Offline.mp3").entityID, kind: .recording)
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let right = parent.appendingPathComponent("library")
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Fixture B")
+        try deliverOwner(right, to: left, writer: b.writerID); try await a.refresh()
+        try deliverOwner(left, to: right, writer: a.writerID); try await b.refresh()
+        try deliverOwner(right, to: left, writer: b.writerID); try await a.refresh()
+        try Data("corrupt".utf8).write(to: left.appendingPathComponent("Offline.mp3"))
+        _ = try await store.importRecording(hdaData: original, entry: entry)
+        XCTAssertEqual(try Data(contentsOf: left.appendingPathComponent("Offline.mp3")), original)
+        let changed = Data([0xFF, 0xFB, 0x90, 0x64, 9, 9, 9, 9])
+        do { _ = try await store.importRecording(hdaData: changed, entry: entry); XCTFail("Changed content waits for offline peer") }
+        catch SharedLibraryOperationError.unfinishedOperation {}
+        XCTAssertEqual(try Data(contentsOf: left.appendingPathComponent("Offline.mp3")), original)
+        let pending = await store.sharedOperation
+        XCTAssertEqual(pending?.result, .waitingForAcknowledgments)
+        do { _ = try await a.projectOutputs(); XCTFail("Do not publish pending audio checksum") }
+        catch SharedLibraryOperationError.unfinishedOperation {}
+        let reopened = SharedLibraryCoordinator(root: left, writerID: a.writerID, witnessDirectory: left.deletingLastPathComponent().appendingPathComponent("local"))
+        let waiting = try await reopened.resumeRecordingOperation(id: entity.id)
+        XCTAssertEqual(waiting.result, .waitingForAcknowledgments)
+        try deliverOwner(left, to: right, writer: a.writerID)
+        try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+        try await b.refresh()
+        try await b.acknowledgeOperation(entity: entity, purpose: .replaceAudio)
+        try deliverOwner(right, to: left, writer: b.writerID)
+        let complete = try await reopened.resumeRecordingOperation(id: entity.id)
+        XCTAssertEqual(complete.result, .complete)
+        XCTAssertNil(complete.projectionError)
+        XCTAssertEqual(try Data(contentsOf: left.appendingPathComponent("Offline.mp3")), changed)
+        let repeated = try await reopened.resumeRecordingOperation(id: entity.id)
+        XCTAssertEqual(repeated.result, .complete)
+        XCTAssertTrue(LibraryFileDiscovery.files(in: left.appendingPathComponent(".docktape/staging"), suffix: ".mp3").isEmpty)
+    }
+
+    func testImportCancelledAfterSemanticAcceptanceCanResumeWithSameIdentity() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let interrupted = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"),
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: interrupted))
+        try await store.setup()
+        let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+        let entry = FileEntry(filename: "Interrupted.hda", size: UInt32(bytes.count))
+        let task = Task { try await store.importRecording(hdaData: bytes, entry: entry) }
+        do { _ = try await task.value; XCTFail("Cancel after accepted intent") } catch is CancellationError {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Interrupted.mp3").path))
+        let before = try await coordinator.recording(at: "Interrupted.mp3")
+        let resumed = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        try await resumed.setup()
+        let imported = try await resumed.importRecording(hdaData: bytes, entry: entry)
+        XCTAssertEqual(imported?.reference?.entityID, before.state.id)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Interrupted.mp3")), bytes)
+    }
+    func testVerifiedSourceImportIdentityIsDeterministicAndChecksumSkipDetectsCorruption() async throws {
+        let (root, coordinator, store) = try await fixture()
+        let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+        let md5 = Insecure.MD5.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let entry = FileEntry(filename: "Verified.hda", size: UInt32(bytes.count), md5: md5)
+        let imported = try await store.importRecording(hdaData: bytes, entry: entry)
+        XCTAssertEqual(imported?.reference?.entityID, try SharedLibraryIdentity.deviceImport(filename: entry.filename, sourceMD5: md5))
+        _ = try await store.renameRecording(filename: "Verified.mp3", to: "Verified title")
+        let verified = try await store.matchesVerifiedImport(entry)
+        XCTAssertTrue(verified)
+        try Data("corrupt".utf8).write(to: root.appendingPathComponent("Verified title.mp3"))
+        let corrupted = try await store.matchesVerifiedImport(entry)
+        XCTAssertFalse(corrupted)
+        let other = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        try await other.setup()
+        _ = try await other.importRecording(hdaData: bytes, entry: entry)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Verified title.mp3")), bytes)
+    }
+
+    func testImportInterruptedAfterStagingReusesInputWithoutAccumulatingFiles() async throws {
+        enum Interrupted: Error { case afterStaging }
+        let (root, coordinator, store) = try await fixture()
+        let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+        let entry = FileEntry(filename: "Staged.hda", size: UInt32(bytes.count))
+        let md5 = Insecure.MD5.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        do { _ = try await coordinator.importAudio(bytes, entry: entry, rawMD5: md5, beforeReplay: { throw Interrupted.afterStaging }); XCTFail() }
+        catch Interrupted.afterStaging {}
+        let staged = root.appendingPathComponent(".docktape/staging")
+        XCTAssertEqual(LibraryFileDiscovery.files(in: staged, suffix: ".mp3").count, 1)
+        _ = try await store.importRecording(hdaData: bytes, entry: entry)
+        XCTAssertTrue(LibraryFileDiscovery.files(in: staged, suffix: ".mp3").isEmpty, "Retry consumes its existing staged input")
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Staged.mp3")), bytes)
+    }
+
+    func testTwoOfflineImportsOfVerifiedSourceConvergeOnOneEntity() async throws {
+        let (left, a, first) = try await fixture()
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let right = parent.appendingPathComponent("library")
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Fixture B")
+        try deliverOwner(right, to: left, writer: b.writerID); try await a.refresh()
+        try deliverOwner(left, to: right, writer: a.writerID); try await b.refresh()
+        try deliverOwner(right, to: left, writer: b.writerID); try await a.refresh()
+        let second = RecordingStore(baseDirectory: right, shared: SharedRecordingMetadataAdapter(coordinator: b))
+        try await second.setup()
+        let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+        let md5 = Insecure.MD5.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let entry = FileEntry(filename: "Shared source.hda", size: UInt32(bytes.count), md5: md5)
+        let one = try await first.importRecording(hdaData: bytes, entry: entry)
+        let two = try await second.importRecording(hdaData: bytes, entry: entry)
+        XCTAssertEqual(one?.reference, two?.reference)
+        let entity = SharedEntityIdentity(id: try XCTUnwrap(one?.reference?.entityID), kind: .recording)
+        try deliverOwner(left, to: right, writer: a.writerID)
+        try deliverOwner(right, to: left, writer: b.writerID)
+        try await a.refresh(); try await b.refresh()
+        let mergedA = try await a.read(entity), mergedB = try await b.read(entity)
+        XCTAssertTrue(mergedA.state.conflicts.isEmpty)
+        XCTAssertTrue(mergedB.state.conflicts.isEmpty)
+        XCTAssertEqual(mergedA.state, mergedB.state)
+        _ = try await a.projectOutputs(); _ = try await b.projectOutputs()
+        XCTAssertEqual(LibraryFileDiscovery.files(in: left, suffix: ".mp3").filter { $0.relativePath == "Shared source.mp3" }.count, 1)
+        XCTAssertEqual(LibraryFileDiscovery.files(in: right, suffix: ".mp3").filter { $0.relativePath == "Shared source.mp3" }.count, 1)
     }
 
 }

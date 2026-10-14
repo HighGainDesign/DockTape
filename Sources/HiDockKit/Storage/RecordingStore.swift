@@ -225,6 +225,7 @@ public actor RecordingStore {
     /// Skip a transfer only when both the device source and saved audio are verified.
     /// An absent/unproven device checksum or legacy metadata needs byte comparison.
     public func matchesVerifiedImport(_ entry: FileEntry) async throws -> Bool {
+        if shared != nil { try await loadLibraryMeta() }
         guard let existing = try existingRecording(for: entry) else { return false }
         let key = metadataKey(for: existing.filename)
         guard let saved = meta[key], let sourceMD5 = saved.sourceMD5,
@@ -246,12 +247,21 @@ public actor RecordingStore {
     /// Returns nil for identical audio. Different bytes repair the existing file
     /// atomically, with no retained backup/copy; sidecars stay available for review.
     public func importRecording(hdaData: Data, entry: FileEntry) async throws -> RecordingMetadata? {
-        try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
+        if shared == nil { try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory) }
         guard hdaData.count == Int(entry.size) else {
             throw HiDockError.transferFailed("The recording transfer was incomplete. Existing audio was left unchanged.")
         }
         guard let mp3Data = HDAConverter.extractMP3(from: hdaData) else {
             throw HiDockError.conversionFailed("No MP3 sync word found in .hda data")
+        }
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            let rawMD5 = Insecure.MD5.hash(data: hdaData).map { String(format: "%02x", $0) }.joined()
+            let imported = try await shared.coordinator.importAudio(mp3Data, entry: entry, rawMD5: rawMD5)
+            sharedOperation = imported.outcome
+            guard imported.outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
+            try await loadLibraryMeta()
+            return imported.changed ? allRecordings().first(where: { $0.filename == imported.outcome.filename }) : nil
         }
         let existing = try existingRecording(for: entry)
         let filename = existing?.filename ?? entry.filename.replacingOccurrences(
