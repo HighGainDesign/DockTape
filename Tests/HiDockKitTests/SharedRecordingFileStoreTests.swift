@@ -239,4 +239,36 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertEqual(LibraryFileDiscovery.files(in: root, suffix: ".mp3").map(\.relativePath), ["Third.mp3"])
     }
 
+    func testQueuedReferenceFollowsCompletedRenameAndMoveButNotDeletion() async throws {
+        let (_, coordinator, store) = try await fixture()
+        let reference = try await coordinator.reference(to: "Meeting.mp3")
+        _ = try await store.renameRecording(filename: "Meeting.mp3", to: "Renamed")
+        let renamed = try await coordinator.resolve(reference)
+        XCTAssertEqual(renamed, "Renamed.mp3")
+        try await store.createFolder(named: "Archive")
+        _ = try await store.moveRecording(filename: "Renamed.mp3", toFolder: "Archive")
+        let moved = try await coordinator.resolve(reference)
+        XCTAssertEqual(moved, "Archive/Renamed.mp3")
+        _ = try await coordinator.edit(.init(base: try await coordinator.recording(at: moved), changes: [.delete]))
+        do { _ = try await coordinator.resolve(reference); XCTFail("Deleted reference must not target physical leftovers") }
+        catch SharedLibraryCoordinatorError.staleJob {}
+    }
+    func testQueuedReferenceDoesNotAdvertiseUnfinishedPhysicalRelocation() async throws {
+        enum Stopped: Error { case interrupted }
+        let (_, coordinator, _) = try await fixture()
+        let reference = try await coordinator.reference(to: "Meeting.mp3")
+        do { _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Renamed", afterMutation: { _ in throw Stopped.interrupted }); XCTFail() }
+        catch Stopped.interrupted {}
+        do { _ = try await coordinator.resolve(reference); XCTFail("Wait for coherent published location") }
+        catch SharedLibraryOperationError.unfinishedOperation {}
+    }
+
+    func testReferenceCannotCrossLibraryBindingEvenWithSameLegacyEntityID() async throws {
+        let (_, first, _) = try await fixture()
+        let (_, second, _) = try await fixture()
+        let reference = try await first.reference(to: "Meeting.mp3")
+        do { _ = try await second.resolve(reference); XCTFail("Reference is library-bound") }
+        catch SharedLibraryCoordinatorError.differentBinding {}
+    }
+
 }

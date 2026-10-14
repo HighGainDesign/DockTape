@@ -17,20 +17,23 @@ public actor SharedRecordingMetadataAdapter {
             throw SharedLibraryCoordinatorError.differentBinding
         }
     }
-    public func load() async throws -> [String: RecordingStore.RecordingMeta] {
+    public func load() async throws -> [String: RecordingStore.RecordingMeta] { try await loadCatalog().metadata }
+    func loadCatalog() async throws -> (metadata: [String: RecordingStore.RecordingMeta], references: [String: SharedRecordingReference]) {
         let request = UUID(); loadRequest = request
         let views = try await coordinator.snapshots(kinds: [.recording, .folder])
         let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: true)
         var result: [String: RecordingStore.RecordingMeta] = [:]
+        var references: [String: SharedRecordingReference] = [:]
         for view in views where view.state.kind == .recording && view.state.lifecycle == .alive {
             guard let path = index.resolvedPaths[view.state.id] else { continue }
             guard result[path] == nil else { throw SharedLibraryPathError.ambiguousPath }
             result[path] = try Self.render(view)
+            references[path] = .init(libraryID: view.libraryID, entityID: view.state.id)
         }
         await beforeLoadReturn()
         try Task.checkCancellation()
         if loadRequest == request { displayed = Dictionary(uniqueKeysWithValues: views.map { ($0.state.id, $0) }) }
-        return result
+        return (result, references)
     }
     public func save(filename: String, before: RecordingStore.RecordingMeta?, after: RecordingStore.RecordingMeta) async throws -> RecordingStore.RecordingMeta {
         loadRequest = nil

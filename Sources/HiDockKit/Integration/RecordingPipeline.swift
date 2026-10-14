@@ -126,7 +126,10 @@ public actor RecordingPipeline {
     }
 
     /// Transcribe a single recording by MP3 filename.
-    public func transcribeRecording(filename: String, numSpeakers: Int? = nil) async throws -> Transcript {
+    public func transcribeRecording(filename requestedFilename: String, numSpeakers: Int? = nil, reference: SharedRecordingReference? = nil) async throws -> Transcript {
+        let filename: String
+        if let reference { guard let shared else { throw SharedLibraryCoordinatorError.differentBinding }; filename = try await shared.resolve(reference) }
+        else { filename = requestedFilename }
         if shared == nil { try LegacyLibraryFileAccess.requireLegacyRoot(recordingStore.baseDirectory) }
         guard let meta = await recordingStore.allRecordings().first(where: { $0.filename == filename }) else { throw HiDockError.fileNotFound(filename) }
         let url = recordingStore.baseDirectory.appendingPathComponent(filename)
@@ -134,6 +137,7 @@ public actor RecordingPipeline {
         do {
             if let shared {
                 let view = try await shared.recording(at: filename)
+                if let reference, reference.libraryID != view.libraryID || reference.entityID != view.state.id { throw SharedLibraryCoordinatorError.differentBinding }
                 job = try await shared.pinJob(.init(id: view.state.id, kind: .recording), output: .transcript, audioURL: url)
             }
             try await prepareModels()

@@ -57,7 +57,7 @@ final class SummarizationState {
         summarizationTask = Task {
             while queueIndex < queue.count {
                 let entry = queue[queueIndex]
-                let rec = entry.recording
+                var rec = entry.recording
                 summarizingFile = rec.filename
                 phase = "Summarizing with \(model)..."
 
@@ -66,7 +66,12 @@ final class SummarizationState {
                     try Task.checkCancellation()
                     let transcript: Transcript?
                     if let shared {
-                        let view = try await shared.recording(at: rec.filename)
+                        guard let reference = rec.reference else { throw SharedLibraryCoordinatorError.staleJob }
+                        let path = try await shared.resolve(reference)
+                        rec = rec.retargeted(to: path)
+                        summarizingFile = path
+                        let view = try await shared.read(.init(id: reference.entityID, kind: .recording))
+                        guard view.libraryID == reference.libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
                         job = try await shared.pinJob(.init(id: view.state.id, kind: .recording), input: .transcript, output: .summary)
                         transcript = try await shared.transcriptForJob(job!, filename: rec.filename)
                     } else { transcript = await transcriptStore.transcript(for: rec.filename) }

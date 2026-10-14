@@ -14,6 +14,10 @@ public struct SharedLibraryViewSnapshot: Sendable {
   public var fingerprint: String { repository.fingerprint }
   public var confirmedState: SharedEntityState? { repository.projection?.state }
 }
+public struct SharedRecordingReference: Hashable, Sendable {
+  public let libraryID: UUID
+  public let entityID: UUID
+}
 public struct SharedCoordinatorEdit: Sendable {
   public let base: SharedLibraryViewSnapshot
   public let changes: [SharedLibraryMutation]
@@ -271,6 +275,31 @@ public actor SharedLibraryCoordinator {
       throw matches.isEmpty ? SharedSidecarError.unknownRecording : SharedSidecarError.ambiguousPath
     }
     return matches[0]
+  }
+  public func reference(to filename: String) async throws -> SharedRecordingReference {
+    let view = try await recording(at: filename)
+    return .init(libraryID: view.libraryID, entityID: view.state.id)
+  }
+  public func resolve(_ reference: SharedRecordingReference) async throws -> String {
+    let manifest = try await bind(force: true)
+    guard manifest.libraryID == reference.libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
+    let view = try await read(.init(id: reference.entityID, kind: .recording))
+    guard view.libraryID == reference.libraryID, view.state.lifecycle == .alive else { throw SharedLibraryCoordinatorError.staleJob }
+    let path = try await currentPath(view)
+    let membership = try await memberRepository().load().membership
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    guard published.recordings[reference.entityID]?.contains(path) == true else { throw SharedLibraryOperationError.unfinishedOperation }
+    for original in published.recordings[reference.entityID] ?? [] where original != path {
+      let stem = (original as NSString).deletingPathExtension
+      for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+        let url = root.appendingPathComponent(stem + suffix)
+        let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+        if FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path) { throw SharedLibraryOperationError.unfinishedOperation }
+      }
+    }
+    let latest = try await read(.init(id: reference.entityID, kind: .recording))
+    guard latest.libraryID == reference.libraryID, latest.fingerprint == view.fingerprint else { throw SharedLibraryCoordinatorError.staleJob }
+    return path
   }
   private func currentPath(_ view: SharedLibraryViewSnapshot) async throws -> String {
     guard case .text(let title)? = view.state.value(for: "title"), !title.contains("/") else {

@@ -203,7 +203,8 @@ public actor RecordingStore {
                 mode: mode,
                 fileSizeBytes: fileSize,
                 estimatedDuration: DurationCalculator.estimateDuration(fileSize: fileSize),
-                folder: recordingFolder
+                folder: recordingFolder,
+                reference: recordingReferences[relativePath]
             ))
         }
         return results
@@ -405,7 +406,7 @@ public actor RecordingStore {
             let outcome = try await shared.coordinator.deleteSharedRecording(filename: filename)
             sharedOperation = outcome
             guard outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
-            meta.removeValue(forKey: filename); metaBaseline.removeValue(forKey: filename)
+            meta.removeValue(forKey: filename); metaBaseline.removeValue(forKey: filename); recordingReferences.removeValue(forKey: filename)
             return
         }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
@@ -510,6 +511,8 @@ public actor RecordingStore {
         let accepted = try SharedRecordingMetadataAdapter.render(outcome.view)
         meta.removeValue(forKey: previous); metaBaseline.removeValue(forKey: previous)
         meta[outcome.filename] = accepted; metaBaseline[outcome.filename] = accepted
+        recordingReferences.removeValue(forKey: previous)
+        recordingReferences[outcome.filename] = .init(libraryID: outcome.view.libraryID, entityID: outcome.view.state.id)
         return outcome.filename
     }
 
@@ -530,6 +533,7 @@ public actor RecordingStore {
     /// In-memory cache of filename → metadata.
     private var meta: [String: RecordingMeta] = [:]
     private var metaBaseline: [String: RecordingMeta] = [:]
+    private var recordingReferences: [String: SharedRecordingReference] = [:]
     private var metadataTicket: UInt64 = 0
 
     /// Load library.json from disk. Also migrates modes.json if present.
@@ -537,8 +541,8 @@ public actor RecordingStore {
         if let shared {
             try shared.requireRoot(baseDirectory)
             metadataTicket += 1; let ticket = metadataTicket
-            let loaded = try await shared.load()
-            if metadataTicket == ticket { meta = loaded; metaBaseline = loaded }
+            let loaded = try await shared.loadCatalog()
+            if metadataTicket == ticket { meta = loaded.metadata; metaBaseline = loaded.metadata; recordingReferences = loaded.references }
             return
         }
         let url = baseDirectory.appendingPathComponent("library.json")
