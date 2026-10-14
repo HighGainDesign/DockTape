@@ -66,6 +66,7 @@ public struct SharedMaterializationAuthority: Sendable {
   /// paths. Staged-input locations are separately bound/validated by the plan.
   public var allowedPaths: Set<String>? = nil
   public var binding: SharedMaterializationBinding? = nil
+  public var additionalBindings: [SharedMaterializationBinding] = []
   public var revisionLease: SharedMaterializationLease
   /// Actual coordinator authority checks its local checkpoint again inside the
   /// gate: a different process cannot revoke this process's Progress object.

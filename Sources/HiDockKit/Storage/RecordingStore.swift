@@ -55,7 +55,8 @@ public actor RecordingStore {
     }
 
     /// Create a new top-level folder. Throws if it already exists.
-    public func createFolder(named name: String) throws {
+    public func createFolder(named name: String) async throws {
+        if let shared { try shared.requireRoot(baseDirectory); try await shared.coordinator.createSharedFolder(named: Self.sanitizeFilename(name)); return }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let sanitized = Self.sanitizeFilename(name)
         guard !sanitized.isEmpty else {
@@ -110,7 +111,13 @@ public actor RecordingStore {
     /// Move a recording (and its sidecars) to a folder, or to root if folder is nil.
     /// Returns the new relative filename.
     @discardableResult
-    public func moveRecording(filename: String, toFolder folderName: String?) throws -> String {
+    public func moveRecording(filename: String, toFolder folderName: String?) async throws -> String {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            metadataTicket += 1
+            let outcome = try await shared.coordinator.relocateRecording(filename: filename, toFolder: folderName, changeFolder: true)
+            return try cacheSharedRelocation(outcome, from: filename)
+        }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let fm = FileManager.default
         let basename = (filename as NSString).lastPathComponent
@@ -392,6 +399,15 @@ public actor RecordingStore {
 
     /// Delete a local recording and all its sidecars.
     public func deleteRecordingAndSidecars(filename: String) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            metadataTicket += 1
+            let outcome = try await shared.coordinator.deleteSharedRecording(filename: filename)
+            sharedOperation = outcome
+            guard outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
+            meta.removeValue(forKey: filename); metaBaseline.removeValue(forKey: filename)
+            return
+        }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let basename = ((filename as NSString).lastPathComponent as NSString).deletingPathExtension
         let dir: URL
@@ -411,6 +427,7 @@ public actor RecordingStore {
 
     /// Delete a local recording and its plain-text sidecar.
     public func deleteRecording(filename: String) async throws {
+        if shared != nil { try await deleteRecordingAndSidecars(filename: filename); return }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let url = baseDirectory.appendingPathComponent(filename)
         try? FileManager.default.removeItem(at: url)
@@ -427,6 +444,14 @@ public actor RecordingStore {
     /// Returns the new filename.
     @discardableResult
     public func renameRecording(filename: String, to newName: String) async throws -> String {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            let title = Self.sanitizeFilename(newName.hasSuffix(".mp3") ? String(newName.dropLast(4)) : newName)
+            guard !title.isEmpty else { throw HiDockError.invalidFilename(newName) }
+            metadataTicket += 1
+            let outcome = try await shared.coordinator.relocateRecording(filename: filename, title: title)
+            return try cacheSharedRelocation(outcome, from: filename)
+        }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let oldBasename = (filename as NSString).deletingPathExtension
         let sanitized = Self.sanitizeFilename(newName.hasSuffix(".mp3") ? String(newName.dropLast(4)) : newName)
@@ -476,6 +501,16 @@ public actor RecordingStore {
     /// Get the file URL for a recording's MP3.
     public func mp3URL(for metadata: RecordingMetadata) -> URL {
         baseDirectory.appendingPathComponent(metadata.filename)
+    }
+
+    public private(set) var sharedOperation: SharedRecordingFileOutcome?
+    private func cacheSharedRelocation(_ outcome: SharedRecordingFileOutcome, from previous: String) throws -> String {
+        sharedOperation = outcome
+        guard outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
+        let accepted = try SharedRecordingMetadataAdapter.render(outcome.view)
+        meta.removeValue(forKey: previous); metaBaseline.removeValue(forKey: previous)
+        meta[outcome.filename] = accepted; metaBaseline[outcome.filename] = accepted
+        return outcome.filename
     }
 
     // MARK: - Recording metadata (library.json)

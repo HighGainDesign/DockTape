@@ -56,6 +56,7 @@ public actor SharedLibraryCoordinator {
   private let repository: SharedLibraryRepository
   private let witnessDirectory: URL?
   private let afterCommit: @Sendable () async -> Void
+  private let trash: @Sendable (URL) throws -> Void
   private var manifest: SharedBootstrapManifest?
   private var members: SharedMemberRepository?
   private var gate: SharedLibraryLocalGate?
@@ -82,13 +83,15 @@ public actor SharedLibraryCoordinator {
   private var listeners: [UUID: AsyncStream<SharedLibraryChange>.Continuation] = [:]
   public init(
     root: URL, writerID: UUID, versionAccess: RecordingFileVersionAccess = .init(),
-    witnessDirectory: URL? = nil, afterCommit: @escaping @Sendable () async -> Void = {}
+    witnessDirectory: URL? = nil, afterCommit: @escaping @Sendable () async -> Void = {},
+    trash: @escaping @Sendable (URL) throws -> Void = { try SharedLibraryMaterializer.moveToTrash($0) }
   ) {
     self.root = root.standardizedFileURL.resolvingSymlinksInPath()
     self.writerID = writerID
     self.versionAccess = versionAccess
     self.witnessDirectory = witnessDirectory
     self.afterCommit = afterCommit
+    self.trash = trash
     bootstrap = LegacyLibraryBootstrap(
       root: root, writerID: writerID, witnessDirectory: witnessDirectory)
     repository = SharedLibraryRepository(root: root, writerID: writerID)
@@ -405,6 +408,184 @@ public actor SharedLibraryCoordinator {
     }
   }
 
+  private func operationReceipts(library: UUID) throws -> URL {
+    guard let directory = witnessDirectory else { throw SharedLibraryOperationError.invalidOperation }
+    return directory.appendingPathComponent("Operations").appendingPathComponent(library.uuidString).appendingPathComponent(writerID.uuidString)
+  }
+  public func createSharedFolder(named name: String) async throws {
+    _ = try SharedLibraryIdentity.normalized(name)
+    guard !name.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
+    let views = try await snapshots(kinds: [.recording, .folder])
+    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    guard index.owners(of: name).isEmpty, !FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path) else {
+      throw SharedLibraryOperationError.pathConflict(name)
+    }
+    let entity = SharedEntityIdentity(id: UUID(), kind: .folder)
+    let base = try await read(entity)
+    let accepted = try await edit(.init(base: base, changes: [
+      .assign(field: "initialPath", value: .text(name)), .assign(field: "name", value: .text(name)), .assign(field: "parent", value: .unset)]))
+    let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
+      inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state), steps: [.createDirectory(path: name)])
+    let materializer = try await makeMaterializer(entity: entity, paths: [name], receipts: operationReceipts(library: accepted.libraryID))
+    guard try await materializer.replay(operation) == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
+  }
+  public func relocateRecording(filename: String, title: String? = nil, toFolder: String? = nil,
+                                changeFolder: Bool = false,
+                                afterMutation: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedRecordingFileOutcome {
+    let source = try SharedLibraryIdentity.normalized(filename)
+    let base = try await recording(at: source)
+    let entity = SharedEntityIdentity(id: base.state.id, kind: .recording)
+    guard base.state.lifecycle == .alive, base.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
+    let receipts = try operationReceipts(library: base.libraryID)
+    let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
+    if let progress = try await reader.progress(entity: entity, libraryID: base.libraryID),
+       progress.completedSteps < progress.operation.steps.count { throw SharedLibraryOperationError.unfinishedOperation }
+    let basename = title ?? ((source as NSString).lastPathComponent as NSString).deletingPathExtension
+    _ = try SharedLibraryIdentity.normalized(basename)
+    guard !basename.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
+    var folder = (source as NSString).deletingLastPathComponent
+    var changes: [SharedLibraryMutation] = []
+    if let title { changes.append(.assign(field: "title", value: .text(title))) }
+    if changeFolder {
+      folder = toFolder ?? ""
+      if let toFolder {
+        let views = try await snapshots(kinds: [.folder])
+        let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+        guard let id = index.resolvedPaths.first(where: { $0.value == toFolder })?.key else { throw SharedLibraryPathError.unknownPath }
+        changes.append(.assign(field: "folder", value: .text(id.uuidString)))
+      } else { changes.append(.assign(field: "folder", value: .unset)) }
+    }
+    let destination = folder.isEmpty ? basename + ".mp3" : folder + "/" + basename + ".mp3"
+    if source == destination { return .init(filename: source, result: .complete, projectionError: nil, view: base) }
+    let all = try await snapshots(kinds: [.recording, .folder])
+    let index = try SharedLibraryPathIndex(states: all.map(\.state), caseSensitive: false)
+    guard index.owners(of: destination).isEmpty else { throw SharedLibraryOperationError.pathConflict(destination) }
+    let sourceStem = (source as NSString).deletingPathExtension
+    let destinationStem = (destination as NSString).deletingPathExtension
+    let manifest = try await bind(force: true)
+    let membership = try await memberRepository().load().membership
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    var steps: [SharedLibraryOperation.Step] = []
+    for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+      let from = sourceStem + suffix, to = destinationStem + suffix
+      let target = root.appendingPathComponent(to)
+      guard !FileManager.default.fileExists(atPath: target.path),
+            !FileManager.default.fileExists(atPath: target.deletingLastPathComponent().appendingPathComponent("." + target.lastPathComponent + ".icloud").path) else {
+        throw SharedLibraryOperationError.pathConflict(to)
+      }
+      if let bytes = try await RecordingFileAccess().readDataIfPresent(at: root.appendingPathComponent(from), knownToExist: suffix == ".mp3") {
+        if suffix.hasSuffix(".json") {
+          try published.validateCompanion(path: from, bytes: bytes, entity: entity.id, library: base.libraryID,
+              kind: suffix == ".transcript.json" ? "transcript" : "summary")
+        }
+        steps.append(.move(source: from, destination: to, fingerprint: SharedLibraryOperation.fingerprint(bytes)))
+      } else if suffix == ".mp3" { throw CocoaError(.fileReadNoSuchFile) }
+    }
+    // Accept the logical intent before touching any source. Receipt replay,
+    // ownership and expected bytes make each related physical phase recoverable.
+    let accepted = try await edit(.init(base: base, changes: changes))
+    let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
+      inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state), steps: steps)
+    let materializer = try await makeMaterializer(entity: entity, paths: Array(operation.canonicalPaths),
+      receipts: operationReceipts(library: accepted.libraryID), afterMutation: afterMutation)
+    let result = try await materializer.replay(operation)
+    var projectionError: String?
+    if result == .complete {
+      do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription }
+    }
+    return .init(filename: result == .complete ? destination : source, result: result, projectionError: projectionError, view: accepted)
+  }
+
+  public func deleteSharedRecording(filename: String) async throws -> SharedRecordingFileOutcome {
+    let source = try SharedLibraryIdentity.normalized(filename)
+    let base = try await recording(at: source)
+    let entity = SharedEntityIdentity(id: base.state.id, kind: .recording)
+    guard base.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
+    let receipts = try operationReceipts(library: base.libraryID)
+    let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
+    if let progress = try await reader.progress(entity: entity, libraryID: base.libraryID),
+       progress.completedSteps < progress.operation.steps.count {
+      if progress.operation.steps.allSatisfy({ if case .trash = $0 { return true }; return false }) {
+        return try await resumeRecordingOperation(id: entity.id)
+      }
+      throw SharedLibraryOperationError.unfinishedOperation
+    }
+    let manifest = try await bind(force: true)
+    let membership = try await memberRepository().load().membership
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let stem = (source as NSString).deletingPathExtension
+    var steps: [SharedLibraryOperation.Step] = []
+    for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+      let path = stem + suffix
+      if let bytes = try await RecordingFileAccess().readDataIfPresent(at: root.appendingPathComponent(path), knownToExist: suffix == ".mp3") {
+        if suffix.hasSuffix(".json") {
+          try published.validateCompanion(path: path, bytes: bytes, entity: entity.id, library: base.libraryID,
+              kind: suffix == ".transcript.json" ? "transcript" : "summary")
+        }
+        steps.append(.trash(path: path, fingerprint: SharedLibraryOperation.fingerprint(bytes)))
+      } else if suffix == ".mp3" { throw CocoaError(.fileReadNoSuchFile) }
+    }
+    let accepted = base.state.lifecycle == .deleted ? base : try await edit(.init(base: base, changes: [.delete]))
+    let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
+      inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state), steps: steps)
+    let permission = try await operationAuthority(entity: entity, paths: Array(operation.canonicalPaths))
+    if !permission.hasPendingWork { try await acknowledgeOperation(entity: entity, purpose: .delete) }
+    let materializer = try await makeMaterializer(entity: entity, paths: Array(operation.canonicalPaths), receipts: receipts)
+    let result = try await materializer.replay(operation)
+    var projectionError: String?
+    if result == .complete { do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription } }
+    return .init(filename: source, result: result, projectionError: projectionError, view: accepted)
+  }
+  public func acknowledgeOperation(entity: SharedEntityIdentity, purpose: SharedDestructivePurpose) async throws {
+    let manifest = try await bind(force: true)
+    guard let directory = witnessDirectory, let gate else { throw SharedLibraryOperationError.invalidOperation }
+    let witness = SharedOwnerWitness(directory: directory, libraryID: manifest.libraryID, writerID: writerID)
+    _ = try await SharedOperationAcknowledgmentStore(root: root, libraryID: manifest.libraryID, writer: writerID, witness: witness, gate: gate)
+      .acknowledge(purpose: purpose, authority: { try await self.operationAuthority(entity: entity, paths: []) })
+    revokeAuthority()
+  }
+
+  /// Resume the exact locally recorded physical plan; never infer completion
+  /// from a new filename or recreate an audio original after an interruption.
+  public func resumeRecordingOperation(id: UUID) async throws -> SharedRecordingFileOutcome {
+    let entity = SharedEntityIdentity(id: id, kind: .recording)
+    let view = try await read(entity)
+    let receipts = try operationReceipts(library: view.libraryID)
+    let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
+    guard let progress = try await reader.progress(entity: entity, libraryID: view.libraryID),
+          let audio = progress.operation.steps.first(where: {
+            switch $0 { case .move(let source, _, _), .trash(let source, _): return source.hasSuffix(".mp3"); default: return false }
+          }) else { throw SharedLibraryOperationError.invalidOperation }
+    if progress.completedSteps == progress.operation.steps.count {
+      let filename: String
+      switch audio { case .move(_, let path, _), .trash(let path, _): filename = path; default: throw SharedLibraryOperationError.invalidOperation }
+      guard try SharedStateFingerprint.of(view.state) == progress.operation.outputRevision else {
+        return .init(filename: filename, result: .needsReplanning, projectionError: nil, view: view)
+      }
+      var projectionError: String?
+      do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription }
+      return .init(filename: filename, result: .complete, projectionError: projectionError, view: view)
+    }
+    let source: String, destination: String
+    switch audio {
+    case .move(let from, let to, _): source = from; destination = to
+    case .trash(let path, _):
+      source = path; destination = path
+      let permission = try await operationAuthority(entity: entity, paths: [])
+      if !permission.hasPendingWork && view.state.lifecycle == .deleted && view.state.conflicts.isEmpty {
+        try await acknowledgeOperation(entity: entity, purpose: .delete)
+      }
+    default: throw SharedLibraryOperationError.invalidOperation
+    }
+    let materializer = try await makeMaterializer(entity: entity, paths: Array(progress.operation.canonicalPaths), receipts: receipts)
+    let result = try await materializer.replay(progress.operation)
+    var projectionError: String?
+    if result == .complete {
+      do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription }
+    }
+    return .init(filename: result == .complete ? destination : source, result: result, projectionError: projectionError, view: view)
+  }
+
   public func projectOutputs(beforeWrite: @escaping @Sendable () async -> Void = {},
                              afterOutput: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedProjectionWriteResult {
     let context = try await projectionContext()
@@ -421,6 +602,25 @@ public actor SharedLibraryCoordinator {
     let views = try await snapshots(kinds: [.recording, .folder, .template])
     let after = try await SharedLibraryProjectionWriter.authoritySources(root: root)
     let membership = try await memberRepository().load().membership
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let pathStates = views.map { view -> SharedEntityState in
+      let fields = view.state.kind == .folder ? ["name", "parent"] : ["title", "folder"]
+      return fields.contains(where: { view.state.fields[$0]?.isConflicted == true }) ? (view.confirmedState ?? view.state) : view.state
+    }
+    let index = try SharedLibraryPathIndex(states: pathStates, caseSensitive: false)
+    for view in views where view.state.kind == .recording && view.state.lifecycle == .alive {
+      guard let destination = index.resolvedPaths[view.state.id] else { continue }
+      for source in published.recordings[view.state.id] ?? [] where source != destination {
+        let stem = (source as NSString).deletingPathExtension
+        for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+          let url = root.appendingPathComponent(stem + suffix)
+          let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+          guard !FileManager.default.fileExists(atPath: url.path), !FileManager.default.fileExists(atPath: placeholder.path) else {
+            throw SharedLibraryOperationError.unfinishedOperation
+          }
+        }
+      }
+    }
     guard transitions == 0, authorityEpoch == epoch, before == after,
           try witness.checkpointFingerprint() == checkpoint,
           membership.pendingWriters.isEmpty, !membership.hasConcurrentEnrollment,
@@ -440,7 +640,7 @@ public actor SharedLibraryCoordinator {
     guard let gate else { throw SharedLibraryOperationError.invalidOperation }
     return SharedLibraryMaterializer(root: root, receipts: receipts,
       authority: { try await self.operationAuthority(entity: entity, paths: paths) },
-      afterMutation: afterMutation, gate: gate)
+      trash: trash, afterMutation: afterMutation, gate: gate)
   }
 
   /// Build physical permission from the whole current identity graph, not an
@@ -476,7 +676,10 @@ public actor SharedLibraryCoordinator {
       throw SharedSidecarError.unknownRecording
     }
     let sensitivity = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
-    let index = try SharedLibraryPathIndex(states: snapshots.map(\.state), caseSensitive: sensitivity)
+    let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let knownIDs = Set(snapshots.filter { $0.state.kind == .recording }.map { $0.state.id })
+    guard Set(locations.recordings.keys).isSubset(of: knownIDs) else { throw SharedProjectionWriteError.untracked("library.json") }
+    let index = try SharedLibraryPathIndex(states: snapshots.map(\.state), caseSensitive: sensitivity, retainedLocations: locations.recordings)
     let owners = index.operationOwners(for: paths)
     for path in paths {
       _ = try SharedLibraryIdentity.normalized(path)
@@ -510,6 +713,9 @@ public actor SharedLibraryCoordinator {
     var result = SharedMaterializationAuthority(
       libraryID: manifest.libraryID, state: selected.state, membership: membership,
       acknowledgments: acknowledgments, hasPendingWork: jobs.values.contains { $0.entity == entity }, pathOwners: owners)
+    result.additionalBindings = locations.proofs.map { url, expected in
+      SharedMaterializationBinding(file: url) { SharedLibraryOperation.fingerprint($0) == expected }
+    }.sorted { $0.file.path < $1.file.path }
     result.allowedPaths = Set(paths)
     result.revisionLease = authorityLease!
     result.validateLocalCommit = { try witness.checkpointFingerprint() == localCheckpoint }

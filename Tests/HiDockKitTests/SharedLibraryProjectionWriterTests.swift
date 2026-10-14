@@ -73,8 +73,9 @@ final class SharedLibraryProjectionWriterTests: XCTestCase {
         let templates = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
         try await templates.load()
         var changed = TemplateStore.builtInDefaults[0]; changed.promptText = "Later prompt"
+        let target = changed
         do {
-            _ = try await coordinator.projectOutputs(beforeWrite: { try? await templates.update(changed) })
+            _ = try await coordinator.projectOutputs(beforeWrite: { try? await templates.update(target) })
             XCTFail("Any affected library revision must invalidate the aggregate plan")
         } catch SharedProjectionWriteError.stale {}
         XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("library.json")), original)

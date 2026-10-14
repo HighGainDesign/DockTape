@@ -131,8 +131,25 @@ struct SharedLibraryProjectionWriter {
                 if existing == desired { unchanged += 1; continue }
                 if let existing, path.hasSuffix(".json") {
                     let marker = try? SharedProjectionDocument.marker(in: existing)
-                    let published = marker.map { marker in publications.contains { $0.files[path] == marker || $0.pending?[path] == marker } } ?? false
-                    let initial = inputs.files[path] == SharedLibraryOperation.fingerprint(existing)
+                    let desiredMarker = try SharedProjectionDocument.marker(in: desired)
+                    let published = marker.map { marker in
+                        publications.contains { registry in
+                            if path == "library.json" || path == ".templates.json" { return registry.files[path] == marker || registry.pending?[path] == marker }
+                            return marker.entities == desiredMarker?.entities && marker.libraryID == desiredMarker?.libraryID && marker.kind == desiredMarker?.kind
+                                && (registry.files.values.contains(marker) || (registry.pending?.values.contains(marker) ?? false))
+                        }
+                    } ?? false
+                    let hash = SharedLibraryOperation.fingerprint(existing)
+                    var initial = inputs.files[path] == hash
+                    // A first projection may follow relocation of a verified
+                    // bootstrap sidecar. Bind its original hash to the same
+                    // recording and component instead of trusting any JSON copy.
+                    if !initial, let desiredMarker, desiredMarker.entities.count == 1,
+                       ["transcript", "summary"].contains(desiredMarker.kind),
+                       let reference = context.manifest.references.first(where: { $0.entity.kind == .recording && $0.entity.id == desiredMarker.entities[0] }) {
+                        let original = (reference.initialPath as NSString).deletingPathExtension + "." + desiredMarker.kind + ".json"
+                        initial = inputs.files[original] == hash
+                    }
                     guard published || initial else { throw SharedProjectionWriteError.untracked(path) }
                 }
                 changes.append((index + 1, path, desired))
@@ -141,6 +158,16 @@ struct SharedLibraryProjectionWriter {
             for (path, bytes) in outputs where path.hasSuffix(".json") { proposed[path] = try SharedProjectionDocument.marker(in: bytes) }
             let intent = try SharedProjectionRegistry(library: context.manifest.libraryID, writer: writer, files: known, pending: proposed).encoded()
             known.merge(proposed, uniquingKeysWith: { _, new in new })
+            // Once the same entity/component is published at its new path,
+            // an absent old sidecar needs no historical producer entry. Keep
+            // entries while any resident or cloud placeholder remains there.
+            known = known.filter { path, marker in
+                guard proposed[path] == nil, ["transcript", "summary"].contains(marker.kind),
+                      proposed.values.contains(where: { $0.kind == marker.kind && $0.entities == marker.entities }) else { return true }
+                let url = root.appendingPathComponent(path)
+                let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+                return FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path)
+            }
             let registry = try SharedProjectionRegistry(library: context.manifest.libraryID, writer: writer, files: known).encoded()
             for scope in scopes { try scope.checkCancellation() }
             guard !context.lease.isRevoked, try context.validate() else { throw SharedProjectionWriteError.stale }

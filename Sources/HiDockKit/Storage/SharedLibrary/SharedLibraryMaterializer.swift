@@ -41,7 +41,10 @@ public actor SharedLibraryMaterializer {
     try Self.checkRoot(root)
     guard !Self.contained(receipts, in: root) else { throw SharedLibraryOperationError.unsafePath }
     let initial = try await authority()
-    if let pending = try Self.check(operation, authority: initial) { return pending }
+    let initialPending = try Self.check(operation, authority: initial)
+    if let pending = initialPending, pending != .waitingForAcknowledgments { return pending }
+    // The accepted delete plan must survive an offline cohort or active job.
+    // Save its expected hashes before waiting, without touching provider files.
     try FileManager.default.createDirectory(at: receipts, withIntermediateDirectories: true)
     let receiptURL = receipts.appendingPathComponent(operation.entity.id.uuidString + ".json")
     let initialReceipt = try await access.withWrite(at: receiptURL) { scope in
@@ -65,6 +68,7 @@ public actor SharedLibraryMaterializer {
       try fresh.encoded().write(to: scope.url, options: .atomic)
       return fresh
     }
+    if let pending = initialPending { return pending }
     var receipt = initialReceipt
     while receipt.completed < operation.steps.count {
       try Task.checkCancellation()
@@ -78,10 +82,10 @@ public actor SharedLibraryMaterializer {
       for item in items where FileManager.default.fileExists(atPath: item.url.path) {
         _ = try await RecordingFileAccess().waitUntilAvailable(at: item.url, knownToExist: true)
       }
-      if let binding = current.binding {
+      for binding in current.additionalBindings + (current.binding.map { [$0] } ?? []) {
         guard Self.contained(binding.file, in: root) else { throw SharedLibraryOperationError.unsafePath }
         guard try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) else {
-          return .waitingForFile(".docktape/format.json")
+          return .waitingForFile(binding.file.lastPathComponent)
         }
       }
       let fresh = try await authority()
@@ -95,12 +99,13 @@ public actor SharedLibraryMaterializer {
       let outcome: PhaseOutcome
       do {
         let gateItems = try gate?.items(outside: root) ?? []
-        let bindingReads = fresh.binding.map { [$0.file] } ?? []
+        let bindings = fresh.additionalBindings + (fresh.binding.map { [$0] } ?? [])
+        let bindingReads = bindings.map(\.file)
         outcome = try await access.withWrites([.init(receiptURL)] + items + gateItems, reading: bindingReads) {
           scopes -> PhaseOutcome in
           if let gate { try gate.validate(scopes[items.count + 1], outside: root) }
-          if let binding = fresh.binding {
-            let control = scopes[scopes.count - 1]
+          for (index, binding) in bindings.enumerated() {
+            let control = scopes[1 + items.count + gateItems.count + index]
             guard Self.contained(control.url, in: root),
                   control.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath() else {
               throw SharedLibraryOperationError.unsafePath
