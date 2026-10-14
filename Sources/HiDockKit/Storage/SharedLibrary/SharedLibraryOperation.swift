@@ -62,6 +62,8 @@ public struct SharedMaterializationAuthority: Sendable {
   public var jobGate: SharedLibraryJobGate? = nil
   public var jobGates: [SharedLibraryJobGate] = []
   public var hasLiveDescendants: Bool = false
+  /// Frozen child placements must still match an accepted directory move.
+  public var directoryScopeMatches: Bool = true
   /// Exact owners from the current identity/path index plus retained operation
   /// claims. An empty set is unowned, multiple IDs is a path conflict.
   public var pathOwners: [String: Set<UUID>]

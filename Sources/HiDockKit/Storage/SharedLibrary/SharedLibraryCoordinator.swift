@@ -711,6 +711,18 @@ public actor SharedLibraryCoordinator {
     return .init(filename: filename, result: result, projectionError: projectionError, view: view)
   }
 
+  private struct FolderMoveMember: Codable, Sendable {
+    let id: UUID
+    let kind: SharedEntityKind
+    let path: String
+  }
+  private struct FolderMoveScope: Codable, Sendable {
+    let library: UUID
+    let folder: UUID
+    let destination: String
+    let members: [FolderMoveMember]
+  }
+
   public func renameFolder(from source: String, to destination: String,
                            afterMutation: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedFolderFileOutcome {
     _ = try SharedLibraryIdentity.normalized(source); _ = try SharedLibraryIdentity.normalized(destination)
@@ -751,7 +763,14 @@ public actor SharedLibraryCoordinator {
       }
     }
     let materializer = try await makeMaterializer(entity: entity, paths: [source, destination], receipts: receipts, afterMutation: afterMutation)
-    let accepted = try await commit(.init(base: base, changes: [.assign(field: "name", value: .text(destination)), .assign(field: "physicalPath", value: .text(source))]), review: false, exact: true)
+    let scope = FolderMoveScope(library: base.libraryID, folder: entity.id, destination: destination,
+      members: views.compactMap { view in
+        guard view.state.id != entity.id, let path = index.resolvedPaths[view.state.id], path.hasPrefix(source + "/") else { return nil }
+        return FolderMoveMember(id: view.state.id, kind: view.state.kind, path: destination + String(path.dropFirst(source.count)))
+      }.sorted { $0.id.uuidString < $1.id.uuidString })
+    let document = try SharedDocument(id: UUID(), json: JSONEncoder().encode(scope))
+    let accepted = try await commit(.init(base: base, changes: [.assign(field: "name", value: .text(destination)),
+      .assign(field: "physicalPath", value: .text(source)), .assign(field: "moveScope", value: .document(document))]), review: false, exact: true)
     let operation = try SharedLibraryOperation(libraryID: base.libraryID, entity: entity,
       inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state),
       steps: [.moveDirectory(source: source, destination: destination, inventory: inventory)])
@@ -1282,6 +1301,23 @@ public actor SharedLibraryCoordinator {
     result.jobGates = jobGates
     result.hasLiveDescendants = entity.kind == .folder && snapshots.contains {
       $0.state.id != entity.id && affected.contains($0.state.id) && ($0.state.lifecycle != .deleted || !$0.state.conflicts.isEmpty)
+    }
+    if entity.kind == .folder, selected.state.value(for: "physicalPath") != selected.state.value(for: "name") {
+      result.directoryScopeMatches = false
+      if case .document(let document)? = selected.state.value(for: "moveScope"),
+         let scope = try? JSONDecoder().decode(FolderMoveScope.self, from: document.json),
+         scope.library == manifest.libraryID, scope.folder == entity.id,
+         selected.state.value(for: "name") == .text(scope.destination),
+         Set(scope.members.map(\.id)).count == scope.members.count,
+         Set(scope.members.map(\.id)) == affected.subtracting([entity.id]),
+         scope.members.allSatisfy({ member in
+           member.path.hasPrefix(scope.destination + "/") && snapshots.contains {
+             $0.state.id == member.id && $0.state.kind == member.kind && $0.state.lifecycle == .alive &&
+             $0.state.conflicts.isEmpty && index.resolvedPaths[member.id] == member.path
+           }
+         }) {
+        result.directoryScopeMatches = true
+      }
     }
     let formatURL = root.appendingPathComponent(".docktape/format.json")
     result.additionalBindings = authoritySources.filter { $0.key != formatURL }.map { url, expected in

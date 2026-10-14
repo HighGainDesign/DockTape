@@ -463,7 +463,10 @@ public actor SharedLibraryMaterializer {
           return .needsReplanning
         }
         if !repair && !authority.mayDestroy(.replaceAudio) { return .waitingForAcknowledgments }
-      case .move, .moveDirectory:
+      case .moveDirectory:
+        guard authority.directoryScopeMatches, authority.state.lifecycle == .alive else { return .needsReplanning }
+        if authority.hasPendingWork { return .waitingForActiveWork }
+      case .move:
         if authority.hasPendingWork { return .waitingForActiveWork }
         guard authority.state.lifecycle == .alive else { return .needsReplanning }
       default:

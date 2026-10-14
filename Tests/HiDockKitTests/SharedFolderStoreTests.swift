@@ -72,6 +72,56 @@ final class SharedFolderStoreTests: XCTestCase {
         let current = try await reopened.resolve(reference)
         XCTAssertEqual(current, "Renamed/Nested/B.mp3")
     }
+    func testChildPlacementChangeWhileParentMoveWaitsRequiresReplanning() async throws {
+        for scenario in ["rename", "reparent", "delete", "newChild"] {
+            let (root, coordinator, _) = try await fixture()
+            let ref = try await coordinator.reference(to: "Folder/A.mp3")
+            let nested = try await coordinator.reference(to: "Folder/Nested/B.mp3")
+            let token = try await coordinator.pinJob(.init(id: nested.entityID, kind: .recording), audioURL: root.appendingPathComponent("Folder/Nested/B.mp3"))
+            let pending = try await coordinator.renameFolder(from: "Folder", to: "Renamed")
+            XCTAssertEqual(pending.result, .waitingForActiveWork)
+            let child = SharedEntityIdentity(id: ref.entityID, kind: .recording)
+            switch scenario {
+            case "delete":
+                _ = try await coordinator.edit(.init(base: try await coordinator.read(child), changes: [.delete]))
+            case "newChild":
+                let fresh = SharedEntityIdentity(id: UUID(), kind: .recording)
+                _ = try await coordinator.edit(.init(base: try await coordinator.read(fresh), changes: [
+                    .assign(field: "initialPath", value: .text("Folder/Late.mp3")), .assign(field: "title", value: .text("Late")),
+                    .assign(field: "folder", value: .text(pending.id.uuidString))]))
+            default:
+                _ = try await coordinator.edit(.init(base: try await coordinator.read(child), changes: [
+                    .assign(field: scenario == "rename" ? "title" : "folder", value: scenario == "rename" ? .text("Changed") : .unset)]))
+            }
+            await coordinator.finishJob(token)
+            let reopened = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"))
+            let resumed = try await reopened.resumeFolderOperation(id: pending.id)
+            XCTAssertEqual(resumed.result, .needsReplanning, "Changed child placement must invalidate the directory plan")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder/A.mp3").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed").path))
+        }
+    }
+
+    func testIndependentMetadataEditWhileParentMoveWaitsIsRetained() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let ref = try await coordinator.reference(to: "Folder/A.mp3")
+        let token = try await coordinator.pinJob(.init(id: ref.entityID, kind: .recording), audioURL: root.appendingPathComponent("Folder/A.mp3"))
+        let pending = try await coordinator.renameFolder(from: "Folder", to: "Renamed")
+        XCTAssertEqual(pending.result, .waitingForActiveWork)
+        let child = SharedEntityIdentity(id: ref.entityID, kind: .recording)
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(child), changes: [.assign(field: "metadata.mode", value: .text("\"Wip\""))]))
+        await coordinator.finishJob(token)
+        let reopened = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"))
+        let resumed = try await reopened.resumeFolderOperation(id: pending.id)
+        XCTAssertEqual(resumed.result, .complete)
+        XCTAssertNil(resumed.projectionError)
+        let view = try await reopened.read(child)
+        XCTAssertEqual(view.state.value(for: "metadata.mode"), .text("\"Wip\""))
+        let current = try await reopened.resolve(ref)
+        XCTAssertEqual(current, "Renamed/A.mp3")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(current).path))
+    }
+
     func testInterruptedDirectoryMoveDoesNotPublishSidecarsBeforeReceiptRecovery() async throws {
         enum Stopped: Error { case afterMove }
         let (root, coordinator, _) = try await fixture()
