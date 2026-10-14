@@ -40,6 +40,7 @@ public actor TranscriptStore {
 
     /// Save a transcript, keyed by MP3 filename.
     public func save(_ transcript: Transcript, mp3Filename: String) throws {
+        try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let url = fileURL(for: mp3Filename)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -59,7 +60,6 @@ public actor TranscriptStore {
     /// Throwing UI load distinguishes a missing sidecar from download/read errors.
     public func loadTranscript(for mp3Filename: String,
                                onWaiting: @Sendable () async -> Void = {}) async throws -> Transcript? {
-        if let cached = cache[mp3Filename] { return cached }
         let revision = revisions[mp3Filename, default: 0]
         let loaded = try await loadFromDisk(mp3Filename: mp3Filename,
                                             knownToExist: knownFiles.contains(mp3Filename), onWaiting: onWaiting)
@@ -76,6 +76,7 @@ public actor TranscriptStore {
 
     /// Delete a transcript.
     public func delete(for mp3Filename: String) throws {
+        try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let url = fileURL(for: mp3Filename)
         try? FileManager.default.removeItem(at: url)
         revisions[mp3Filename, default: 0] += 1
@@ -94,11 +95,35 @@ public actor TranscriptStore {
     }
 
     /// Update speaker names in a transcript. JSON is written immediately; TXT regeneration is debounced.
-    public func updateSpeakerNames(for mp3Filename: String, names: [String: String]) throws {
-        guard var transcript = cache[mp3Filename] else { return }
-        transcript.speakerNames = names
-        try save(transcript, mp3Filename: mp3Filename)
+    public func updateSpeakerNames(for mp3Filename: String, names: [String: String]) async throws {
+        guard let base = cache[mp3Filename] else { throw HiDockError.storageError("Reload this transcript before editing.") }
+        let original = try Self.generationFingerprint(base)
+        let beforeNames = base.speakerNames
+        let file = fileURL(for: mp3Filename)
+        revisions[mp3Filename, default: 0] += 1
+        let revision = revisions[mp3Filename, default: 0]
+        let bytes = try await LegacyLibraryFileAccess().mutateObject(at: file, root: baseDirectory) { object in
+            let data = try JSONSerialization.data(withJSONObject: object)
+            let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+            let current = try decoder.decode(Transcript.self, from: data)
+            guard try Self.generationFingerprint(current) == original else {
+                throw HiDockError.storageError("This transcript changed while you were editing. Reload it and try again.")
+            }
+            var updated = current.speakerNames
+            for id in Set(beforeNames.keys).union(names.keys) where beforeNames[id] != names[id] { updated[id] = names[id] }
+            object["speakerNames"] = updated
+        }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let current = try decoder.decode(Transcript.self, from: bytes)
+        if revisions[mp3Filename, default: 0] == revision { cache[mp3Filename] = current }
         markTxtDirty(mp3Filename)
+    }
+
+    private static func generationFingerprint(_ transcript: Transcript) throws -> String {
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        var object = try JSONSerialization.jsonObject(with: encoder.encode(transcript)) as! [String: Any]
+        object.removeValue(forKey: "speakerNames"); object.removeValue(forKey: "recordingFilename")
+        return SharedLibraryOperation.fingerprint(try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
     }
 
     /// Merge speaker IDs: reassign all segments from `sourceID` to `targetID`, remove sourceID from names.
@@ -167,6 +192,7 @@ public actor TranscriptStore {
 
     /// Re-key a transcript after a recording rename.
     public func rename(from oldMp3: String, to newMp3: String) async throws {
+        try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         var loaded = cache[oldMp3]
         if loaded == nil { loaded = try await loadFromDisk(mp3Filename: newMp3) }
         if loaded == nil { loaded = try await loadFromDisk(mp3Filename: oldMp3) }
@@ -211,6 +237,7 @@ public actor TranscriptStore {
     }
 
     private func exportPlainText(_ transcript: Transcript, mp3Filename: String) throws {
+        try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let basename = (mp3Filename as NSString).deletingPathExtension
         let txtURL = baseDirectory.appendingPathComponent("\(basename).txt")
         let plainText = TranscriptExporter.exportPlainText(transcript: transcript)

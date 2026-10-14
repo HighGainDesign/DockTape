@@ -141,7 +141,7 @@ final class RecordingRenameTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = RecordingStore(baseDirectory: directory)
         try await store.setup()
-        await store.setMeta(mode: "Rec", deviceFilename: "original.hda", for: "renamed.mp3")
+        try await store.setMeta(mode: "Rec", deviceFilename: "original.hda", for: "renamed.mp3")
         let imported = await store.isDownloaded(filename: "original.hda")
         XCTAssertFalse(imported)
         let importedNames = await store.allImportedDeviceFilenames()

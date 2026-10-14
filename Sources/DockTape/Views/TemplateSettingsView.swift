@@ -11,6 +11,7 @@ struct TemplateSettingsView: View {
     @State private var editingTemplate: Template?
     @State private var showDeleteConfirmation = false
     @State private var templateToDelete: String?
+    @State private var persistenceError: String?
 
     // Debounce save
     @State private var saveTask: Task<Void, Never>?
@@ -26,6 +27,11 @@ struct TemplateSettingsView: View {
         .task {
             await loadTemplates()
         }
+        .alert("Template Change Failed", isPresented: Binding(
+            get: { persistenceError != nil }, set: { if !$0 { persistenceError = nil } }
+        )) {
+            Button("OK", role: .cancel) { persistenceError = nil }
+        } message: { Text(persistenceError ?? "") }
     }
 
     // MARK: - List Panel
@@ -193,43 +199,44 @@ struct TemplateSettingsView: View {
     private func debouncedSave() {
         saveTask?.cancel()
         saveTask = Task {
-            try? await Task.sleep(for: .milliseconds(500))
-            guard !Task.isCancelled, let template = editingTemplate else { return }
-            await state.templateStore.update(template)
-            await loadTemplates()
+            do {
+                try await Task.sleep(for: .milliseconds(500))
+                guard !Task.isCancelled, let template = editingTemplate else { return }
+                try await state.templateStore.update(template)
+                await loadTemplates()
+            } catch is CancellationError {
+                return
+            } catch { persistenceError = error.localizedDescription }
         }
     }
 
     private func addNewTemplate() {
-        let newTemplate = Template.makeUserTemplate(
-            name: "New Template",
-            description: "",
-            promptText: ""
-        )
+        let newTemplate = Template.makeUserTemplate(name: "New Template", description: "", promptText: "")
         Task {
-            await state.templateStore.addUserTemplate(newTemplate)
-            await loadTemplates()
-            selectedID = newTemplate.id
+            do {
+                try await state.templateStore.addUserTemplate(newTemplate)
+                await loadTemplates(); selectedID = newTemplate.id
+            } catch { persistenceError = error.localizedDescription }
         }
     }
 
     private func deleteTemplate(id: String) {
         Task {
-            await state.templateStore.delete(id: id)
-            if selectedID == id {
-                selectedID = nil
-                editingTemplate = nil
-            }
-            templateToDelete = nil
-            await loadTemplates()
+            do {
+                try await state.templateStore.delete(id: id)
+                if selectedID == id { selectedID = nil; editingTemplate = nil }
+                templateToDelete = nil
+                await loadTemplates()
+            } catch { persistenceError = error.localizedDescription }
         }
     }
 
     private func resetBuiltIn(id: String) {
         Task {
-            await state.templateStore.resetToDefault(id: id)
-            await loadTemplates()
-            editingTemplate = templates.first { $0.id == id }
+            do {
+                try await state.templateStore.resetToDefault(id: id)
+                await loadTemplates(); editingTemplate = templates.first { $0.id == id }
+            } catch { persistenceError = error.localizedDescription }
         }
     }
 

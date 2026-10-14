@@ -148,8 +148,8 @@ final class AppState {
     func setup() async throws {
         try await library.setup()
         try await summarization.summaryStore.loadAll()
-        await templateStore.load()
-        await templateStore.migrateFromUserDefaults(.standard)
+        try await templateStore.load()
+        try await templateStore.migrateFromUserDefaults(.standard)
 
         // Populate transcript statuses for recordings that already have transcripts on disk
         let transcribedFiles = await transcription.transcriptStore.allTranscribedFilenames()

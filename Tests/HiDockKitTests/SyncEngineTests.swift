@@ -32,7 +32,7 @@ final class SyncEngineTests: XCTestCase {
             var filename = metadata.filename
             if relocate {
                 filename = try await store.renameRecording(filename: filename, to: "meeting")
-                await store.renameMeta(from: metadata.filename, to: filename)
+                try await store.renameMeta(from: metadata.filename, to: filename)
                 try await store.createFolder(named: "Archive")
                 filename = try await store.moveRecording(filename: filename, toFolder: "Archive")
             }

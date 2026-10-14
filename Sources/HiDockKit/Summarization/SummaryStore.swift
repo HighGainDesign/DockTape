@@ -38,6 +38,7 @@ public actor SummaryStore {
 
     /// Save a summary, keyed by MP3 filename.
     public func save(_ summary: Summary, mp3Filename: String) throws {
+        try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let url = fileURL(for: mp3Filename)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -58,7 +59,6 @@ public actor SummaryStore {
     /// Throwing UI load distinguishes a missing sidecar from download/read errors.
     public func loadSummary(for mp3Filename: String,
                                onWaiting: @Sendable () async -> Void = {}) async throws -> Summary? {
-        if let cached = cache[mp3Filename] { return cached }
         let revision = revisions[mp3Filename, default: 0]
         let loaded = try await loadFromDisk(mp3Filename: mp3Filename,
                                             knownToExist: knownFiles.contains(mp3Filename), onWaiting: onWaiting)
@@ -74,26 +74,55 @@ public actor SummaryStore {
     }
 
     /// Toggle an action item's completion state and persist.
-    public func toggleItem(_ itemID: UUID, inSummaryFor mp3Filename: String) throws {
-        guard var summary = cache[mp3Filename] else { return }
-        for sectionIndex in summary.sections.indices {
-            guard var items = summary.sections[sectionIndex].items else { continue }
-            if let itemIndex = items.firstIndex(where: { $0.id == itemID }) {
-                items[itemIndex].isCompleted.toggle()
-                summary.sections[sectionIndex] = Summary.Section(
-                    id: summary.sections[sectionIndex].id,
-                    heading: summary.sections[sectionIndex].heading,
-                    content: summary.sections[sectionIndex].content,
-                    items: items
-                )
-                try save(summary, mp3Filename: mp3Filename)
-                return
-            }
+    public func toggleItem(_ itemID: UUID, inSummaryFor mp3Filename: String) async throws {
+        guard let base = cache[mp3Filename],
+              let item = base.sections.flatMap({ $0.items ?? [] }).first(where: { $0.id == itemID }) else {
+            throw HiDockError.storageError("Reload this summary before editing.")
         }
+        let original = try Self.generationFingerprint(base)
+        let desired = !item.isCompleted
+        revisions[mp3Filename, default: 0] += 1
+        let revision = revisions[mp3Filename, default: 0]
+        let bytes = try await LegacyLibraryFileAccess().mutateObject(at: fileURL(for: mp3Filename), root: baseDirectory) { object in
+            let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+            let current = try decoder.decode(Summary.self, from: JSONSerialization.data(withJSONObject: object))
+            guard try Self.generationFingerprint(current) == original else {
+                throw HiDockError.storageError("This summary changed while you were editing. Reload it and try again.")
+            }
+            var sections = object["sections"] as! [[String: Any]]
+            var found = false
+            for index in sections.indices {
+                guard var items = sections[index]["items"] as? [[String: Any]] else { continue }
+                for itemIndex in items.indices where (items[itemIndex]["id"] as? String).flatMap(UUID.init(uuidString:)) == itemID {
+                    items[itemIndex]["isCompleted"] = desired; found = true
+                }
+                sections[index]["items"] = items
+            }
+            guard found else { throw HiDockError.storageError("This action item no longer exists. Reload the summary.") }
+            object["sections"] = sections
+        }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let current = try decoder.decode(Summary.self, from: bytes)
+        if revisions[mp3Filename, default: 0] == revision { cache[mp3Filename] = current }
+    }
+
+    private static func generationFingerprint(_ summary: Summary) throws -> String {
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        var object = try JSONSerialization.jsonObject(with: encoder.encode(summary)) as! [String: Any]
+        object.removeValue(forKey: "recordingFilename")
+        var sections = object["sections"] as! [[String: Any]]
+        for index in sections.indices {
+            guard var items = sections[index]["items"] as? [[String: Any]] else { continue }
+            for itemIndex in items.indices { items[itemIndex].removeValue(forKey: "isCompleted") }
+            sections[index]["items"] = items
+        }
+        object["sections"] = sections
+        return SharedLibraryOperation.fingerprint(try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
     }
 
     /// Delete a summary.
     public func delete(for mp3Filename: String) throws {
+        try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let url = fileURL(for: mp3Filename)
         try? FileManager.default.removeItem(at: url)
         revisions[mp3Filename, default: 0] += 1
@@ -114,6 +143,7 @@ public actor SummaryStore {
     /// Re-key a summary after recording rename, moving the file on disk
     /// and updating the recordingFilename inside the summary.
     public func rename(from oldMp3: String, to newMp3: String) async throws {
+        try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         var loaded = cache[oldMp3]
         if loaded == nil { loaded = try await loadFromDisk(mp3Filename: newMp3) }
         if loaded == nil { loaded = try await loadFromDisk(mp3Filename: oldMp3) }
