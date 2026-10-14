@@ -22,6 +22,7 @@ public struct SharedCoordinatorEdit: Sendable {
   }
 }
 public struct SharedLibraryJobToken: Sendable {
+  let id: UUID
   let library: UUID
   let entity: SharedEntityIdentity
   let lifecycle: String
@@ -56,8 +57,25 @@ public actor SharedLibraryCoordinator {
   private let witnessDirectory: URL?
   private var manifest: SharedBootstrapManifest?
   private var members: SharedMemberRepository?
+  private var gate: SharedLibraryLocalGate?
   private var cache: [SharedEntityIdentity: SharedLibraryViewSnapshot] = [:]
   private var requests: [SharedEntityIdentity: UInt64] = [:]
+  private var authorityEpoch: UInt64 = 0
+  private var transitions = 0
+  private var authorityRevision: String?
+  private var authorityLease: SharedMaterializationLease?
+  private var leasedRevisions: [SharedEntityIdentity: String] = [:]
+  private var jobs: [UUID: SharedLibraryJobToken] = [:]
+  private func revokeAuthority() {
+    authorityLease?.revoke()
+    authorityLease = nil
+    authorityRevision = nil
+    leasedRevisions.removeAll()
+    authorityEpoch &+= 1
+  }
+  private func beginTransition() { revokeAuthority(); transitions += 1 }
+  private func endTransition() { transitions -= 1 }
+
   private var monitor: SharedLibraryChangeMonitor?
   private var monitorRefresh: Task<Void, Never>?
   private var listeners: [UUID: AsyncStream<SharedLibraryChange>.Continuation] = [:]
@@ -91,11 +109,17 @@ public actor SharedLibraryCoordinator {
     let witness = witnessDirectory.map {
       SharedOwnerWitness(directory: $0, libraryID: manifest.libraryID, writerID: writerID)
     }
-    try await repository.configure(manifest: manifest, witness: witness)
+    if gate == nil, let directory = witnessDirectory {
+      let local = SharedLibraryLocalGate(file: directory.appendingPathComponent("Gates")
+        .appendingPathComponent(manifest.libraryID.uuidString).appendingPathComponent(writerID.uuidString + ".lock"))
+      try await local.prepare(outside: root)
+      gate = local
+    }
+    try await repository.configure(manifest: manifest, witness: witness, gate: gate)
     self.manifest = manifest
     if members == nil {
       members = SharedMemberRepository(
-        root: root, writer: writerID, manifest: manifest, witness: witness)
+        root: root, writer: writerID, manifest: manifest, witness: witness, gate: gate)
     }
   }
   private func bind(force: Bool = false) async throws -> SharedBootstrapManifest {
@@ -122,6 +146,7 @@ public actor SharedLibraryCoordinator {
     return true
   }
   public func requestEnrollment(requestID: UUID, label: String) async throws {
+    beginTransition(); defer { endTransition() }
     let manifest = try await bind(force: true)
     guard manifest.complete else { throw SharedLibraryCoordinatorError.bootstrapPending }
     let members = try memberRepository()
@@ -177,6 +202,7 @@ public actor SharedLibraryCoordinator {
     _ snapshot: SharedLibraryViewSnapshot, entity: SharedEntityIdentity, request: UInt64
   ) {
     guard requests[entity] == request else { return }
+    if let leased = leasedRevisions[entity], leased != snapshot.fingerprint { revokeAuthority() }
     let changed = cache[entity]?.fingerprint != snapshot.fingerprint
     cache[entity] = snapshot
     if changed {
@@ -245,6 +271,7 @@ public actor SharedLibraryCoordinator {
   }
 
   public func refresh() async throws {
+    beginTransition(); defer { endTransition() }
     let manifest = try await bind(force: true)
     let members = try memberRepository()
     var membershipSnapshot = try await members.load()
@@ -365,6 +392,95 @@ public actor SharedLibraryCoordinator {
     }
   }
 
+  public func makeMaterializer(
+    entity: SharedEntityIdentity, paths: [String], receipts: URL,
+    afterMutation: @escaping @Sendable (Int) throws -> Void = { _ in }
+  ) async throws -> SharedLibraryMaterializer {
+    _ = try await bind(force: true)
+    guard let gate else { throw SharedLibraryOperationError.invalidOperation }
+    return SharedLibraryMaterializer(root: root, receipts: receipts,
+      authority: { try await self.operationAuthority(entity: entity, paths: paths) },
+      afterMutation: afterMutation, gate: gate)
+  }
+
+  /// Build physical permission from the whole current identity graph, not an
+  /// entity's cached filename. Aggregate projections require a separate all-
+  /// entity contract and cannot use this single-entity authority.
+  public func operationAuthority(entity: SharedEntityIdentity, paths: [String]) async throws
+    -> SharedMaterializationAuthority
+  {
+    guard transitions == 0 else { throw SharedLibraryOperationError.staleAuthority }
+    let epoch = authorityEpoch
+    let manifest = try await bind(force: true)
+    guard try await mayEdit() else { throw SharedLibraryCoordinatorError.enrollmentPending }
+    let members = try memberRepository()
+    let membership = try await members.load().membership
+    guard let directory = witnessDirectory else { throw SharedLibraryOperationError.invalidOperation }
+    let witness = SharedOwnerWitness(directory: directory, libraryID: manifest.libraryID, writerID: writerID)
+    let localCheckpoint = try witness.checkpointFingerprint()
+    let identities = try await repository.scan()
+    let repository = self.repository
+    let snapshots = try await withThrowingTaskGroup(of: SharedLibrarySnapshot.self) { group in
+      for identity in identities { group.addTask { try await repository.load(entity: identity) } }
+      var result: [SharedLibrarySnapshot] = []
+      for try await snapshot in group { result.append(snapshot) }
+      return result
+    }
+    let latest = try await members.load().membership
+    guard transitions == 0, authorityEpoch == epoch,
+          latest.fingerprint == membership.fingerprint else { throw SharedLibraryOperationError.staleAuthority }
+    guard snapshots.allSatisfy({ $0.writers.isSubset(of: membership.cohort) }) else {
+      throw SharedLibraryCoordinatorError.unrecognizedWriter
+    }
+    guard let selected = snapshots.first(where: { $0.state.id == entity.id && $0.state.kind == entity.kind }) else {
+      throw SharedSidecarError.unknownRecording
+    }
+    let sensitivity = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
+    let index = try SharedLibraryPathIndex(states: snapshots.map(\.state), caseSensitive: sensitivity)
+    let owners = index.operationOwners(for: paths)
+    for path in paths {
+      _ = try SharedLibraryIdentity.normalized(path)
+      guard path != "library.json", owners[path] == [entity.id] else {
+        throw SharedLibraryOperationError.pathConflict(path)
+      }
+    }
+    let acknowledgments = try await SharedOperationAcknowledgmentStore(
+      root: root, libraryID: manifest.libraryID, writer: writerID, witness: witness, gate: gate).load(entity: entity.id)
+    guard transitions == 0, authorityEpoch == epoch,
+          try witness.checkpointFingerprint() == localCheckpoint else { throw SharedLibraryOperationError.staleAuthority }
+    struct Revision: Encodable {
+      struct Entry: Encodable { let id: UUID; let kind: SharedEntityKind; let revision: String }
+      let membership: String
+      let entities: [Entry]
+      let jobs: [UUID]
+    }
+    let revision = try SharedStateFingerprint.of(Revision(
+      membership: membership.fingerprint,
+      entities: snapshots.map { .init(id: $0.state.id, kind: $0.state.kind, revision: $0.fingerprint) }
+        .sorted { ($0.kind.rawValue, $0.id.uuidString) < ($1.kind.rawValue, $1.id.uuidString) },
+      jobs: jobs.keys.sorted { $0.uuidString < $1.uuidString }))
+    if authorityRevision != revision || authorityLease?.isRevoked != false {
+      revokeAuthority()
+      authorityLease = .init()
+      authorityRevision = revision
+      leasedRevisions = Dictionary(uniqueKeysWithValues: snapshots.map {
+        (SharedEntityIdentity(id: $0.state.id, kind: $0.state.kind), $0.fingerprint)
+      })
+    }
+    var result = SharedMaterializationAuthority(
+      libraryID: manifest.libraryID, state: selected.state, membership: membership,
+      acknowledgments: acknowledgments, hasPendingWork: jobs.values.contains { $0.entity == entity }, pathOwners: owners)
+    result.allowedPaths = Set(paths)
+    result.revisionLease = authorityLease!
+    result.validateLocalCommit = { try witness.checkpointFingerprint() == localCheckpoint }
+    result.binding = .init(file: root.appendingPathComponent(".docktape/format.json")) { bytes in
+      guard let current = try? JSONDecoder().decode(SharedBootstrapManifest.self, from: bytes) else { return false }
+      return current.schemaVersion == manifest.schemaVersion && current.complete
+        && current.libraryID == manifest.libraryID && current.fingerprint == manifest.fingerprint
+    }
+    return result
+  }
+
   public func edit(_ edit: SharedCoordinatorEdit) async throws -> SharedLibraryViewSnapshot {
     try await commit(edit, review: false)
   }
@@ -374,6 +490,7 @@ public actor SharedLibraryCoordinator {
   private func commit(_ edit: SharedCoordinatorEdit, review: Bool) async throws
     -> SharedLibraryViewSnapshot
   {
+    beginTransition(); defer { endTransition() }
     let manifest = try await bind(force: true)
     guard manifest.libraryID == edit.base.libraryID, repository.accepts(edit.base.repository) else {
       throw SharedLibraryCoordinatorError.differentBinding
@@ -422,14 +539,23 @@ public actor SharedLibraryCoordinator {
   public func pinJob(_ entity: SharedEntityIdentity, input: SharedComponent? = nil) async throws
     -> SharedLibraryJobToken
   {
+    beginTransition(); defer { endTransition() }
     let snapshot = try await read(entity)
     guard snapshot.state.lifecycle == .alive else { throw SharedLibraryCoordinatorError.staleJob }
-    return .init(
-      library: snapshot.libraryID, entity: entity,
+    let token = SharedLibraryJobToken(
+      id: UUID(), library: snapshot.libraryID, entity: entity,
       lifecycle: try Self.lifecycleRevision(snapshot.state),
       component: input, input: try Self.inputRevision(snapshot.state, component: input))
+    jobs[token.id] = token
+    return token
+  }
+  public func finishJob(_ token: SharedLibraryJobToken) {
+    guard let existing = jobs[token.id], existing.library == token.library, existing.entity == token.entity else { return }
+    revokeAuthority()
+    jobs.removeValue(forKey: token.id)
   }
   public func validateJob(_ token: SharedLibraryJobToken) async throws {
+    guard jobs[token.id] != nil else { throw SharedLibraryCoordinatorError.staleJob }
     let snapshot = try await read(token.entity)
     guard snapshot.libraryID == token.library, snapshot.state.lifecycle == .alive,
       try Self.lifecycleRevision(snapshot.state) == token.lifecycle,

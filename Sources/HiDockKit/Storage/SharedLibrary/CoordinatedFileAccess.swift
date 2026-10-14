@@ -99,8 +99,10 @@ public struct CoordinatedFileAccess: Sendable {
 
   /// Only related files in one physical operation share this request. The
   /// receipt participates in the same local lease as its source/destination.
+  /// Related control-file reads follow the write scopes in the returned array;
+  /// hydration happens before acquiring this access, never in a global read batch.
   public func withWrites<Output: Sendable>(
-    _ items: [WriteItem], accessor: @escaping @Sendable ([Scope]) throws -> Output
+    _ items: [WriteItem], reading: [URL] = [], accessor: @escaping @Sendable ([Scope]) throws -> Output
   ) async throws -> Output {
     guard !items.isEmpty else { throw CocoaError(.fileWriteInvalidFileName) }
     let intents = items.map { item in
@@ -113,7 +115,8 @@ public struct CoordinatedFileAccess: Sendable {
       }
       return NSFileAccessIntent.writingIntent(with: item.url, options: options)
     }
-    return try await perform(intents: intents, accessor: accessor)
+    let reads = reading.map { NSFileAccessIntent.readingIntent(with: $0, options: []) }
+    return try await perform(intents: intents + reads, accessor: accessor)
   }
 
   /// A version read and its canonical-file history mutation form one local

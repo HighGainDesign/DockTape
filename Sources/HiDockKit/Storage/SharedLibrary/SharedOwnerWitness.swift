@@ -102,6 +102,28 @@ public struct SharedOwnerWitness: Sendable {
       .appendingPathComponent(writerID.uuidString)
       .appendingPathComponent(SharedLibraryOperation.fingerprint(Data(key.utf8)) + ".json")
   }
+  func checkpointFingerprint() throws -> String {
+    let stream = directory.appendingPathComponent(libraryID.uuidString).appendingPathComponent(writerID.uuidString)
+    struct Checkpoint: Encodable {
+      struct Entry: Encodable { let name: String; let fingerprint: String }
+      let library: UUID
+      let writer: UUID
+      let files: [Entry]
+    }
+    var entries: [Checkpoint.Entry] = []
+    if FileManager.default.fileExists(atPath: stream.path) {
+      for file in try FileManager.default.contentsOfDirectory(at: stream, includingPropertiesForKeys: [])
+        .filter({ $0.pathExtension == "json" }).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+        guard SharedLibraryMaterializer.contained(file.resolvingSymlinksInPath(), in: stream) else {
+          throw SharedOwnerWitnessError.invalidWitness
+        }
+        entries.append(.init(name: file.lastPathComponent,
+          fingerprint: SharedLibraryOperation.fingerprint(try Data(contentsOf: file))))
+      }
+    }
+    return try SharedStateFingerprint.of(Checkpoint(library: libraryID, writer: writerID, files: entries))
+  }
+
   private struct Record: Codable, Sendable {
     let schema: Int
     let library: UUID
@@ -120,6 +142,7 @@ public struct SharedOwnerWitness: Sendable {
     decode: @escaping @Sendable (Data) throws -> SharedOwnerHeadSummary,
     afterPublish: @escaping @Sendable () throws -> Void = {},
     observed: SharedOwnerHeadSummary? = nil,
+    gate: SharedLibraryLocalGate? = nil,
     body:
       @escaping @Sendable (CoordinatedFileAccess.Scope, Data?) throws -> SharedOwnerPreparedWrite<
         Output
@@ -141,9 +164,11 @@ public struct SharedOwnerWitness: Sendable {
     let writer = writerID
     let directory = self.directory
     let intendedHead = head.standardizedFileURL.resolvingSymlinksInPath()
-    return try await access.withWrites([.init(head), .init(file)]) { scopes in
+    let gateItems = try gate?.items(outside: head.deletingLastPathComponent()) ?? []
+    return try await access.withWrites([.init(head), .init(file)] + gateItems) { scopes in
       let target = scopes[0]
       let checkpoint = scopes[1]
+      if let gate { try gate.validate(scopes[2], outside: head.deletingLastPathComponent()) }
       guard target.url.standardizedFileURL.resolvingSymlinksInPath() == intendedHead,
         SharedLibraryMaterializer.contained(checkpoint.url, in: directory)
       else {

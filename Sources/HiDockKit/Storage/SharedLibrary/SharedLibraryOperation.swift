@@ -44,6 +44,15 @@ public struct SharedMaterializationLease: Sendable {
   public var isRevoked: Bool { cancellation.isCancelled }
 }
 
+public struct SharedMaterializationBinding: Sendable {
+  public let file: URL
+  public let validate: @Sendable (Data) throws -> Bool
+  public init(file: URL, validate: @escaping @Sendable (Data) throws -> Bool) {
+    self.file = file
+    self.validate = validate
+  }
+}
+
 public struct SharedMaterializationAuthority: Sendable {
   public let libraryID: UUID
   public var state: SharedEntityState
@@ -53,7 +62,14 @@ public struct SharedMaterializationAuthority: Sendable {
   /// Exact owners from the current identity/path index plus retained operation
   /// claims. An empty set is unowned, multiple IDs is a path conflict.
   public var pathOwners: [String: Set<UUID>]
+  /// Live coordinator permissions are limited to these requested canonical
+  /// paths. Staged-input locations are separately bound/validated by the plan.
+  public var allowedPaths: Set<String>? = nil
+  public var binding: SharedMaterializationBinding? = nil
   public var revisionLease: SharedMaterializationLease
+  /// Actual coordinator authority checks its local checkpoint again inside the
+  /// gate: a different process cannot revoke this process's Progress object.
+  public var validateLocalCommit: @Sendable () throws -> Bool = { true }
   public init(
     libraryID: UUID, state: SharedEntityState, membership: SharedLibraryMembership,
     acknowledgments: [SharedOperationAcknowledgment], hasPendingWork: Bool,
@@ -126,6 +142,15 @@ public struct SharedLibraryOperation: Codable, Equatable, Sendable {
     self.steps = steps
     self.inputAudioFingerprint = inputAudioFingerprint
     try validate()
+  }
+  var canonicalPaths: Set<String> {
+    Set(steps.flatMap { step -> [String] in
+      switch step {
+      case .move(let source, let destination, _): return [source, destination]
+      case .write(let path, _, _), .trash(let path, _), .createDirectory(let path), .removeEmptyDirectory(let path): return [path]
+      case .publishAudio(let path, _, _), .replaceAudio(let path, _, _, _, _): return [path]
+      }
+    })
   }
   public static func fingerprint(_ bytes: Data) -> String {
     SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()

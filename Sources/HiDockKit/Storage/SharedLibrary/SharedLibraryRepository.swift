@@ -62,27 +62,30 @@ public actor SharedLibraryRepository {
   private let access = CoordinatedFileAccess()
   private let binding: String
   private var witness: SharedOwnerWitness?
+  private var gate: SharedLibraryLocalGate?
   private var trustedFoundation: SharedLibraryMembership?
 
   public init(
     root: URL, writerID: UUID, manifest: SharedBootstrapManifest? = nil,
-    witness: SharedOwnerWitness? = nil
+    witness: SharedOwnerWitness? = nil, gate: SharedLibraryLocalGate? = nil
   ) {
     self.root = root.standardizedFileURL.resolvingSymlinksInPath()
     self.writerID = writerID
     self.witness = witness
+    self.gate = gate
     binding = Self.hash(Data(self.root.path.utf8))
     trustedFoundation = manifest.map {
       .init(libraryID: $0.libraryID, founder: $0.founder, bootstrapFingerprint: $0.fingerprint)
     }
   }
 
-  func configure(manifest: SharedBootstrapManifest, witness: SharedOwnerWitness? = nil) throws {
+  func configure(manifest: SharedBootstrapManifest, witness: SharedOwnerWitness? = nil, gate: SharedLibraryLocalGate? = nil) throws {
     let incoming = SharedLibraryMembership(
       libraryID: manifest.libraryID, founder: manifest.founder,
       bootstrapFingerprint: manifest.fingerprint)
     if let existing = trustedFoundation { _ = try existing.merged(with: incoming) }
     trustedFoundation = incoming
+    if let gate { _ = try gate.items(outside: root); self.gate = gate }
     if let witness {
       guard witness.isOutside(root), witness.matches(library: manifest.libraryID, writer: writerID)
       else {
@@ -228,6 +231,8 @@ public actor SharedLibraryRepository {
     -> SharedLibrarySnapshot
   {
     if let witness, !witness.isOutside(root) { throw SharedLibraryRepositoryError.invalidPath }
+    let gate = self.gate
+    let gateItems = try gate?.items(outside: root) ?? []
     guard edit.base.binding == binding, edit.base.writer == writerID else {
       throw SharedLibraryRepositoryError.differentBinding
     }
@@ -343,9 +348,11 @@ public actor SharedLibraryRepository {
         decode: {
           Self.witnessSummary(
             try Self.decode($0, entity: entity, expectedWriter: writer, foundation: foundation))
-        }, observed: proof, body: execute)
+        }, observed: proof, gate: gate, body: execute)
     }
-    return try await access.withWrite(at: destination) { scope in
+    return try await access.withWrites([.init(destination)] + gateItems) { scopes in
+      let scope = scopes[0]
+      if let gate { try gate.validate(scopes[scopes.count - 1], outside: root) }
       let data =
         FileManager.default.fileExists(atPath: scope.url.path)
         ? try Data(contentsOf: scope.url) : nil

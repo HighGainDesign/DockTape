@@ -9,11 +9,13 @@ public actor SharedOperationAcknowledgmentStore {
   private let writer: UUID
   private let access = CoordinatedFileAccess()
   private let witness: SharedOwnerWitness?
-  public init(root: URL, libraryID: UUID, writer: UUID, witness: SharedOwnerWitness? = nil) {
+  private let gate: SharedLibraryLocalGate?
+  public init(root: URL, libraryID: UUID, writer: UUID, witness: SharedOwnerWitness? = nil, gate: SharedLibraryLocalGate? = nil) {
     self.root = root.standardizedFileURL.resolvingSymlinksInPath()
     self.libraryID = libraryID
     self.writer = writer
     self.witness = witness
+    self.gate = gate
   }
   private struct Payload: Codable, Equatable, Sendable {
     let schema: Int
@@ -41,7 +43,7 @@ public actor SharedOperationAcknowledgmentStore {
     }
     try await write(
       acknowledgment, entity: acknowledgment.entity, directory: directory,
-      lease: fresh.revisionLease)
+      lease: fresh.revisionLease, validation: fresh.validateLocalCommit)
     return acknowledgment
   }
   public func withdraw(entity: UUID) async throws {
@@ -50,7 +52,7 @@ public actor SharedOperationAcknowledgmentStore {
   }
   private func write(
     _ acknowledgment: SharedOperationAcknowledgment?, entity: UUID, directory: URL,
-    lease: SharedMaterializationLease? = nil
+    lease: SharedMaterializationLease? = nil, validation: @escaping @Sendable () throws -> Bool = { true }
   ) async throws {
     let file = directory.appendingPathComponent(writer.uuidString + ".json")
     let library = libraryID
@@ -58,12 +60,14 @@ public actor SharedOperationAcknowledgmentStore {
     let root = self.root
     // Include valid provider copies when repairing the owner sequence. The
     // device-local counter witness is also required at app integration.
+    let gate = self.gate
+    let gateItems = try gate?.items(outside: root) ?? []
     let known = try await payloads(entity: entity)
     let highWater = known.filter { $0.writer == writer }.map(\.sequence).max() ?? 0
     let execute:
       @Sendable (CoordinatedFileAccess.Scope, Data?) throws -> SharedOwnerPreparedWrite<Void> = {
         scope, data in
-        guard lease?.isRevoked != true else { throw SharedLibraryOperationError.staleAuthority }
+        guard lease?.isRevoked != true, try validation() else { throw SharedLibraryOperationError.staleAuthority }
         try SharedLibraryMaterializer.checkRoot(root)
         guard SharedLibraryMaterializer.contained(scope.url, in: directory) else {
           throw SharedLibraryOperationError.unsafePath
@@ -96,9 +100,11 @@ public actor SharedOperationAcknowledgmentStore {
         at: file, key: "ack." + entity.uuidString,
         decode: {
           try Self.summary(Self.decode($0, library: library, entity: entity))
-        }, body: execute)
+        }, gate: gate, body: execute)
     } else {
-      try await access.withWrite(at: file) { scope in
+      try await access.withWrites([.init(file)] + gateItems) { scopes in
+        let scope = scopes[0]
+        if let gate { try gate.validate(scopes[scopes.count - 1], outside: root) }
         let data =
           FileManager.default.fileExists(atPath: scope.url.path)
           ? try Data(contentsOf: scope.url) : nil

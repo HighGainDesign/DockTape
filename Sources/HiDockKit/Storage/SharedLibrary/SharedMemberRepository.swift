@@ -16,12 +16,15 @@ actor SharedMemberRepository {
   private let initial: SharedLibraryMembership
   private let access = CoordinatedFileAccess()
   private let witness: SharedOwnerWitness?
+  private let gate: SharedLibraryLocalGate?
   init(
-    root: URL, writer: UUID, manifest: SharedBootstrapManifest, witness: SharedOwnerWitness? = nil
+    root: URL, writer: UUID, manifest: SharedBootstrapManifest, witness: SharedOwnerWitness? = nil,
+    gate: SharedLibraryLocalGate? = nil
   ) {
     self.root = root.standardizedFileURL.resolvingSymlinksInPath()
     self.writer = writer
     self.witness = witness
+    self.gate = gate
     initial = .init(
       libraryID: manifest.libraryID, founder: manifest.founder,
       bootstrapFingerprint: manifest.fingerprint)
@@ -146,6 +149,8 @@ actor SharedMemberRepository {
     {
       throw SharedLibraryRepositoryError.differentBinding
     }
+    let gate = self.gate
+    let gateItems = try gate?.items(outside: root) ?? []
     _ = try initial.merged(with: membership)
     let root = self.root
     let directory = self.directory
@@ -226,9 +231,11 @@ actor SharedMemberRepository {
         at: destination, key: "members",
         decode: {
           try Self.witnessSummary(Self.decode($0, expected: writer))
-        }, observed: proof, body: execute)
+        }, observed: proof, gate: gate, body: execute)
     }
-    return try await access.withWrite(at: destination) { scope in
+    return try await access.withWrites([.init(destination)] + gateItems) { scopes in
+      let scope = scopes[0]
+      if let gate { try gate.validate(scopes[scopes.count - 1], outside: root) }
       let bytes =
         FileManager.default.fileExists(atPath: scope.url.path)
         ? try Data(contentsOf: scope.url) : nil

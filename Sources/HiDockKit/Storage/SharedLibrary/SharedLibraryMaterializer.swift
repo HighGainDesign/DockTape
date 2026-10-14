@@ -12,19 +12,22 @@ public actor SharedLibraryMaterializer {
   private let trash: @Sendable (URL) throws -> Void
   private let afterMutation: @Sendable (Int) throws -> Void
   private let access = CoordinatedFileAccess()
+  private let gate: SharedLibraryLocalGate?
   private var active: Set<UUID> = []
   public init(
     root: URL, receipts: URL, authority: @escaping Authority,
     trash: @escaping @Sendable (URL) throws -> Void = {
       try SharedLibraryMaterializer.moveToTrash($0)
     },
-    afterMutation: @escaping @Sendable (Int) throws -> Void = { _ in }
+    afterMutation: @escaping @Sendable (Int) throws -> Void = { _ in },
+    gate: SharedLibraryLocalGate? = nil
   ) {
     self.root = root.standardizedFileURL.resolvingSymlinksInPath()
     self.receipts = receipts.standardizedFileURL.resolvingSymlinksInPath()
     self.authority = authority
     self.trash = trash
     self.afterMutation = afterMutation
+    self.gate = gate
   }
 
   public func replay(_ operation: SharedLibraryOperation) async throws
@@ -75,6 +78,12 @@ public actor SharedLibraryMaterializer {
       for item in items where FileManager.default.fileExists(atPath: item.url.path) {
         _ = try await RecordingFileAccess().waitUntilAvailable(at: item.url, knownToExist: true)
       }
+      if let binding = current.binding {
+        guard Self.contained(binding.file, in: root) else { throw SharedLibraryOperationError.unsafePath }
+        guard try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) else {
+          return .waitingForFile(".docktape/format.json")
+        }
+      }
       let fresh = try await authority()
       if let pending = try Self.check(operation, authority: fresh) { return pending }
       let index = receipt.completed
@@ -82,11 +91,23 @@ public actor SharedLibraryMaterializer {
       let afterMutation = self.afterMutation
       let root = self.root
       let receipts = self.receipts
+      let gate = self.gate
       let outcome: PhaseOutcome
       do {
-        outcome = try await access.withWrites([.init(receiptURL)] + items) {
+        let gateItems = try gate?.items(outside: root) ?? []
+        let bindingReads = fresh.binding.map { [$0.file] } ?? []
+        outcome = try await access.withWrites([.init(receiptURL)] + items + gateItems, reading: bindingReads) {
           scopes -> PhaseOutcome in
-          guard !fresh.revisionLease.isRevoked else { return .pending(.needsReplanning) }
+          if let gate { try gate.validate(scopes[items.count + 1], outside: root) }
+          if let binding = fresh.binding {
+            let control = scopes[scopes.count - 1]
+            guard Self.contained(control.url, in: root),
+                  control.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath() else {
+              throw SharedLibraryOperationError.unsafePath
+            }
+            guard try binding.validate(Data(contentsOf: control.url)) else { return .pending(.needsReplanning) }
+          }
+          guard !fresh.revisionLease.isRevoked, try fresh.validateLocalCommit() else { return .pending(.needsReplanning) }
           try Self.checkRoot(root)
           guard Self.contained(scopes[0].url, in: receipts) else {
             throw SharedLibraryOperationError.unsafePath
@@ -98,7 +119,7 @@ public actor SharedLibraryMaterializer {
           }
           // Another process may have finished this phase while waiting.
           if actual.completed != index { return .advanced(actual) }
-          let files = Array(scopes.dropFirst())
+          let files = Array(scopes.dropFirst().prefix(items.count))
           for file in files {
             guard Self.contained(file.url, in: root) else {
               throw SharedLibraryOperationError.unsafePath
@@ -115,7 +136,7 @@ public actor SharedLibraryMaterializer {
             step, files: files, authority: fresh,
             replaying: replaying, trash: trash,
             beforeMutation: {
-              guard !fresh.revisionLease.isRevoked else {
+              guard !fresh.revisionLease.isRevoked, try fresh.validateLocalCommit() else {
                 throw SharedLibraryOperationError.staleAuthority
               }
               try receiptScope.checkCancellation()
@@ -375,6 +396,9 @@ public actor SharedLibraryMaterializer {
       operation.entity.id == authority.state.id, operation.entity.kind == authority.state.kind
     else {
       throw SharedLibraryOperationError.differentBinding
+    }
+    if let allowed = authority.allowedPaths, let denied = operation.canonicalPaths.subtracting(allowed).sorted().first {
+      throw SharedLibraryOperationError.pathConflict(denied)
     }
     guard !authority.revisionLease.isRevoked, authority.state.conflicts.isEmpty,
       try SharedStateFingerprint.of(authority.state) == operation.outputRevision
