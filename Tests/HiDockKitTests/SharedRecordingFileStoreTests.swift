@@ -473,11 +473,12 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         do { _ = try await task.value; XCTFail("Cancel after accepted intent") } catch is CancellationError {}
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Interrupted.mp3").path))
         let before = try await coordinator.recording(at: "Interrupted.mp3")
-        let resumed = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
-        try await resumed.setup()
-        let imported = try await resumed.importRecording(hdaData: bytes, entry: entry)
-        XCTAssertEqual(imported?.reference?.entityID, before.state.id)
+        let reopened = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"))
+        let resumed = try await reopened.resumeRecordingOperation(id: before.state.id)
+        XCTAssertEqual(resumed.result, .complete, "Accepted input must recover without device retransfers")
         XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Interrupted.mp3")), bytes)
+        XCTAssertTrue(LibraryFileDiscovery.files(in: root.appendingPathComponent(".docktape/staging"), suffix: ".mp3").isEmpty)
     }
     func testVerifiedSourceImportIdentityIsDeterministicAndChecksumSkipDetectsCorruption() async throws {
         let (root, coordinator, store) = try await fixture()

@@ -548,8 +548,8 @@ public actor SharedLibraryCoordinator {
     if actualHash != selected && base.state.value(for: "audioPublished") == nil {
       changes.append(.assign(field: "audioPublished", value: priorHash.map(SharedFieldValue.text) ?? .unset))
     }
-    let accepted = changes.isEmpty ? base : try await commit(.init(base: base, changes: changes), review: false, exact: true)
     if actualHash == selected {
+      let accepted = changes.isEmpty ? base : try await commit(.init(base: base, changes: changes), review: false, exact: true)
       if accepted.state.fields["audioPublished"] != nil, accepted.state.value(for: "audioPublished") != .text(selected) {
         throw SharedLibraryOperationError.unfinishedOperation
       }
@@ -569,15 +569,26 @@ public actor SharedLibraryCoordinator {
         break
       }
     }
+    let stager = try await makeInputStager(entity: entity, library: base.libraryID)
     let staged: String
     if let reusable { staged = reusable }
-    else { staged = try await materializer.stageNewAudio(bytes, entity: entity) }
+    else { staged = try await stager.stageNewAudio(bytes, entity: entity) }
+    let accepted: SharedLibraryViewSnapshot
+    do { accepted = changes.isEmpty ? base : try await commit(.init(base: base, changes: changes), review: false, exact: true) }
+    catch {
+      // Cleanup refuses any currently accepted matching input, including a
+      // peer's concurrent acceptance. Never delete an accepted sole copy.
+      try? await Task.detached { try await stager.discardStagedAudio(staged, entity: entity, fingerprint: selected) }.value
+      throw error
+    }
     let repair = priorHash == selected
     let step: SharedLibraryOperation.Step = !hasPublishedAudio
       ? .publishAudio(path: filename, staged: staged, selectedFingerprint: selected)
       : .replaceAudio(path: filename, staged: staged, expectedFingerprint: actualHash, selectedFingerprint: selected, repair: repair)
     let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
       inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: [step], inputAudioFingerprint: priorHash)
+    try await Task.detached { try await materializer.recordIntent(operation) }.value
+    try Task.checkCancellation()
     if !repair && hasPublishedAudio {
       let permission = try await operationAuthority(entity: entity, paths: [])
       if !permission.hasPendingWork { try await acknowledgeOperation(entity: entity, purpose: .replaceAudio) }
@@ -682,8 +693,14 @@ public actor SharedLibraryCoordinator {
       .assign(field: "audioPublished", value: .unset),
       .assign(field: "legacyMetadata", value: .document(try SharedDocument(id: UUID(), json: JSONEncoder().encode(metadata)))),
       .assign(field: "mergeSources", value: .document(try SharedDocument(id: UUID(), json: JSONSerialization.data(withJSONObject: provenance, options: .sortedKeys))))]
-    try await beforeCommit()
-    try Task.checkCancellation()
+    let materializer = try await makeMaterializer(entity: entity, paths: [filename], receipts: operationReceipts(library: manifest.libraryID))
+    let stager = try await makeInputStager(entity: entity, library: manifest.libraryID)
+    let staged = try await stager.stageNewAudio(bytes, entity: entity)
+    do { try await beforeCommit(); try Task.checkCancellation() }
+    catch {
+      try? await Task.detached { try await stager.discardStagedAudio(staged, entity: entity, fingerprint: selected) }.value
+      throw error
+    }
     let leases = tokens.map(\.lease)
     let validate: @Sendable (SharedEntityState) throws -> Void = { state in
       guard state.lifecycle == .uninitialized, leases.allSatisfy({ !$0.isRevoked }) else { throw SharedLibraryCoordinatorError.staleJob }
@@ -693,15 +710,19 @@ public actor SharedLibraryCoordinator {
     do {
       accepted = try await repository.commit(.init(base: base, changes: changes, validation: validate, bindings: proofs))
       endTransition()
-    } catch { endTransition(); throw error }
+    } catch {
+      endTransition()
+      try? await Task.detached { try await stager.discardStagedAudio(staged, entity: entity, fingerprint: selected) }.value
+      throw error
+    }
     var view = SharedLibraryViewSnapshot(libraryID: manifest.libraryID, repository: accepted)
     publish(view, entity: entity, request: beginRead(entity))
     await afterCommit()
-    let materializer = try await makeMaterializer(entity: entity, paths: [filename], receipts: operationReceipts(library: manifest.libraryID))
-    let staged = try await materializer.stageNewAudio(bytes, entity: entity)
     let operation = try SharedLibraryOperation(libraryID: manifest.libraryID, entity: entity,
       inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: view.state),
       steps: [.publishAudio(path: filename, staged: staged, selectedFingerprint: selected)])
+    try await Task.detached { try await materializer.recordIntent(operation) }.value
+    try Task.checkCancellation()
     let result = try await materializer.replay(operation)
     var projectionError: String?
     if result == .complete {
@@ -1268,10 +1289,25 @@ public actor SharedLibraryCoordinator {
       trash: trash, afterMutation: afterMutation, gate: gate)
   }
 
+  /// Input staging can precede creation of the recording. This authority is
+  /// private and grants no canonical paths; ordinary physical permission still
+  /// requires an existing entity in the shared graph.
+  private func makeInputStager(entity: SharedEntityIdentity, library: UUID) async throws -> SharedLibraryMaterializer {
+    _ = try await bind(force: true)
+    guard let gate else { throw SharedLibraryOperationError.invalidOperation }
+    return SharedLibraryMaterializer(root: root, receipts: try operationReceipts(library: library),
+      authority: { try await self.protectedOperationAuthority(entity: entity, paths: [], includeUninitialized: true) },
+      trash: trash, gate: gate)
+  }
   /// Build physical permission from the whole current identity graph, not an
   /// entity's cached filename. Aggregate projections require a separate all-
   /// entity contract and cannot use this single-entity authority.
   public func operationAuthority(entity: SharedEntityIdentity, paths: [String]) async throws
+    -> SharedMaterializationAuthority
+  {
+    try await protectedOperationAuthority(entity: entity, paths: paths, includeUninitialized: false)
+  }
+  private func protectedOperationAuthority(entity: SharedEntityIdentity, paths: [String], includeUninitialized: Bool) async throws
     -> SharedMaterializationAuthority
   {
     guard transitions == 0 else { throw SharedLibraryOperationError.staleAuthority }
@@ -1299,8 +1335,12 @@ public actor SharedLibraryCoordinator {
     guard snapshots.allSatisfy({ $0.writers.isSubset(of: membership.cohort) }) else {
       throw SharedLibraryCoordinatorError.unrecognizedWriter
     }
-    guard let selected = snapshots.first(where: { $0.state.id == entity.id && $0.state.kind == entity.kind }) else {
-      throw SharedSidecarError.unknownRecording
+    let selected: SharedLibrarySnapshot
+    if let existing = snapshots.first(where: { $0.state.id == entity.id && $0.state.kind == entity.kind }) { selected = existing }
+    else {
+      guard includeUninitialized, paths.isEmpty, entity.kind == .recording else { throw SharedSidecarError.unknownRecording }
+      selected = try await repository.load(entity: entity)
+      guard selected.state.lifecycle == .uninitialized, selected.writers.isEmpty else { throw SharedLibraryOperationError.invalidOperation }
     }
     let sensitivity = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
     let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)

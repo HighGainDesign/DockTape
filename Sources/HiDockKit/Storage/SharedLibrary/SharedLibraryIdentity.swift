@@ -28,6 +28,15 @@ public enum SharedLibraryIdentity {
         return identifier("DockTape.device-import.v1\0" + path + "\0" + fingerprint)
     }
 
+    /// Local staging deduplicates a prepared input; it is never a recording ID.
+    static func stagedInput(entity: UUID, fingerprint: String) throws -> UUID {
+        guard fingerprint.utf8.count == 64,
+              fingerprint.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+            throw SharedLibraryIdentityError.invalidSourceFingerprint
+        }
+        return identifier("DockTape.staged-input.v1\0" + entity.uuidString + "\0" + fingerprint)
+    }
+
     public static func normalized(_ relativePath: String) throws -> String {
         let path = relativePath.precomposedStringWithCanonicalMapping
         let parts = path.split(separator: "/", omittingEmptySubsequences: false)

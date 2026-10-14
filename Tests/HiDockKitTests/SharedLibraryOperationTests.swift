@@ -126,6 +126,43 @@ final class SharedLibraryOperationTests: XCTestCase {
     }
   }
 
+  func testConcurrentStagingOfSameInputUsesOneVerifiedFile() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let bytes = Data("same new input".utf8)
+    async let first = fixture.materializer().stageNewAudio(bytes, entity: fixture.entity)
+    async let second = fixture.materializer().stageNewAudio(bytes, entity: fixture.entity)
+    let paths = try await (first, second)
+    XCTAssertEqual(paths.0, paths.1)
+    XCTAssertEqual(try Data(contentsOf: fixture.root.appendingPathComponent(paths.0)), bytes)
+    XCTAssertEqual(LibraryFileDiscovery.files(in: fixture.root.appendingPathComponent(".docktape/staging"), suffix: ".mp3").count, 1)
+  }
+
+  func testStageAndDiscardHoldCurrentAuthorityBindings() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let control = fixture.root.appendingPathComponent("control.json")
+    let initial = Data("initial source proof".utf8)
+    try initial.write(to: control)
+    var permission = await fixture.authority.current()
+    permission.additionalBindings = [.init(file: control) { $0 == initial }]
+    await fixture.authority.update(permission)
+    let materializer = fixture.materializer()
+    let bytes = Data("new staged input".utf8)
+    let staged = try await materializer.stageNewAudio(bytes, entity: fixture.entity)
+    try Data("changed authority".utf8).write(to: control, options: .atomic)
+    do {
+      try await materializer.discardStagedAudio(staged, entity: fixture.entity, fingerprint: SharedLibraryOperation.fingerprint(bytes))
+      XCTFail("Unvalidated authority cannot discard input")
+    } catch SharedLibraryOperationError.staleAuthority {}
+    XCTAssertEqual(try Data(contentsOf: fixture.root.appendingPathComponent(staged)), bytes)
+    do {
+      _ = try await materializer.stageNewAudio(bytes, entity: fixture.entity)
+      XCTFail("Unvalidated authority cannot stage input")
+    } catch SharedLibraryOperationError.staleAuthority {}
+    XCTAssertEqual(LibraryFileDiscovery.files(in: fixture.root.appendingPathComponent(".docktape/staging"), suffix: ".mp3").count, 1)
+  }
+
   func testNormalizedMoveAcceptsCompactionButRejectsEditsLifecycleABAAndReplacementGeneration() async throws {
     for change in ["compaction", "title", "lifecycle", "generation"] {
       let fixture = try Fixture()

@@ -308,6 +308,25 @@ public actor SharedLibraryMaterializer {
     }
   }
 
+  private func withInputWrite(at file: URL, permission: SharedMaterializationAuthority,
+      mutation: @escaping @Sendable (CoordinatedFileAccess.Scope) throws -> Void) async throws {
+    let gate = self.gate, root = self.root
+    let gateItems = try gate?.items(outside: root) ?? []
+    let bindings = permission.additionalBindings + (permission.binding.map { [$0] } ?? [])
+    try await access.withWrites([.init(file)] + gateItems, reading: bindings.map(\.file)) { scopes in
+      if let gate { try gate.validate(scopes[1], outside: root) }
+      for (index, binding) in bindings.enumerated() {
+        let scope = scopes[1 + gateItems.count + index]
+        guard Self.contained(scope.url, in: root),
+          scope.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath() else {
+          throw SharedLibraryOperationError.unsafePath
+        }
+        guard try binding.validate(Data(contentsOf: scope.url)) else { throw SharedLibraryOperationError.staleAuthority }
+      }
+      guard !permission.revisionLease.isRevoked, try permission.validateLocalCommit() else { throw SharedLibraryOperationError.staleAuthority }
+      try mutation(scopes[0])
+    }
+  }
   public func discardStagedAudio(
     _ staged: String, entity: SharedEntityIdentity, fingerprint: String
   ) async throws {
@@ -321,7 +340,7 @@ public actor SharedLibraryMaterializer {
     else {
       throw SharedLibraryOperationError.unsafePath
     }
-    let current = try await authority()
+    let current = try await readAuthority()
     guard current.state.id == entity.id, current.state.kind == entity.kind,
       current.state.conflicts.isEmpty,
       current.state.value(for: "audioFingerprint") != .text(fingerprint)
@@ -330,7 +349,7 @@ public actor SharedLibraryMaterializer {
     }
     let file = root.appendingPathComponent(staged)
     let root = self.root
-    try await access.withWrite(at: file) { scope in
+    try await withInputWrite(at: file, permission: current) { scope in
       try Self.checkRoot(root)
       guard Self.contained(scope.url, in: root) else {
         throw SharedLibraryOperationError.unsafePath
@@ -342,6 +361,7 @@ public actor SharedLibraryMaterializer {
       guard actual == fingerprint else {
         throw SharedLibraryOperationError.contentChanged("staged audio")
       }
+      guard !current.revisionLease.isRevoked, try current.validateLocalCommit() else { throw SharedLibraryOperationError.staleAuthority }
       try scope.checkCancellation()
       try FileManager.default.removeItem(at: scope.url)
     }
@@ -416,9 +436,9 @@ public actor SharedLibraryMaterializer {
   /// Stage only a newly supplied input. Its entity-scoped path is consumed by
   /// replacement or explicit cancellation; there is no copy of old audio.
   public func stageNewAudio(_ bytes: Data, entity: SharedEntityIdentity) async throws -> String {
-    let current = try await authority()
+    let current = try await readAuthority()
     guard current.state.id == entity.id, current.state.kind == entity.kind,
-      current.state.lifecycle == .alive, current.state.conflicts.isEmpty
+      (current.state.lifecycle == .alive || current.state.lifecycle == .uninitialized), current.state.conflicts.isEmpty
     else {
       throw SharedLibraryOperationError.invalidOperation
     }
@@ -447,15 +467,17 @@ public actor SharedLibraryMaterializer {
         }
       }
     }
-    let relative = ".docktape/staging/" + entity.id.uuidString + "/" + UUID().uuidString + ".mp3"
+    let fingerprint = SharedLibraryOperation.fingerprint(bytes)
+    let inputID = try SharedLibraryIdentity.stagedInput(entity: entity.id, fingerprint: fingerprint)
+    let relative = ".docktape/staging/" + entity.id.uuidString + "/" + inputID.uuidString + ".mp3"
     let file = root.appendingPathComponent(relative)
     let root = self.root
-    try await access.withWrite(at: file) { scope in
+    try await withInputWrite(at: file, permission: current) { scope in
       try Self.checkRoot(root)
-      guard Self.contained(scope.url, in: root),
-        !FileManager.default.fileExists(atPath: scope.url.path)
-      else {
-        throw SharedLibraryOperationError.unsafePath
+      guard Self.contained(scope.url, in: root) else { throw SharedLibraryOperationError.unsafePath }
+      if let existing = try Self.hash(scope) {
+        guard existing == fingerprint else { throw SharedLibraryOperationError.contentChanged("staged audio") }
+        return
       }
       try scope.checkCancellation()
       try bytes.write(to: scope.url, options: .atomic)
