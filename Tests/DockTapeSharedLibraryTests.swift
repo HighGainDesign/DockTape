@@ -96,7 +96,7 @@ struct DockTapeSharedLibraryTests {
         try expect(state.sharedLibrary.revision > revision, "Visible content must receive a new revision")
         guard let recording = state.library.recordings.first else { throw Failure(description: "Missing app recording") }
         await state.renameRecording(recording, to: "Renamed")
-        try expect(state.errorMessage == nil, "App rename must not attempt duplicate legacy sidecar changes")
+        try expect(state.errorMessage == nil, "App rename must not attempt duplicate legacy sidecar changes: " + (state.errorMessage ?? "no error"))
         try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.summary.json").path), "App rename must preserve summary companion")
         let after = try await coordinator.recording(at: "Renamed.mp3")
         try expect(after.state.id == entity, "App rename must preserve recording identity")
@@ -162,7 +162,8 @@ struct DockTapeSharedLibraryTests {
         try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.mp3").path), "Storage switching must not move recordings")
         await reopened.sharedLibrary.close()
         try await mergeSelectionChecks(parent: parent, identity: identity)
-        print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions, reconnect and ID-bound merge/original deletion.")
+        try await folderRenameChecks(parent: parent, identity: identity)
+        print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions, reconnect and ID-bound merge/original deletion and folder rename.")
     }
     @MainActor static func mergeSelectionChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {
         let root = parent.appendingPathComponent("merge-library")
@@ -211,6 +212,31 @@ struct DockTapeSharedLibraryTests {
         await state.executeMerge(as: "Wrong library")
         try expect(!FileManager.default.fileExists(atPath: other.appendingPathComponent("Wrong library.mp3").path), "A changed library must invalidate the open merge dialog")
         try expect(state.errorMessage?.contains("library changed") == true, "Explain the changed merge binding")
+        await state.sharedLibrary.close()
+    }
+
+    @MainActor static func folderRenameChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {
+        let root = parent.appendingPathComponent("folder-library")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder/Nested"), withIntermediateDirectories: true)
+        for name in ["Folder/A.mp3", "Folder/Nested/B.mp3"] { try Data("synthetic folder audio".utf8).write(to: root.appendingPathComponent(name)) }
+        let legacy = RecordingStore(baseDirectory: root)
+        try await legacy.setup()
+        try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Folder/A.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Preserved")]), mp3Filename: "Folder/A.mp3")
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: parent.appendingPathComponent("folder-witnesses"))
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable isolated folder library")
+        guard let shared = state.sharedLibrary.coordinator else { throw Failure(description: "Missing folder coordinator") }
+        await shared.stopMonitoring()
+        let reference = try await shared.reference(to: "Folder/A.mp3")
+        state.selectedView = .folder("Folder")
+        state.library.selectedFolder = "Folder"
+        await state.renameFolder(from: "Folder", to: "Renamed")
+        try expect(state.errorMessage == nil && state.selectedView == .folder("Renamed") && state.library.selectedFolder == "Renamed", "Actual folder action must retarget sidebar selection: " + (state.errorMessage ?? ""))
+        try expect(Set(state.library.recordings.map(\.filename)) == ["Renamed/A.mp3", "Renamed/Nested/B.mp3"], "Actual app must refresh all renamed descendant paths")
+        try expect(try await shared.reference(to: "Renamed/A.mp3") == reference, "App folder action must preserve child IDs")
+        let transcript = await state.transcription.transcriptStore.transcript(for: "Renamed/A.mp3")
+        try expect(transcript?.recordingFilename == "Renamed/A.mp3", "Actual transcript adapter must read the relocated companion")
         await state.sharedLibrary.close()
     }
 

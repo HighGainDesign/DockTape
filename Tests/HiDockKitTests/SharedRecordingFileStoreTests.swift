@@ -453,4 +453,86 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertEqual(originalPath, "Original meeting.mp3")
     }
 
+    private actor ReadGate {
+        var armed = false, waiting = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        func arm() { armed = true }
+        func wait() async {
+            guard armed else { return }
+            waiting = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+        func release() { armed = false; continuation?.resume(); continuation = nil }
+    }
+    private func waitFor(_ gate: ReadGate) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await gate.waiting) {
+            guard ContinuousClock.now < deadline else { throw CancellationError() }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+    func testCatalogStartedDuringRenameCannotEraseAcceptedRecordingReference() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let operation = ReadGate(), catalog = ReadGate()
+        let store = RecordingStore(baseDirectory: root,
+            shared: SharedRecordingMetadataAdapter(coordinator: coordinator, beforeLoadReturn: { await catalog.wait() }),
+            beforeSharedFileOperation: { await operation.wait() })
+        try await store.setup()
+        let reference = try await coordinator.reference(to: "Meeting.mp3")
+        await operation.arm()
+        let rename = Task { try await store.renameRecording(filename: "Meeting.mp3", to: "Renamed") }
+        try await waitFor(operation)
+        await catalog.arm()
+        let read = Task { try await store.loadLibraryMeta() }
+        try await waitFor(catalog)
+        await operation.release()
+        _ = try await rename.value
+        await catalog.release()
+        try await read.value
+        let result = await store.allRecordings()
+        XCTAssertEqual(result.first?.filename, "Renamed.mp3")
+        XCTAssertEqual(result.first?.reference, reference)
+        XCTAssertEqual(result.first?.mode, "Mee")
+    }
+    func testCatalogStartedDuringDeleteCannotRestoreRemovedSourceAssociation() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let operation = ReadGate(), catalog = ReadGate()
+        let store = RecordingStore(baseDirectory: root,
+            shared: SharedRecordingMetadataAdapter(coordinator: coordinator, beforeLoadReturn: { await catalog.wait() }),
+            beforeSharedFileOperation: { await operation.wait() })
+        try await store.setup()
+        await operation.arm()
+        let deletion = Task { try await store.deleteRecordingAndSidecars(filename: "Meeting.mp3") }
+        try await waitFor(operation)
+        await catalog.arm()
+        let read = Task { try await store.loadLibraryMeta() }
+        try await waitFor(catalog)
+        await operation.release()
+        try await deletion.value
+        await catalog.release()
+        try await read.value
+        let imported = await store.allImportedDeviceFilenames()
+        XCTAssertTrue(imported.isEmpty, "Late pre-deletion catalog must not restore imported status")
+        let mode = await store.mode(for: "Meeting.mp3")
+        XCTAssertNil(mode, "Late catalog must not restore deleted metadata")
+    }
+
+    func testCapturedMergeReferencesAreRejectedByLegacyStore() async throws {
+        let (_, coordinator, _) = try await fixture()
+        let reference = try await coordinator.reference(to: "Meeting.mp3")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(root)
+        let store = RecordingStore(baseDirectory: root)
+        try await store.setup()
+        var frame = Data(repeating: 0, count: 417)
+        frame.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+        for name in ["Left", "Right"] { try frame.write(to: root.appendingPathComponent(name + ".mp3")) }
+        do {
+            _ = try await store.mergeRecordings(filenames: ["Left.mp3", "Right.mp3"], as: "Wrong library",
+                references: ["Left.mp3": reference, "Right.mp3": reference])
+            XCTFail("Do not consume shared selections against another legacy binding")
+        } catch SharedLibraryCoordinatorError.differentBinding {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Wrong library.mp3").path))
+    }
+
 }

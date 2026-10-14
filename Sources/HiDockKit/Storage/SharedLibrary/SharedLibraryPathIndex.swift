@@ -88,6 +88,7 @@ public struct SharedLibraryPathIndex: Sendable {
             if state.kind == .folder {
                 paths = try folderPaths(state.id, visiting: [])
                 for path in paths { try claim(path, owner: state.id) }
+                if case .text(let physical)? = state.value(for: "physicalPath") { try claim(physical, owner: state.id) }
             } else {
                 var prefixes: Set<String> = []
                 for folder in try parents(state, field: "folder") {

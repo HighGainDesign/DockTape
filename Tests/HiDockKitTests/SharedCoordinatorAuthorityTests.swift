@@ -107,7 +107,14 @@ final class SharedCoordinatorAuthorityTests: XCTestCase {
         let observation = Date().addingTimeInterval(0.3)
         while !barrier.isComplete(), Date() < observation { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertFalse(barrier.isComplete(), "A started owner edit must remain pending during the physical phase")
-        let during = try await coordinator.read(entity)
+        // A new coordinated read queues behind the pending writer, which
+        // itself must wait for this deliberately paused physical lease. Read
+        // the immutable on-disk head for this assertion instead of creating a
+        // reader → writer → physical-barrier cycle in the test.
+        struct OwnerHead: Decodable { let state: SharedEntityState }
+        let ownerFile = root.appendingPathComponent(".docktape/records/" + entity.id.uuidString.lowercased())
+            .appendingPathComponent(coordinator.writerID.uuidString.lowercased() + ".json")
+        let during = try JSONDecoder().decode(OwnerHead.self, from: Data(contentsOf: ownerFile))
         XCTAssertEqual(during.state.value(for: "title"), .text("Meeting"),
                        "No accepted local edit may cross a physical commit/receipt boundary")
         barrier.release()

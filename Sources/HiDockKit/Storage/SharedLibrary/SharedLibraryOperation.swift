@@ -60,6 +60,7 @@ public struct SharedMaterializationAuthority: Sendable {
   public var acknowledgments: [SharedOperationAcknowledgment]
   public var hasPendingWork: Bool
   public var jobGate: SharedLibraryJobGate? = nil
+  public var jobGates: [SharedLibraryJobGate] = []
   /// Exact owners from the current identity/path index plus retained operation
   /// claims. An empty set is unowned, multiple IDs is a path conflict.
   public var pathOwners: [String: Set<UUID>]
@@ -116,6 +117,7 @@ public struct SharedMaterializationAuthority: Sendable {
 public struct SharedLibraryOperation: Codable, Equatable, Sendable {
   public enum Step: Codable, Equatable, Sendable {
     case move(source: String, destination: String, fingerprint: String)
+    case moveDirectory(source: String, destination: String, inventory: SharedDirectoryInventory)
     case write(path: String, expectedFingerprint: String?, bytes: Data)
     case trash(path: String, fingerprint: String)
     case removeEmptyDirectory(path: String)
@@ -148,7 +150,7 @@ public struct SharedLibraryOperation: Codable, Equatable, Sendable {
   var canonicalPaths: Set<String> {
     Set(steps.flatMap { step -> [String] in
       switch step {
-      case .move(let source, let destination, _): return [source, destination]
+      case .move(let source, let destination, _), .moveDirectory(let source, let destination, _): return [source, destination]
       case .write(let path, _, _), .trash(let path, _), .createDirectory(let path), .removeEmptyDirectory(let path): return [path]
       case .publishAudio(let path, _, _), .replaceAudio(let path, _, _, _, _): return [path]
       }
@@ -172,6 +174,11 @@ public struct SharedLibraryOperation: Codable, Equatable, Sendable {
         else { throw SharedLibraryOperationError.invalidOperation }
         paths = [source, destination]
         hashes = [hash]
+      case .moveDirectory(let source, let destination, let inventory):
+        guard entity.kind == .folder, source != destination,
+              !destination.hasPrefix(source + "/"), !source.hasPrefix(destination + "/") else { throw SharedLibraryOperationError.invalidOperation }
+        try inventory.validate()
+        paths = [source, destination]; hashes = []
       case .write(let path, let expected, _):
         guard ["json", "md", "txt"].contains((path as NSString).pathExtension.lowercased()) else {
           throw SharedLibraryOperationError.invalidOperation

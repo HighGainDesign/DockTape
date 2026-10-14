@@ -10,13 +10,16 @@ public actor RecordingStore {
     private let fileAccess: RecordingFileAccess
     private let metadataFileAccess: RecordingFileAccess
     private let shared: SharedRecordingMetadataAdapter?
+    private let beforeSharedFileOperation: @Sendable () async -> Void
 
     public init(baseDirectory: URL? = nil, fileAccess: RecordingFileAccess = RecordingFileAccess(),
                 metadataFileAccess: RecordingFileAccess = RecordingFileAccess(),
-                shared: SharedRecordingMetadataAdapter? = nil) {
+                shared: SharedRecordingMetadataAdapter? = nil,
+                beforeSharedFileOperation: @escaping @Sendable () async -> Void = {}) {
         self.fileAccess = fileAccess
         self.metadataFileAccess = metadataFileAccess
         self.shared = shared
+        self.beforeSharedFileOperation = beforeSharedFileOperation
         if let dir = baseDirectory {
             self.baseDirectory = dir
         } else {
@@ -72,7 +75,18 @@ public actor RecordingStore {
 
     /// Rename a top-level folder.
     @discardableResult
-    public func renameFolder(from oldName: String, to newName: String) throws -> String {
+    public func renameFolder(from oldName: String, to newName: String) async throws -> String {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            let name = Self.sanitizeFilename(newName)
+            metadataTicket += 1
+            await beforeSharedFileOperation()
+            let outcome = try await shared.coordinator.renameFolder(from: oldName, to: name)
+            sharedFolderOperation = outcome
+            guard outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
+            try await loadLibraryMeta()
+            return outcome.name
+        }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let sanitized = Self.sanitizeFilename(newName)
         guard !sanitized.isEmpty else {
@@ -115,6 +129,7 @@ public actor RecordingStore {
         if let shared {
             try shared.requireRoot(baseDirectory)
             metadataTicket += 1
+            await beforeSharedFileOperation()
             let outcome = try await shared.coordinator.relocateRecording(filename: filename, toFolder: folderName, changeFolder: true)
             return try cacheSharedRelocation(outcome, from: filename)
         }
@@ -356,6 +371,7 @@ public actor RecordingStore {
             guard let result = allRecordings().first(where: { $0.filename == outcome.filename }) else { throw HiDockError.fileNotFound(outcome.filename) }
             return result
         }
+        if !references.isEmpty { throw SharedLibraryCoordinatorError.differentBinding }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         guard filenames.count >= 2 else {
             throw HiDockError.invalidFilename("Need at least 2 recordings to merge")
@@ -424,9 +440,11 @@ public actor RecordingStore {
         if let shared {
             try shared.requireRoot(baseDirectory)
             metadataTicket += 1
+            await beforeSharedFileOperation()
             let outcome = try await shared.coordinator.deleteSharedRecording(filename: filename, reference: reference)
             sharedOperation = outcome
             guard outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
+            metadataTicket += 1
             meta.removeValue(forKey: outcome.filename); metaBaseline.removeValue(forKey: outcome.filename); recordingReferences.removeValue(forKey: outcome.filename)
             return
         }
@@ -472,6 +490,7 @@ public actor RecordingStore {
             let title = Self.sanitizeFilename(newName.hasSuffix(".mp3") ? String(newName.dropLast(4)) : newName)
             guard !title.isEmpty else { throw HiDockError.invalidFilename(newName) }
             metadataTicket += 1
+            await beforeSharedFileOperation()
             let outcome = try await shared.coordinator.relocateRecording(filename: filename, title: title)
             return try cacheSharedRelocation(outcome, from: filename)
         }
@@ -527,10 +546,14 @@ public actor RecordingStore {
     }
 
     public private(set) var sharedOperation: SharedRecordingFileOutcome?
+    public private(set) var sharedFolderOperation: SharedFolderFileOutcome?
     private func cacheSharedRelocation(_ outcome: SharedRecordingFileOutcome, from previous: String) throws -> String {
         sharedOperation = outcome
         guard outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
         let accepted = try SharedRecordingMetadataAdapter.render(outcome.view)
+        // Reads begun while the operation was awaiting physical completion
+        // must not replace this accepted path/reference with an older catalog.
+        metadataTicket += 1
         meta.removeValue(forKey: previous); metaBaseline.removeValue(forKey: previous)
         meta[outcome.filename] = accepted; metaBaseline[outcome.filename] = accepted
         recordingReferences.removeValue(forKey: previous)

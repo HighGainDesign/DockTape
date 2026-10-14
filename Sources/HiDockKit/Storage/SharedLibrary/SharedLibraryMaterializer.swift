@@ -31,6 +31,29 @@ public actor SharedLibraryMaterializer {
     self.gate = gate
   }
 
+  /// Persist an already accepted semantic intent before the next cancellable
+  /// provider read. This writes only the bounded local replay plan.
+  func recordIntent(_ operation: SharedLibraryOperation) async throws {
+    try operation.validate()
+    guard !Self.contained(receipts, in: root) else { throw SharedLibraryOperationError.unsafePath }
+    try FileManager.default.createDirectory(at: receipts, withIntermediateDirectories: true)
+    let file = receipts.appendingPathComponent(operation.entity.id.uuidString + ".json")
+    let items = [CoordinatedFileAccess.WriteItem(file)] + (try gate?.items(outside: root) ?? [])
+    let receipts = self.receipts, root = self.root, gate = self.gate
+    try await access.withWrites(items) { scopes in
+      guard Self.contained(scopes[0].url, in: receipts) else { throw SharedLibraryOperationError.unsafePath }
+      if let gate { try gate.validate(scopes[1], outside: root) }
+      if FileManager.default.fileExists(atPath: scopes[0].url.path) {
+        let previous = try SharedOperationReceipt.decode(Data(contentsOf: scopes[0].url))
+        guard previous.operation.libraryID == operation.libraryID, previous.operation.entity == operation.entity else { throw SharedLibraryOperationError.differentBinding }
+        if previous.operation == operation { return }
+        guard previous.completed == previous.operation.steps.count else { throw SharedLibraryOperationError.unfinishedOperation }
+      }
+      try scopes[0].checkCancellation()
+      try SharedOperationReceipt(operation).encoded().write(to: scopes[0].url, options: .atomic)
+    }
+  }
+
   public func replay(_ operation: SharedLibraryOperation) async throws
     -> SharedMaterializationResult
   {
@@ -131,12 +154,13 @@ public actor SharedLibraryMaterializer {
               throw SharedLibraryOperationError.unsafePath
             }
           }
-          let jobDescriptor: Int32?
-          if let jobGate = fresh.jobGate {
+          var jobDescriptors: [Int32] = []
+          defer { for descriptor in jobDescriptors { Darwin.close(descriptor) } }
+          let jobGates = fresh.jobGates.isEmpty ? (fresh.jobGate.map { [$0] } ?? []) : fresh.jobGates
+          for jobGate in jobGates {
             guard let acquired = try jobGate.acquireExclusive() else { return .pending(.waitingForActiveWork) }
-            jobDescriptor = acquired
-          } else { jobDescriptor = nil }
-          defer { if let jobDescriptor { Darwin.close(jobDescriptor) } }
+            jobDescriptors.append(acquired)
+          }
           // Persist intent before the physical commit. Recovery still
           // verifies exact bytes/ownership, never merely file existence.
           let replaying = actual.attempting
@@ -438,7 +462,7 @@ public actor SharedLibraryMaterializer {
           return .needsReplanning
         }
         if !repair && !authority.mayDestroy(.replaceAudio) { return .waitingForAcknowledgments }
-      case .move:
+      case .move, .moveDirectory:
         if authority.hasPendingWork { return .waitingForActiveWork }
         guard authority.state.lifecycle == .alive else { return .needsReplanning }
       default:
@@ -452,7 +476,7 @@ public actor SharedLibraryMaterializer {
   {
     let paths: [(String, CoordinatedFileAccess.WriteMode)]
     switch step {
-    case .move(let source, let destination, _):
+    case .move(let source, let destination, _), .moveDirectory(let source, let destination, _):
       paths = [(source, .moving), (destination, .replacing)]
     case .write(let path, _, _): paths = [(path, .replacing)]
     case .trash(let path, _): paths = [(path, .deleting)]
@@ -523,6 +547,23 @@ public actor SharedLibraryMaterializer {
       }
       guard let sourceHash else { return .init(changed: false, pending: .waitingForFile(source)) }
       guard sourceHash == expected else { throw SharedLibraryOperationError.contentChanged(source) }
+      try files[0].checkCancellation()
+      try beforeMutation()
+      try fm.moveItem(at: files[0].url, to: files[1].url)
+      files[0].didMove(to: files[1].url)
+      return .init(changed: true, pending: nil)
+    case .moveDirectory(let source, let destination, let expected):
+      try owner(source, authority: authority, required: true)
+      try owner(destination, authority: authority, required: false)
+      let hasSource = fm.fileExists(atPath: files[0].url.path)
+      let hasDestination = fm.fileExists(atPath: files[1].url.path)
+      if hasDestination {
+        guard !hasSource, replaying,
+              try SharedDirectoryInventory.capture(at: files[1].url) == expected else { throw SharedLibraryOperationError.pathConflict(destination) }
+        return .init(changed: false, pending: nil)
+      }
+      guard hasSource else { return .init(changed: false, pending: .waitingForFile(source)) }
+      guard try SharedDirectoryInventory.capture(at: files[0].url) == expected else { throw SharedLibraryOperationError.contentChanged(source) }
       try files[0].checkCancellation()
       try beforeMutation()
       try fm.moveItem(at: files[0].url, to: files[1].url)
