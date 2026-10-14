@@ -1,4 +1,5 @@
 // © 2026 High Gain Design. All rights reserved.
+import CryptoKit
 import XCTest
 
 @testable import HiDockKit
@@ -187,6 +188,37 @@ final class SharedLibraryRepositoryTests: XCTestCase {
         do {
             _ = try await repository.load(entity: entity)
             XCTFail("Corruption must not become an empty state")
+        } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .invalidEnvelope) }
+    }
+
+    func testCompactedStateWithoutAQuorumCertificateCannotBeAccepted() async throws {
+        let directory = try root()
+        let repository = SharedLibraryRepository(root: directory, writerID: a)
+        let entity = SharedEntityIdentity(id: id, kind: .recording)
+        let first = try SharedDocument(id: UUID(), json: Data("{}".utf8))
+        let second = try SharedDocument(id: UUID(), json: Data("{\"new\":true}".utf8))
+        let initial = try await repository.load(entity: entity)
+        let edited = try await repository.commit(
+            .init(
+                base: initial,
+                changes: [
+                    .generation(first, component: .transcript),
+                    .generationEdit(component: .transcript, generation: first.id, key: "speaker", value: .text("Keep")),
+                ]))
+        let current = try await repository.commit(
+            .init(base: edited, changes: [.generation(second, component: .transcript)]))
+        let compacted = try current.state.compacting(SharedGenerationCompaction.proposed(for: current.state))
+        let url = head(directory, writer: a)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        object["state"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(compacted))
+        object.removeValue(forKey: "checksum")
+        let payload = try JSONSerialization.data(
+            withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+        object["checksum"] = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+        try JSONSerialization.data(withJSONObject: object).write(to: url, options: .atomic)
+        do {
+            _ = try await repository.load(entity: entity)
+            XCTFail("Checksum alone is not consent to retire namespaces")
         } catch { XCTAssertEqual(error as? SharedLibraryRepositoryError, .invalidEnvelope) }
     }
 

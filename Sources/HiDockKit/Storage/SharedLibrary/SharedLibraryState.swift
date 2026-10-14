@@ -26,6 +26,7 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
     public let id: UUID
     public let kind: SharedEntityKind
     public private(set) var fields: [String: CausalRegister<SharedFieldValue>] = [:]
+    public private(set) var compaction: SharedGenerationCompaction?
     private static var lifecycleField: String { "$lifecycle" }
 
     public init(id: UUID, kind: SharedEntityKind) {
@@ -61,7 +62,8 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
 
     public mutating func assign(field: String, value: SharedFieldValue, writer: UUID) throws {
         guard !field.isEmpty, !field.contains("\0"), !field.hasPrefix("$"),
-              !field.hasPrefix("transcript."), !field.hasPrefix("summary.") else {
+            !field.hasPrefix("transcript."), !field.hasPrefix("summary.")
+        else {
             throw SharedEntityError.invalidField
         }
         try edit(writer: writer) { try $0.write(field: field, value: value, writer: writer) }
@@ -83,8 +85,15 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
     public func merged(with other: Self) throws -> Self {
         guard id == other.id else { throw SharedEntityError.differentEntity }
         guard kind == other.kind else { throw SharedEntityError.differentKind }
-        var result = self
-        for (field, incoming) in other.fields {
+        let context: SharedGenerationCompaction?
+        if let local = compaction, let incoming = other.compaction {
+            context = try local.joined(with: incoming)
+        } else {
+            context = compaction ?? other.compaction
+        }
+        var result = try context.map { try compacting($0) } ?? self
+        let normalized = try context.map { try other.compacting($0) } ?? other
+        for (field, incoming) in normalized.fields {
             var current = result.fields[field] ?? CausalRegister<SharedFieldValue>()
             try current.merge(incoming)
             if [SharedComponent.transcript, .summary].contains(where: { field == Self.generationField($0) }) {
@@ -95,11 +104,33 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
         return result
     }
 
+    /// Internal: the repository/coordinator must verify a current quorum
+    /// certificate before publishing this normalized state to a library.
+    func compacting(_ proposed: SharedGenerationCompaction) throws -> Self {
+        let context = try compaction.map { try $0.joined(with: proposed) } ?? proposed
+        var result = self
+        result.compaction = context
+        for field in result.fields.keys.sorted() {
+            if let (component, generation, _) = Self.editIdentity(field),
+                context.retires(component: component, generation: generation)
+            {
+                let filtered = try result.fields[field]!.applyingCausalFloor(context.context)
+                if filtered.values.isEmpty {
+                    result.fields.removeValue(forKey: field)
+                } else {
+                    result.fields[field] = filtered
+                }
+            }
+        }
+        return result
+    }
+
     public func generationValues(for component: SharedComponent) -> Set<SharedDocument> {
-        Set((fields[Self.generationField(component)]?.values ?? []).compactMap {
-            if case .document(let document) = $0 { return document }
-            return nil
-        })
+        Set(
+            (fields[Self.generationField(component)]?.values ?? []).compactMap {
+                if case .document(let document) = $0 { return document }
+                return nil
+            })
     }
 
     public func currentDocument(for component: SharedComponent) -> SharedDocument? {
@@ -108,7 +139,8 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
     }
 
     public mutating func assignGeneration(_ document: SharedDocument, component: SharedComponent, writer: UUID) throws {
-        guard !generationValues(for: component).contains(where: { $0.id == document.id && $0.json != document.json }) else {
+        guard !generationValues(for: component).contains(where: { $0.id == document.id && $0.json != document.json })
+        else {
             throw SharedEntityError.invalidState
         }
         try edit(writer: writer) { updated in
@@ -116,8 +148,9 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
             // observed. A concurrent late edit remains alongside the unset marker.
             for field in updated.fields.keys.sorted() {
                 if let (owner, generation, _) = Self.editIdentity(field),
-                   owner == component, generation != document.id,
-                   updated.fields[field]?.values.contains(where: { $0 != .unset }) == true {
+                    owner == component, generation != document.id,
+                    updated.fields[field]?.values.contains(where: { $0 != .unset }) == true
+                {
                     try updated.write(field: field, value: .unset, writer: writer)
                 }
             }
@@ -125,8 +158,10 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
         }
     }
 
-    public mutating func assignGenerationEdit(component: SharedComponent, generation: UUID,
-                                               key: String, value: SharedFieldValue, writer: UUID) throws {
+    public mutating func assignGenerationEdit(
+        component: SharedComponent, generation: UUID,
+        key: String, value: SharedFieldValue, writer: UUID
+    ) throws {
         guard currentDocument(for: component)?.id == generation else { throw SharedEntityError.staleGeneration }
         guard !key.isEmpty, !key.contains("\0"), Self.validEditValue(value, component: component) else {
             throw SharedEntityError.invalidField
@@ -140,7 +175,8 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
         var result: [String: SharedFieldValue] = [:]
         for field in fields.keys {
             if let (owner, generation, key) = Self.editIdentity(field),
-               owner == component, generation == current.id, let value = value(for: field) {
+                owner == component, generation == current.id, let value = value(for: field)
+            {
                 result[key] = value
             }
         }
@@ -159,7 +195,19 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
 
     private mutating func write(field: String, value: SharedFieldValue, writer: UUID) throws {
         var register = fields[field] ?? CausalRegister<SharedFieldValue>()
-        try register.assign(value, by: writer)
+        if let context = compaction, let (component, generation, _) = Self.editIdentity(field),
+            context.retires(component: component, generation: generation)
+        {
+            register = try register.applyingCausalFloor(context.context)
+        }
+        // Field dots remain field-scoped; allocation uses an entity-wide lower
+        // bound so reintroduced retired namespaces cannot reuse covered dots.
+        let highest = fields.values.reduce(compaction?.counter(for: writer) ?? 0) {
+            max($0, $1.highestCounter(for: writer))
+        }
+        let (minimum, overflow) = highest.addingReportingOverflow(1)
+        guard !overflow else { throw CausalRegisterError.counterExhausted(writer) }
+        try register.assign(value, by: writer, counterAtLeast: minimum)
         fields[field] = register
     }
 
@@ -175,7 +223,9 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
         var contentByID: [UUID: Data] = [:]
         for value in values {
             guard case .document(let document) = value else { continue }
-            if let previous = contentByID[document.id], previous != document.json { throw SharedEntityError.invalidState }
+            if let previous = contentByID[document.id], previous != document.json {
+                throw SharedEntityError.invalidState
+            }
             contentByID[document.id] = document.json
         }
     }
@@ -185,18 +235,25 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
     private static func editIdentity(_ field: String) -> (SharedComponent, UUID, String)? {
         let parts = field.split(separator: ".", maxSplits: 3, omittingEmptySubsequences: false)
         guard parts.count == 4, let component = SharedComponent(rawValue: String(parts[0])),
-              parts[1] == "edits", let generation = UUID(uuidString: String(parts[2])), !parts[3].isEmpty else { return nil }
+            parts[1] == "edits", let generation = UUID(uuidString: String(parts[2])), !parts[3].isEmpty
+        else { return nil }
         return (component, generation, String(parts[3]))
     }
 
-    private enum CodingKeys: String, CodingKey { case id, kind, fields }
+    private enum CodingKeys: String, CodingKey { case id, kind, fields, compaction }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
         kind = try container.decode(SharedEntityKind.self, forKey: .kind)
+        compaction = try container.decodeIfPresent(SharedGenerationCompaction.self, forKey: .compaction)
         fields = try container.decode([String: CausalRegister<SharedFieldValue>].self, forKey: .fields)
         guard fields.isEmpty || fields[Self.lifecycleField] != nil else { throw SharedEntityError.invalidState }
+        if let compaction {
+            guard !fields.isEmpty, try compacting(compaction).fields == fields else {
+                throw SharedEntityError.invalidState
+            }
+        }
         for (field, register) in fields {
             guard !field.isEmpty, !field.contains("\0") else { throw SharedEntityError.invalidState }
             if field == Self.lifecycleField {
@@ -209,12 +266,18 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
             for component in [SharedComponent.transcript, .summary] {
                 if field == Self.generationField(component) {
                     try Self.validateGenerationValues(register.values)
-                    guard register.values.allSatisfy({ if case .document = $0 { return true }; return $0 == .unset }) else {
+                    guard
+                        register.values.allSatisfy({
+                            if case .document = $0 { return true }
+                            return $0 == .unset
+                        })
+                    else {
                         throw SharedEntityError.invalidState
                     }
                 } else if field.hasPrefix(component.rawValue + ".") {
                     guard Self.editIdentity(field) != nil,
-                          register.values.allSatisfy({ Self.validEditValue($0, component: component) }) else {
+                        register.values.allSatisfy({ Self.validEditValue($0, component: component) })
+                    else {
                         throw SharedEntityError.invalidState
                     }
                 }

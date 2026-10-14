@@ -18,6 +18,7 @@ public enum CausalRegisterError: Error, Equatable, Sendable {
     case conflictingDot(CausalDot)
     /// Never reuse a counter by wrapping it back to zero.
     case counterExhausted(UUID)
+    case invalidContext
 }
 
 /// A state-based multi-value register. Concurrent differing values remain
@@ -44,14 +45,35 @@ public struct CausalRegister<Value: Codable & Hashable & Sendable>: Codable, Equ
 
     public var isConflicted: Bool { values.count > 1 }
 
+    public var causalContext: [CausalDot] {
+        clock.map { CausalDot(writer: $0.key, counter: $0.value) }.sorted {
+            $0.writer.uuidString < $1.writer.uuidString
+        }
+    }
+    public func highestCounter(for writer: UUID) -> UInt64 { clock[writer] ?? 0 }
+
+    /// Used only for namespaces retired by a certified entity checkpoint. The
+    /// floor represents already consumed writes, not elapsed time or absence.
+    public func applyingCausalFloor(_ context: [CausalDot]) throws -> Self {
+        guard Set(context.map(\.writer)).count == context.count, context.allSatisfy({ $0.counter > 0 }) else {
+            throw CausalRegisterError.invalidContext
+        }
+        var result = self
+        let floor = Dictionary(uniqueKeysWithValues: context.map { ($0.writer, $0.counter) })
+        result.entries = result.entries.filter { $0.dot.counter > (floor[$0.dot.writer] ?? 0) }
+        for (writer, counter) in floor { result.clock[writer] = max(result.clock[writer] ?? 0, counter) }
+        return result
+    }
+
     /// Supersede the values this state has observed. A caller handling a draft
     /// must separately validate its base revision before assigning; it must not
     /// consume values the user has never reviewed.
-    public mutating func assign(_ value: Value, by writer: UUID) throws {
+    public mutating func assign(_ value: Value, by writer: UUID, counterAtLeast minimum: UInt64 = 1) throws {
         let (next, overflow) = (clock[writer] ?? 0).addingReportingOverflow(1)
         guard !overflow else { throw CausalRegisterError.counterExhausted(writer) }
-        clock[writer] = next
-        entries = [Entry(dot: CausalDot(writer: writer, counter: next), value: value)]
+        let accepted = max(next, minimum)
+        clock[writer] = accepted
+        entries = [Entry(dot: CausalDot(writer: writer, counter: accepted), value: value)]
     }
 
     /// Join is commutative, associative and idempotent for valid states.
@@ -96,7 +118,8 @@ public struct CausalRegister<Value: Codable & Hashable & Sendable>: Codable, Equ
         var dots: Set<CausalDot> = []
         for entry in decodedEntries {
             guard entry.dot.counter > 0,
-                  (validatedClock[entry.dot.writer] ?? 0) == entry.dot.counter else {
+                (validatedClock[entry.dot.writer] ?? 0) == entry.dot.counter
+            else {
                 throw Self.invalid("Value dot does not match its writer's current causal counter.", decoder: decoder)
             }
             guard dots.insert(entry.dot).inserted else {

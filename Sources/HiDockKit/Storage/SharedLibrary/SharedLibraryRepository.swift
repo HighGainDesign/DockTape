@@ -282,7 +282,10 @@ public actor SharedLibraryRepository {
         let version = try decoder.decode(Probe.self, from: bytes).schemaVersion
         guard version == 1 else { throw SharedLibraryRepositoryError.unsupportedSchema(version) }
         let head = try decoder.decode(Envelope.self, from: bytes)
-        guard head.sequence > 0, head.state.lifecycle != .uninitialized,
+        // Retirement contexts require a quorum certificate. Until the
+        // certificate persistence path is installed, reject them at the I/O
+        // boundary rather than trusting a checksum as writer consent.
+        guard head.sequence > 0, head.state.lifecycle != .uninitialized, head.state.compaction == nil,
             head.state.id == entity.id, head.state.kind == entity.kind,
             expectedWriter == nil || head.writerID == expectedWriter,
             Set(head.observed.map(\.writer)).count == head.observed.count,
