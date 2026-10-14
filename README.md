@@ -17,7 +17,6 @@ Import, transcribe, diarize, and manage recordings on your Mac. Transcription an
 - **Audio playback** — built-in player with variable speed (0.5x–3x)
 - **Library management** — folders, search, sort, filter by recording type and date
 - **Smart summarization** — hit Summarize on any recording; auto-transcribes first if needed
-- **Menu bar extra** — quick device status from the menu bar
 - **CLI tool** — `hidock` command for headless operation
 
 ## Download

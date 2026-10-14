@@ -9,7 +9,6 @@ import HiDockKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let appState = AppState()
     var mainWindowController: MainWindowController?
-    var statusBarController: StatusBarController?
 
     static func main() {
         // Sync iCloud settings before AppState reads them
@@ -27,7 +26,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let wc = MainWindowController(appState: appState)
         wc.showWindow(nil)
         mainWindowController = wc
-        statusBarController = StatusBarController(appState: appState)
         Task { @MainActor in
             do {
                 try await appState.setup()

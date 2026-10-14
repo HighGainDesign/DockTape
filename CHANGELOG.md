@@ -35,6 +35,10 @@
 - The vendored USB library now targets the app's macOS 14 minimum. Release builds preserve full diagnostic logs and verify signing strictly.
 - The shared core has initial iOS support; an iOS app is planned.
 
+### Removed
+
+- The menu-bar device-status icon and popover. Device status remains in the app's sidebar.
+
 ### Known issues
 
 - iCloud conflict handling remains limited when multiple Macs edit the same sidecar files simultaneously.
