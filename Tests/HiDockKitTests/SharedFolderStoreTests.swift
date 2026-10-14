@@ -168,6 +168,26 @@ final class SharedFolderStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed/A.mp3").path))
     }
 
+    func testCancellationAfterAcceptedFolderCreationRetainsRestartPlan() async throws {
+        let (root, original, _) = try await fixture()
+        let cancelled = SharedLibraryCoordinator(root: root, writerID: original.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"),
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let task = Task { try await cancelled.createSharedFolder(named: "Created") }
+        do { try await task.value; XCTFail("Report cancellation after acceptance") } catch is CancellationError {}
+        let views = try await original.snapshots(kinds: [.folder])
+        let id = try XCTUnwrap(views.first { $0.state.value(for: "name") == .text("Created") }?.state.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Created").path))
+        let reopened = SharedLibraryCoordinator(root: root, writerID: original.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"))
+        let resumed = try await reopened.resumeFolderOperation(id: id)
+        XCTAssertEqual(resumed.result, .complete)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Created").path))
+        let repeated = try await reopened.resumeFolderOperation(id: id)
+        XCTAssertEqual(repeated.result, .complete)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Folder/A.mp3")), Data("Folder/A.mp3".utf8))
+    }
+
     func testSharedFolderDeleteDisposesOwnedRecordingsAndOnlyEmptyDirectories() async throws {
         let (root, coordinator, store) = try await fixture()
         try FileManager.default.removeItem(at: root.appendingPathComponent("Folder/.notes"))

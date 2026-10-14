@@ -56,6 +56,109 @@ final class SharedLibraryOperationTests: XCTestCase {
   }
   private enum Interrupted: Error { case crash }
 
+  private actor TransientAuthority {
+    private var failures = 1
+    private let value: SharedMaterializationAuthority
+    init(_ value: SharedMaterializationAuthority) { self.value = value }
+    func read() throws -> SharedMaterializationAuthority {
+      if failures > 0 { failures -= 1; throw SharedLibraryOperationError.staleAuthority }
+      return value
+    }
+  }
+  func testTransientRefreshAuthorityRetriesButStillRejectsChangedIntent() async throws {
+    for changed in [false, true] {
+      let fixture = try Fixture()
+      defer { fixture.cleanup() }
+      var permission = await fixture.authority.current()
+      if changed { try permission.state.assign(field: "title", value: .text("different"), writer: fixture.writer) }
+      let reader = TransientAuthority(permission)
+      let materializer = SharedLibraryMaterializer(root: fixture.root, receipts: fixture.receipts, authority: { try await reader.read() })
+      let bytes = Data("synthetic original".utf8)
+      try bytes.write(to: fixture.root.appendingPathComponent("old.mp3"))
+      let operation = try fixture.operation([.move(source: "old.mp3", destination: "new.mp3", fingerprint: SharedLibraryOperation.fingerprint(bytes))])
+      let result = try await materializer.replay(operation)
+      XCTAssertEqual(result, changed ? .needsReplanning : .complete)
+      XCTAssertEqual(try Data(contentsOf: fixture.root.appendingPathComponent(changed ? "old.mp3" : "new.mp3")), bytes)
+    }
+  }
+
+  private actor RevokingAuthority {
+    private var reads = 0
+    private let original: SharedMaterializationAuthority
+    private let changed: SharedMaterializationAuthority
+    private let atMutation: Bool
+    init(original: SharedMaterializationAuthority, changed: SharedMaterializationAuthority, atMutation: Bool) {
+      self.original = original; self.changed = changed; self.atMutation = atMutation
+    }
+    func read() -> SharedMaterializationAuthority {
+      reads += 1
+      let trigger = atMutation ? 3 : 1
+      var value = reads > trigger ? changed : original
+      value.revisionLease = .init()
+      if reads == trigger {
+        let lease = value.revisionLease
+        if atMutation {
+          value.validateLocalCommit = { lease.revoke(); return true }
+        } else { lease.revoke() }
+      }
+      return value
+    }
+  }
+
+  func testRevokedReturnedAuthorityAndMutationBoundaryRevalidateWithoutOverwritingEdits() async throws {
+    for atMutation in [false, true] {
+      for changed in [false, true] {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let original = await fixture.authority.current()
+        var next = original
+        if changed { try next.state.assign(field: "title", value: .text("competing name"), writer: fixture.writer) }
+        let reader = RevokingAuthority(original: original, changed: next, atMutation: atMutation)
+        let materializer = SharedLibraryMaterializer(root: fixture.root, receipts: fixture.receipts, authority: { await reader.read() })
+        let bytes = Data("synthetic original".utf8)
+        try bytes.write(to: fixture.root.appendingPathComponent("old.mp3"))
+        let operation = try fixture.operation([.move(source: "old.mp3", destination: "new.mp3", fingerprint: SharedLibraryOperation.fingerprint(bytes))])
+        let result = try await materializer.replay(operation)
+        XCTAssertEqual(result, changed ? .needsReplanning : .complete, "mutation=\(atMutation), changed=\(changed)")
+        XCTAssertEqual(try Data(contentsOf: fixture.root.appendingPathComponent(changed ? "old.mp3" : "new.mp3")), bytes)
+        XCTAssertEqual(LibraryFileDiscovery.files(in: fixture.root, suffix: ".mp3").count, 1)
+      }
+    }
+  }
+
+  func testNormalizedMoveAcceptsCompactionButRejectsEditsLifecycleABAAndReplacementGeneration() async throws {
+    for change in ["compaction", "title", "lifecycle", "generation"] {
+      let fixture = try Fixture()
+      defer { fixture.cleanup() }
+      var before = fixture.state
+      let document = try SharedDocument(id: UUID(), json: Data("{\"text\":\"same bytes\"}".utf8))
+      try before.assignGeneration(document, component: .transcript, writer: fixture.writer)
+      var after = try before.compacting(SharedGenerationCompaction.proposed(for: before))
+      switch change {
+      case "title": try after.assign(field: "title", value: .text("different"), writer: fixture.writer)
+      case "lifecycle":
+        try after.delete(writer: fixture.writer)
+        try after.restore(writer: fixture.writer)
+      case "generation":
+        try after.assignGeneration(SharedDocument(id: UUID(), json: document.json), component: .transcript, writer: fixture.writer)
+      default: break
+      }
+      var permission = await fixture.authority.current()
+      permission.state = after
+      await fixture.authority.update(permission)
+      let bytes = Data("synthetic original".utf8)
+      try bytes.write(to: fixture.root.appendingPathComponent("old.mp3"))
+      let operation = try SharedLibraryOperation(libraryID: fixture.library, entity: fixture.entity,
+        inputRevision: "previous", outputRevision: SharedLibraryOperation.revision(for: before),
+        steps: [.move(source: "old.mp3", destination: "new.mp3", fingerprint: SharedLibraryOperation.fingerprint(bytes))])
+      let result = try await fixture.materializer().replay(operation)
+      XCTAssertEqual(result, change == "compaction" ? .complete : .needsReplanning)
+      let surviving = change == "compaction" ? "new.mp3" : "old.mp3"
+      XCTAssertEqual(try Data(contentsOf: fixture.root.appendingPathComponent(surviving)), bytes)
+      XCTAssertEqual(LibraryFileDiscovery.files(in: fixture.root, suffix: ".mp3").count, 1)
+    }
+  }
+
   func testMoveReplayAfterFilesystemChangePreservesSingleCopyAndCompanion() async throws {
     let f = try Fixture()
     defer { f.cleanup() }

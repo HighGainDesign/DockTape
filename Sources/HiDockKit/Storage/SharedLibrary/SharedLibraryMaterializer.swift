@@ -54,6 +54,37 @@ public actor SharedLibraryMaterializer {
     }
   }
 
+  private func readAuthority() async throws -> SharedMaterializationAuthority {
+    let delays: [Duration] = [.milliseconds(25), .milliseconds(50), .milliseconds(100), .milliseconds(200), .milliseconds(400), .milliseconds(800)]
+    for attempt in 0...delays.count {
+      do {
+        let permission = try await authority()
+        guard !permission.revisionLease.isRevoked else { throw SharedLibraryOperationError.staleAuthority }
+        return permission
+      }
+      catch SharedLibraryOperationError.staleAuthority {
+        guard attempt < delays.count else { throw SharedLibraryOperationError.staleAuthority }
+        try await Task.sleep(for: delays[attempt])
+      }
+    }
+    throw SharedLibraryOperationError.staleAuthority
+  }
+  private func checkedAuthority(for operation: SharedLibraryOperation) async throws
+    -> (permission: SharedMaterializationAuthority, pending: SharedMaterializationResult?)
+  {
+    for attempt in 0...3 {
+      let permission = try await readAuthority()
+      let pending = try Self.check(operation, authority: permission)
+      // The lease can be revoked after acquisition returns to this actor.
+      // Re-read only invalidated proof; actual intent changes stay pending.
+      if pending == .needsReplanning, permission.revisionLease.isRevoked, attempt < 3 {
+        try await Task.sleep(for: .milliseconds(25))
+        continue
+      }
+      return (permission, pending)
+    }
+    throw SharedLibraryOperationError.staleAuthority
+  }
   public func replay(_ operation: SharedLibraryOperation) async throws
     -> SharedMaterializationResult
   {
@@ -64,8 +95,8 @@ public actor SharedLibraryMaterializer {
     defer { active.remove(operation.entity.id) }
     try Self.checkRoot(root)
     guard !Self.contained(receipts, in: root) else { throw SharedLibraryOperationError.unsafePath }
-    let initial = try await authority()
-    let initialPending = try Self.check(operation, authority: initial)
+    let initial = try await checkedAuthority(for: operation)
+    let initialPending = initial.pending
     if let pending = initialPending, pending != .waitingForAcknowledgments && pending != .waitingForActiveWork { return pending }
     // The accepted delete plan must survive an offline cohort or active job.
     // Save its expected hashes before waiting, without touching provider files.
@@ -94,11 +125,13 @@ public actor SharedLibraryMaterializer {
     }
     if let pending = initialPending { return pending }
     var receipt = initialReceipt
+    var staleProofRetries = 0
     while receipt.completed < operation.steps.count {
       try Task.checkCancellation()
       try Self.checkRoot(root)
-      let current = try await authority()
-      if let pending = try Self.check(operation, authority: current) { return pending }
+      let checkedCurrent = try await checkedAuthority(for: operation)
+      if let pending = checkedCurrent.pending { return pending }
+      let current = checkedCurrent.permission
       let step = operation.steps[receipt.completed]
       let items = try Self.items(step, root: root)
       // Preparation stays outside the receipt/source lease. Each File
@@ -112,8 +145,9 @@ public actor SharedLibraryMaterializer {
           return .waitingForFile(binding.file.lastPathComponent)
         }
       }
-      let fresh = try await authority()
-      if let pending = try Self.check(operation, authority: fresh) { return pending }
+      let checkedFresh = try await checkedAuthority(for: operation)
+      if let pending = checkedFresh.pending { return pending }
+      let fresh = checkedFresh.permission
       let index = receipt.completed
       let trash = self.trash
       let afterMutation = self.afterMutation
@@ -187,10 +221,23 @@ public actor SharedLibraryMaterializer {
           try actual.encoded().write(to: scopes[0].url, options: .atomic)
           return .advanced(actual)
         }
-      } catch SharedLibraryOperationError.staleAuthority { return .needsReplanning }
+      } catch SharedLibraryOperationError.staleAuthority {
+        // Refresh invalidation must follow the same fresh-proof path as a
+        // failed coordinated binding. No mutation occurred under that lease.
+        outcome = .pending(.needsReplanning)
+      }
       switch outcome {
-      case .advanced(let next): receipt = next
-      case .pending(let result): return result
+      case .advanced(let next): receipt = next; staleProofRetries = 0
+      case .pending(let result):
+        if result == .needsReplanning, staleProofRetries < 3 {
+          let current = try await checkedAuthority(for: operation)
+          if current.pending == nil {
+            staleProofRetries += 1
+            try await Task.sleep(for: .milliseconds(25))
+            continue
+          }
+        }
+        return result
       }
     }
     return .complete
@@ -437,7 +484,7 @@ public actor SharedLibraryMaterializer {
       throw SharedLibraryOperationError.pathConflict(denied)
     }
     guard !authority.revisionLease.isRevoked, authority.state.conflicts.isEmpty,
-      try SharedStateFingerprint.of(authority.state) == operation.outputRevision
+      try SharedLibraryOperation.matchesRevision(operation.outputRevision, state: authority.state)
     else { return .needsReplanning }
     for step in operation.steps {
       switch step {

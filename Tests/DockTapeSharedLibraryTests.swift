@@ -96,7 +96,8 @@ struct DockTapeSharedLibraryTests {
         try expect(state.sharedLibrary.revision > revision, "Visible content must receive a new revision")
         guard let recording = state.library.recordings.first else { throw Failure(description: "Missing app recording") }
         await state.renameRecording(recording, to: "Renamed")
-        try expect(state.errorMessage == nil, "App rename must not attempt duplicate legacy sidecar changes: " + (state.errorMessage ?? "no error"))
+        let renameOutcome = await state.library.store.sharedOperation
+        try expect(state.errorMessage == nil, "App rename must not attempt duplicate legacy sidecar changes: " + (state.errorMessage ?? "no error") + "; result=\(String(describing: renameOutcome?.result)); projection=\(String(describing: renameOutcome?.projectionError))")
         try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.summary.json").path), "App rename must preserve summary companion")
         let after = try await coordinator.recording(at: "Renamed.mp3")
         try expect(after.state.id == entity, "App rename must preserve recording identity")
@@ -199,7 +200,7 @@ struct DockTapeSharedLibraryTests {
         await state.deleteMergeOriginals()
         let deletedOriginal = try await shared.read(.init(id: oldB.entityID, kind: .recording))
         let preservedNew = try await shared.read(.init(id: unrelated.entityID, kind: .recording))
-        try expect(deletedOriginal.state.lifecycle == .deleted && preservedNew.state.lifecycle == .alive, "Delete originals must follow IDs and leave a new recording at the old filename alone")
+        try expect(deletedOriginal.state.lifecycle == .deleted && preservedNew.state.lifecycle == .alive, "Delete originals must follow IDs and leave a new recording at the old filename alone: " + (state.errorMessage ?? "no error") + " original=\(deletedOriginal.state.lifecycle) unrelated=\(preservedNew.state.lifecycle)")
         for path in ["A.mp3", "Later B.mp3", "B.mp3"] {
             try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent(path).path), "Active fixture leases must veto physical disposal")
         }

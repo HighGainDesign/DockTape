@@ -54,6 +54,114 @@ final class SharedRecordingFileStoreTests: XCTestCase {
             from: Data(contentsOf: root.appendingPathComponent("Renamed.transcript.json")))
         XCTAssertEqual(transcript.recordingFilename, renamed)
     }
+    func testCancellationAfterAcceptedRelocationRetainsRestartPlan() async throws {
+        try await checkCancelledAcceptedRecording(deleting: false)
+    }
+    func testCancellationAfterAcceptedDeletionRetainsRestartPlan() async throws {
+        try await checkCancelledAcceptedRecording(deleting: true)
+    }
+    func testRefreshBetweenAcceptedDeletionAndCleanupPreservesReplayInputs() async throws {
+        try await checkCancelledAcceptedRecording(deleting: true, refreshing: true)
+    }
+    func testRefreshBetweenAcceptedRelocationAndMoveKeepsProjectionPending() async throws {
+        try await checkCancelledAcceptedRecording(deleting: false, refreshing: true)
+    }
+    private func checkCancelledAcceptedRecording(deleting: Bool, refreshing: Bool = false) async throws {
+            let (root, original, _) = try await fixture()
+            let ref = try await original.reference(to: "Meeting.mp3")
+            let directory = root.deletingLastPathComponent()
+            let cancelled = SharedLibraryCoordinator(root: root, writerID: original.writerID,
+                witnessDirectory: directory.appendingPathComponent("local"),
+                afterCommit: {
+                    if refreshing {
+                        do {
+                            // Match AppState's refresh sequence before projection.
+                            let entity = SharedEntityIdentity(id: ref.entityID, kind: .recording)
+                            let before = try await original.read(entity)
+                            try await original.refresh()
+                            let after = try await original.read(entity)
+                            XCTAssertEqual(before.state.fields, after.state.fields, "Refresh changes compaction metadata, not the accepted causal fields")
+                            _ = try await original.projectOutputs()
+                            if !deleting { XCTFail("Do not publish relocated sidecars before the physical move") }
+                        } catch SharedLibraryOperationError.unfinishedOperation {
+                            if deleting { XCTFail("A deletion refresh may update metadata while retaining replay inputs") }
+                        } catch { XCTFail("Unexpected refresh error: \(error)") }
+                    }
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }, trash: { url in
+                    let recycled = directory.appendingPathComponent("recycled")
+                    try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+                    try FileManager.default.moveItem(at: url, to: recycled.appendingPathComponent(url.lastPathComponent))
+                })
+            let task = Task {
+                if deleting { _ = try await cancelled.deleteSharedRecording(filename: "Meeting.mp3") }
+                else { _ = try await cancelled.relocateRecording(filename: "Meeting.mp3", title: "Renamed") }
+            }
+            do { try await task.value; XCTFail("Cancellation after acceptance must be reported") }
+            catch is CancellationError {}
+            let entity = SharedEntityIdentity(id: ref.entityID, kind: .recording)
+            let accepted = try await original.read(entity)
+            if deleting { XCTAssertEqual(accepted.state.lifecycle, .deleted) }
+            else { XCTAssertEqual(accepted.state.value(for: "title"), .text("Renamed")) }
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), Data("single synthetic original".utf8))
+            let reopened = SharedLibraryCoordinator(root: root, writerID: original.writerID,
+                witnessDirectory: directory.appendingPathComponent("local"), trash: { url in
+                    let recycled = directory.appendingPathComponent("recycled")
+                    try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+                    try FileManager.default.moveItem(at: url, to: recycled.appendingPathComponent(url.lastPathComponent))
+                })
+            let resumed = try await reopened.resumeRecordingOperation(id: ref.entityID)
+            XCTAssertEqual(resumed.result, .complete)
+            XCTAssertNil(resumed.projectionError)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path))
+            if !deleting {
+                XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Renamed.mp3")), Data("single synthetic original".utf8))
+                let current = try await reopened.resolve(ref)
+                XCTAssertEqual(current, "Renamed.mp3")
+            }
+    }
+
+    private actor Once {
+        private var ran = false
+        func take() -> Bool { if ran { return false }; ran = true; return true }
+    }
+    func testOwnedProjectionDuringMovePreparationCannotBreakAcceptedReplay() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let ref = try await coordinator.reference(to: "Meeting.mp3")
+        let once = Once()
+        let result = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Renamed", beforeCommit: {
+            guard await once.take() else { return }
+            let entity = SharedEntityIdentity(id: ref.entityID, kind: .recording)
+            _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.assign(field: "metadata.mode", value: .text("\"Wip\""))]))
+            try await coordinator.refresh()
+            _ = try await coordinator.projectOutputs()
+        })
+        XCTAssertEqual(result.result, .complete)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Renamed.mp3")), Data("single synthetic original".utf8))
+        let transcript = try SharedContentCoding.decoder().decode(Transcript.self, from: Data(contentsOf: root.appendingPathComponent("Renamed.transcript.json")))
+        XCTAssertEqual(transcript.segments.first?.text, "Conversation")
+        let view = try await coordinator.read(.init(id: ref.entityID, kind: .recording))
+        XCTAssertEqual(view.state.value(for: "metadata.mode"), .text("\"Wip\""))
+    }
+
+    func testPreparationRetryCannotOverwriteAnUnseenCompetingName() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let ref = try await coordinator.reference(to: "Meeting.mp3")
+        let entity = SharedEntityIdentity(id: ref.entityID, kind: .recording)
+        let once = Once()
+        do {
+            _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Renamed", beforeCommit: {
+                guard await once.take() else { return }
+                _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.assign(field: "title", value: .text("Other name"))]))
+            })
+            XCTFail("Retry cannot replace a competing intent")
+        } catch SharedLibraryCoordinatorError.staleReview {}
+        let current = try await coordinator.read(entity)
+        XCTAssertEqual(current.state.value(for: "title"), .text("Other name"))
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), Data("single synthetic original".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.mp3").path))
+    }
+
     func testActualStoreMoveUsesFolderIdentityAndKeepsOneOriginal() async throws {
         let (root, coordinator, store) = try await fixture()
         try await store.createFolder(named: "Archive")

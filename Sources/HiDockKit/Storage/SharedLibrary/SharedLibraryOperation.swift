@@ -2,11 +2,24 @@
 import CryptoKit
 import Foundation
 
-public enum SharedLibraryOperationError: Error, Equatable, Sendable {
+public enum SharedLibraryOperationError: Error, Equatable, LocalizedError, Sendable {
   case invalidOperation, invalidReceipt, differentBinding, unfinishedOperation, staleAuthority
   case pathConflict(String)
   case contentChanged(String)
   case unsafePath, unavailableRoot
+  public var errorDescription: String? {
+    switch self {
+    case .invalidOperation: return "This file operation needs review before it can continue."
+    case .invalidReceipt: return "The saved operation's recovery information is unreadable."
+    case .differentBinding: return "This operation belongs to a different library."
+    case .unfinishedOperation: return "This operation is pending. Resume it before making another file change."
+    case .staleAuthority: return "The library changed while preparing this operation. Retry."
+    case .pathConflict(let path): return "Another recording or file uses \(path). Resolve it before continuing."
+    case .contentChanged(let path): return "\(path) changed while preparing this operation. Review it before continuing."
+    case .unsafePath: return "This operation contains a location outside its library."
+    case .unavailableRoot: return "The library folder is unavailable."
+    }
+  }
 }
 public enum SharedMaterializationResult: Equatable, Sendable {
   case complete, needsReplanning, waitingForAcknowledgments, waitingForActiveWork
@@ -131,6 +144,18 @@ public struct SharedLibraryOperation: Codable, Equatable, Sendable {
     case replaceAudio(
       path: String, staged: String, expectedFingerprint: String?, selectedFingerprint: String,
       repair: Bool)
+  }
+  /// Compare causal state in its canonical compaction representation. This
+  /// publishes no state or compaction certificate; repository/authority checks
+  /// still verify the actual current state, membership and source bytes.
+  public static func revision(for state: SharedEntityState) throws -> String {
+    let normalized = try? state.compacting(SharedGenerationCompaction.proposed(for: state))
+    return try SharedStateFingerprint.of(normalized ?? state)
+  }
+  /// Legacy low-level plans retain exact raw-state matching. New SDK plans use
+  /// the normalized revision so certified refresh compaction is not an edit.
+  static func matchesRevision(_ revision: String, state: SharedEntityState) throws -> Bool {
+    try revision == Self.revision(for: state) || revision == SharedStateFingerprint.of(state)
   }
   public let id: UUID
   public let libraryID: UUID

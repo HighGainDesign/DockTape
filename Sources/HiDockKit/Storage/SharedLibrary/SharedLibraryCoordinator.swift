@@ -577,7 +577,7 @@ public actor SharedLibraryCoordinator {
       ? .publishAudio(path: filename, staged: staged, selectedFingerprint: selected)
       : .replaceAudio(path: filename, staged: staged, expectedFingerprint: actualHash, selectedFingerprint: selected, repair: repair)
     let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
-      inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state), steps: [step], inputAudioFingerprint: priorHash)
+      inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: [step], inputAudioFingerprint: priorHash)
     if !repair && hasPublishedAudio {
       let permission = try await operationAuthority(entity: entity, paths: [])
       if !permission.hasPendingWork { try await acknowledgeOperation(entity: entity, purpose: .replaceAudio) }
@@ -700,7 +700,7 @@ public actor SharedLibraryCoordinator {
     let materializer = try await makeMaterializer(entity: entity, paths: [filename], receipts: operationReceipts(library: manifest.libraryID))
     let staged = try await materializer.stageNewAudio(bytes, entity: entity)
     let operation = try SharedLibraryOperation(libraryID: manifest.libraryID, entity: entity,
-      inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(view.state),
+      inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: view.state),
       steps: [.publishAudio(path: filename, staged: staged, selectedFingerprint: selected)])
     let result = try await materializer.replay(operation)
     var projectionError: String?
@@ -772,7 +772,7 @@ public actor SharedLibraryCoordinator {
     let accepted = try await commit(.init(base: base, changes: [.assign(field: "name", value: .text(destination)),
       .assign(field: "physicalPath", value: .text(source)), .assign(field: "moveScope", value: .document(document))]), review: false, exact: true)
     let operation = try SharedLibraryOperation(libraryID: base.libraryID, entity: entity,
-      inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state),
+      inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state),
       steps: [.moveDirectory(source: source, destination: destination, inventory: inventory)])
     // The semantic commit has happened. Save its recovery plan even if
     // cancellation arrived in the post-commit callback; never claim rollback.
@@ -786,8 +786,15 @@ public actor SharedLibraryCoordinator {
     let view = try await read(entity)
     let receipts = try operationReceipts(library: view.libraryID)
     let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
-    guard let progress = try await reader.progress(entity: entity, libraryID: view.libraryID),
-          case .moveDirectory(let source, let destination, _) = progress.operation.steps.first else { throw SharedLibraryOperationError.invalidOperation }
+    guard let progress = try await reader.progress(entity: entity, libraryID: view.libraryID) else { throw SharedLibraryOperationError.invalidOperation }
+    if case .createDirectory(let path) = progress.operation.steps.first, progress.operation.steps.count == 1 {
+      let materializer = try await makeMaterializer(entity: entity, paths: [path], receipts: receipts, afterMutation: afterMutation)
+      let result = try await materializer.replay(progress.operation)
+      var projectionError: String?
+      if result == .complete { do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription } }
+      return .init(id: id, name: path, result: result, projectionError: projectionError)
+    }
+    guard case .moveDirectory(let source, let destination, _) = progress.operation.steps.first else { throw SharedLibraryOperationError.invalidOperation }
     if progress.completedSteps == progress.operation.steps.count,
        view.state.lifecycle == .alive, view.state.conflicts.isEmpty,
        view.state.value(for: "physicalPath") == .text(destination),
@@ -940,7 +947,7 @@ public actor SharedLibraryCoordinator {
     if let progress, progress.operation.steps == [.removeEmptyDirectory(path: path)] { operation = progress.operation }
     else {
       operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
-        inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state), steps: [.removeEmptyDirectory(path: path)])
+        inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: [.removeEmptyDirectory(path: path)])
       try await Task.detached { try await materializer.recordIntent(operation) }.value
     }
     let permission = try await operationAuthority(entity: entity, paths: [path])
@@ -961,18 +968,35 @@ public actor SharedLibraryCoordinator {
     }
     let entity = SharedEntityIdentity(id: UUID(), kind: .folder)
     let base = try await read(entity)
+    let materializer = try await makeMaterializer(entity: entity, paths: [name], receipts: operationReceipts(library: base.libraryID))
     let accepted = try await edit(.init(base: base, changes: [
       .assign(field: "initialPath", value: .text(name)), .assign(field: "name", value: .text(name)), .assign(field: "parent", value: .unset)]))
     let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
-      inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state), steps: [.createDirectory(path: name)])
-    let materializer = try await makeMaterializer(entity: entity, paths: [name], receipts: operationReceipts(library: accepted.libraryID))
+      inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: [.createDirectory(path: name)])
+    try await Task.detached { try await materializer.recordIntent(operation) }.value
+    try Task.checkCancellation()
     guard try await materializer.replay(operation) == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
   }
   public func relocateRecording(filename: String, title: String? = nil, toFolder: String? = nil,
                                 changeFolder: Bool = false,
+                                beforeCommit: @escaping @Sendable () async throws -> Void = {},
                                 afterMutation: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedRecordingFileOutcome {
     let source = try SharedLibraryIdentity.normalized(filename)
+    let initial = try await recording(at: source)
+    return try await relocateRecordingAttempt(filename: source, title: title, toFolder: toFolder, changeFolder: changeFolder,
+      beforeCommit: beforeCommit, afterMutation: afterMutation, initial: initial, retries: 2)
+  }
+  private func relocateRecordingAttempt(filename: String, title: String?, toFolder: String?, changeFolder: Bool,
+      beforeCommit: @escaping @Sendable () async throws -> Void, afterMutation: @escaping @Sendable (Int) throws -> Void,
+      initial: SharedLibraryViewSnapshot, retries: Int) async throws -> SharedRecordingFileOutcome {
+    let source = filename
+    let selected = try await read(.init(id: initial.state.id, kind: .recording))
+    if title != nil, selected.state.fields["title"] != initial.state.fields["title"] { throw SharedLibraryCoordinatorError.staleReview }
+    if changeFolder, selected.state.fields["folder"] != initial.state.fields["folder"] { throw SharedLibraryCoordinatorError.staleReview }
     let base = try await recording(at: source)
+    guard base.libraryID == initial.libraryID, base.state.id == initial.state.id else { throw SharedLibraryCoordinatorError.differentBinding }
+    if title != nil, base.state.fields["title"] != initial.state.fields["title"] { throw SharedLibraryCoordinatorError.staleReview }
+    if changeFolder, base.state.fields["folder"] != initial.state.fields["folder"] { throw SharedLibraryCoordinatorError.staleReview }
     let entity = SharedEntityIdentity(id: base.state.id, kind: .recording)
     guard base.state.lifecycle == .alive, base.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
     let receipts = try operationReceipts(library: base.libraryID)
@@ -1005,6 +1029,9 @@ public actor SharedLibraryCoordinator {
     let membership = try await memberRepository().load().membership
     let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
     var steps: [SharedLibraryOperation.Step] = []
+    var sourceBindings = published.proofs.map { file, hash in
+      SharedMaterializationBinding(file: file) { SharedLibraryOperation.fingerprint($0) == hash }
+    }
     for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
       let from = sourceStem + suffix, to = destinationStem + suffix
       let target = root.appendingPathComponent(to)
@@ -1017,16 +1044,32 @@ public actor SharedLibraryCoordinator {
           try published.validateCompanion(path: from, bytes: bytes, entity: entity.id, library: base.libraryID,
               kind: suffix == ".transcript.json" ? "transcript" : "summary")
         }
-        steps.append(.move(source: from, destination: to, fingerprint: SharedLibraryOperation.fingerprint(bytes)))
+        let hash = SharedLibraryOperation.fingerprint(bytes)
+        sourceBindings.append(.init(file: root.appendingPathComponent(from)) { SharedLibraryOperation.fingerprint($0) == hash })
+        steps.append(.move(source: from, destination: to, fingerprint: hash))
       } else if suffix == ".mp3" { throw CocoaError(.fileReadNoSuchFile) }
     }
+    try await beforeCommit()
     // Accept the logical intent before touching any source. Receipt replay,
     // ownership and expected bytes make each related physical phase recoverable.
-    let accepted = try await edit(.init(base: base, changes: changes))
+    let paths = steps.flatMap { step -> [String] in
+      if case .move(let source, let destination, _) = step { return [source, destination] }
+      return []
+    }
+    let materializer = try await makeMaterializer(entity: entity, paths: paths,
+      receipts: receipts, afterMutation: afterMutation)
+    let accepted: SharedLibraryViewSnapshot
+    do { accepted = try await commit(.init(base: base, changes: changes), review: false, exact: true, bindings: sourceBindings) }
+    catch {
+      let changed = error as? SharedLibraryRepositoryError == .staleRevision || error as? SharedLibraryCoordinatorError == .staleReview || error as? SharedLibraryOperationError == .staleAuthority
+      guard retries > 0, changed, !Task.isCancelled else { throw error }
+      return try await relocateRecordingAttempt(filename: source, title: title, toFolder: toFolder, changeFolder: changeFolder,
+        beforeCommit: beforeCommit, afterMutation: afterMutation, initial: initial, retries: retries - 1)
+    }
     let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
-      inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state), steps: steps)
-    let materializer = try await makeMaterializer(entity: entity, paths: Array(operation.canonicalPaths),
-      receipts: operationReceipts(library: accepted.libraryID), afterMutation: afterMutation)
+      inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: steps)
+    try await Task.detached { try await materializer.recordIntent(operation) }.value
+    try Task.checkCancellation()
     let result = try await materializer.replay(operation)
     var projectionError: String?
     if result == .complete {
@@ -1067,12 +1110,18 @@ public actor SharedLibraryCoordinator {
         steps.append(.trash(path: path, fingerprint: SharedLibraryOperation.fingerprint(bytes)))
       } else if suffix == ".mp3" { throw CocoaError(.fileReadNoSuchFile) }
     }
+    let paths = steps.compactMap { step -> String? in
+      if case .trash(let path, _) = step { return path }
+      return nil
+    }
+    let materializer = try await makeMaterializer(entity: entity, paths: paths, receipts: receipts)
     let accepted = base.state.lifecycle == .deleted ? base : try await edit(.init(base: base, changes: [.delete]))
     let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
-      inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(accepted.state), steps: steps)
+      inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: steps)
+    try await Task.detached { try await materializer.recordIntent(operation) }.value
+    try Task.checkCancellation()
     let permission = try await operationAuthority(entity: entity, paths: Array(operation.canonicalPaths))
     if !permission.hasPendingWork { try await acknowledgeOperation(entity: entity, purpose: .delete) }
-    let materializer = try await makeMaterializer(entity: entity, paths: Array(operation.canonicalPaths), receipts: receipts)
     let result = try await materializer.replay(operation)
     var projectionError: String?
     if result == .complete { do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription } }
@@ -1110,7 +1159,7 @@ public actor SharedLibraryCoordinator {
     }
     var result: SharedMaterializationResult
     if progress.completedSteps == progress.operation.steps.count {
-      if try SharedStateFingerprint.of(view.state) != progress.operation.outputRevision {
+      if try !SharedLibraryOperation.matchesRevision(progress.operation.outputRevision, state: view.state) {
         guard let selected, view.state.lifecycle == .alive, view.state.conflicts.isEmpty,
               view.state.value(for: "audioFingerprint") == .text(selected), view.state.value(for: "audioPublished") == .text(selected) else {
           return .init(filename: destination, result: .needsReplanning, projectionError: nil, view: view)
@@ -1143,6 +1192,19 @@ public actor SharedLibraryCoordinator {
     return .init(filename: result == .complete ? destination : source, result: result, projectionError: projectionError, view: view)
   }
 
+  /// Ordinary publication can rebuild a stale proof after a brief refresh.
+  /// Explicit preparation/mutation hooks retain one-shot rejection semantics.
+  public func projectOutputs() async throws -> SharedProjectionWriteResult {
+    let delays: [Duration] = [.milliseconds(25), .milliseconds(100), .milliseconds(400), .milliseconds(800)]
+    for attempt in 0...delays.count {
+      do { return try await projectOutputs(beforeWrite: {}, afterOutput: { _ in }) }
+      catch SharedProjectionWriteError.stale {
+        guard attempt < delays.count else { throw SharedProjectionWriteError.stale }
+        try await Task.sleep(for: delays[attempt])
+      }
+    }
+    throw SharedProjectionWriteError.stale
+  }
   public func projectOutputs(beforeWrite: @escaping @Sendable () async -> Void = {},
                              afterOutput: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedProjectionWriteResult {
     let context = try await projectionContext()
@@ -1351,7 +1413,8 @@ public actor SharedLibraryCoordinator {
   public func resolve(_ edit: SharedCoordinatorEdit) async throws -> SharedLibraryViewSnapshot {
     try await commit(edit, review: true)
   }
-  private func commit(_ edit: SharedCoordinatorEdit, review: Bool, exact: Bool = false) async throws
+  private func commit(_ edit: SharedCoordinatorEdit, review: Bool, exact: Bool = false,
+                      bindings: [SharedMaterializationBinding] = []) async throws
     -> SharedLibraryViewSnapshot
   {
     beginTransition(); defer { endTransition() }
@@ -1379,7 +1442,7 @@ public actor SharedLibraryCoordinator {
         guard try SharedStateFingerprint.of(state) == expected else { throw SharedLibraryCoordinatorError.staleReview }
       }
     } else { validation = nil }
-    let accepted = try await repository.commit(.init(base: fresh, changes: edit.changes, validation: validation))
+    let accepted = try await repository.commit(.init(base: fresh, changes: edit.changes, validation: validation, bindings: bindings))
     let view = SharedLibraryViewSnapshot(libraryID: manifest.libraryID, repository: accepted)
     publish(view, entity: entity, request: beginRead(entity))
     await afterCommit()
