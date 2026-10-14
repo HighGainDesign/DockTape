@@ -106,10 +106,22 @@ public actor SharedLibraryRepository {
     snapshot.binding == binding && snapshot.writer == writerID
   }
 
-  nonisolated func readBindings(_ snapshot: SharedLibrarySnapshot) throws -> [SharedMaterializationBinding] {
+  nonisolated func readBindings(_ snapshot: SharedLibrarySnapshot, validateSourceSet: Bool = false) throws -> [SharedMaterializationBinding] {
     guard accepts(snapshot) else { throw SharedLibraryRepositoryError.differentBinding }
-    return snapshot.sourceHeads.map { url, hash in SharedMaterializationBinding(file: url) { Self.hash($0) == hash } }
+    var bindings = snapshot.sourceHeads.map { url, hash in SharedMaterializationBinding(file: url) { Self.hash($0) == hash } }
         .sorted { $0.file.path < $1.file.path }
+    if validateSourceSet {
+      let root = self.root
+      let entity = SharedEntityIdentity(id: snapshot.state.id, kind: snapshot.state.kind)
+      let expected = Set(snapshot.sourceHeads.keys)
+      bindings.append(.init(file: root.appendingPathComponent(".docktape/format.json")) { _ in
+        try Self.validateRoot(root)
+        let directory = Self.directory(entity, root: root)
+        try Self.validate(directory, root: root)
+        return Set(try Self.headFiles(directory).map(\.url)) == expected
+      })
+    }
+    return bindings
   }
 
   public func load(entity: SharedEntityIdentity) async throws -> SharedLibrarySnapshot {

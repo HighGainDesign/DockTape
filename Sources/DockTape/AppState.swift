@@ -72,6 +72,8 @@ final class AppState {
     var triggerCustomPrompt: Bool = false
     var triggerMerge: Bool = false
     var mergeFilenames: [String] = []
+    private var mergeReferences: [String: SharedRecordingReference] = [:]
+    private var mergeLibraryRoot: URL?
     var showMergeDeletePrompt: Bool = false
     var showMigrationPrompt: Bool = false
     var syncProgress: Double? = nil  // 0.0–1.0 during sync, nil when idle
@@ -604,6 +606,10 @@ final class AppState {
             .filter { selected.contains($0.filename) }
             .sorted { ($0.recordedAt ?? .distantFuture) < ($1.recordedAt ?? .distantFuture) }
         mergeFilenames = sorted.map(\.filename)
+        mergeReferences = Dictionary(uniqueKeysWithValues: sorted.compactMap { recording in
+            recording.reference.map { (recording.filename, $0) }
+        })
+        mergeLibraryRoot = library.store.baseDirectory
         triggerMerge = true
     }
 
@@ -611,10 +617,14 @@ final class AppState {
     func executeMerge(as name: String) async {
         guard requireWritableLibrary() else { return }
         guard mergeFilenames.count >= 2 else { return }
+        guard mergeLibraryRoot == library.store.baseDirectory else {
+            errorMessage = "The library changed. Select the recordings to merge again."
+            return
+        }
 
         statusMessage = "Merging \(mergeFilenames.count) recordings..."
         do {
-            let merged = try await library.store.mergeRecordings(filenames: mergeFilenames, as: name)
+            let merged = try await library.store.mergeRecordings(filenames: mergeFilenames, as: name, references: mergeReferences)
             statusMessage = "Merged \(mergeFilenames.count) recordings into \(merged.filename)"
             await library.refresh()
             // Select the merged recording
@@ -626,19 +636,36 @@ final class AppState {
         }
     }
 
-    /// Delete the original recordings after a merge.
+    func clearMergeSelection() {
+        mergeFilenames = []; mergeReferences = [:]; mergeLibraryRoot = nil
+    }
+
+    /// Delete the original identities after a merge, even if names changed.
     func deleteMergeOriginals() async {
-        for filename in mergeFilenames {
+        guard requireWritableLibrary() else { return }
+        guard mergeLibraryRoot == library.store.baseDirectory else {
+            errorMessage = "The library changed. The original recordings were left in place."
+            return
+        }
+        for original in mergeFilenames {
             do {
-                try await library.store.deleteRecordingAndSidecars(filename: filename)
-                try await transcription.transcriptStore.delete(for: filename)
-                try? await summarization.summaryStore.delete(for: filename)
+                let filename: String
+                if let shared = sharedLibrary.coordinator {
+                    guard let reference = mergeReferences[original] else { throw SharedLibraryCoordinatorError.staleJob }
+                    filename = try await shared.resolve(reference)
+                } else { filename = original }
+                if playback.playingFile == filename { playback.stop() }
+                try await library.store.deleteRecordingAndSidecars(filename: filename, reference: mergeReferences[original])
+                if sharedLibrary.coordinator == nil {
+                    try await transcription.transcriptStore.delete(for: filename)
+                    try await summarization.summaryStore.delete(for: filename)
+                }
                 summarization.hasSummary.remove(filename)
             } catch {
-                errorMessage = "Failed to delete \(filename): \(error.localizedDescription)"
+                errorMessage = "Failed to delete \(original): \(error.localizedDescription)"
             }
         }
-        mergeFilenames = []
+        clearMergeSelection()
         await library.refresh()
     }
 

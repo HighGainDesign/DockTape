@@ -263,8 +263,10 @@ public actor SharedLibraryCoordinator {
     let manifest = try await bind()
     if let reference = manifest.references.first(where: { $0.entity.kind == .recording && $0.initialPath == path }) {
       let view = try await read(reference.entity)
-      guard try await currentPath(view) == path else { throw SharedSidecarError.unknownRecording }
-      return view
+      if try await currentPath(view) == path { return view }
+      // The bootstrap identifies the original recording, not a permanent
+      // reservation of its old name after a completed rename. Look up the
+      // current owner when another recording legitimately reuses that path.
     }
     var matches: [SharedLibraryViewSnapshot] = []
     for entity in try await repository.scan() where entity.kind == .recording {
@@ -590,6 +592,125 @@ public actor SharedLibraryCoordinator {
     return (.init(filename: filename, result: result, projectionError: projectionError, view: completed), true)
   }
 
+  public func mergeRecordings(filenames: [String], as filename: String,
+                              references: [String: SharedRecordingReference] = [:],
+                              beforeSourceProof: @escaping @Sendable (SharedEntityIdentity) async throws -> Void = { _ in },
+                              beforeCommit: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedRecordingFileOutcome {
+    guard filenames.count >= 2 else { throw HiDockError.invalidFilename("Need at least 2 recordings to merge") }
+    guard try await mayEdit() else { throw SharedLibraryCoordinatorError.enrollmentPending }
+    let path = try SharedLibraryIdentity.normalized(filename)
+    guard !path.contains("/"), path.hasSuffix(".mp3") else { throw SharedLibraryIdentityError.invalidRelativePath }
+    var tokens: [SharedLibraryJobToken] = []
+    do {
+      var concatenator = MP3Concatenator()
+      var dates: [Date] = [], mode: String?, sources: [String] = []
+      for input in filenames {
+        let reference: SharedRecordingReference
+        if let captured = references[input] { reference = captured }
+        else { reference = try await self.reference(to: input) }
+        let current = try await resolve(reference)
+        let entity = SharedEntityIdentity(id: reference.entityID, kind: .recording)
+        let url = root.appendingPathComponent(current)
+        let token = try await pinJob(entity, audioURL: url)
+        tokens.append(token)
+        guard let data = try await RecordingFileAccess().readDataIfPresent(at: url, knownToExist: true) else { throw CocoaError(.fileReadNoSuchFile) }
+        try concatenator.append(data)
+        let metadata = try SharedRecordingMetadataAdapter.render(token.snapshot)
+        if let date = metadata.recordedAt ?? FilenameParsing.parse((current as NSString).lastPathComponent).date { dates.append(date) }
+        if mode == nil { mode = token.recordingMode }
+        sources.append(current)
+      }
+      let bytes = try concatenator.output()
+      let metadata = RecordingStore.RecordingMeta(mode: mode?.isEmpty == false ? mode : nil,
+        deviceFilename: nil, mergedFrom: sources, recordedAt: dates.min(), audioSHA256: SharedLibraryOperation.fingerprint(bytes))
+      let outcome = try await publishMergedAudio(bytes, filename: path, metadata: metadata, tokens: tokens, beforeSourceProof: beforeSourceProof, beforeCommit: beforeCommit)
+      for token in tokens { await finishJob(token) }
+      return outcome
+    } catch {
+      for token in tokens { await finishJob(token) }
+      throw error
+    }
+  }
+  private func publishMergedAudio(_ bytes: Data, filename: String, metadata: RecordingStore.RecordingMeta,
+                                  tokens: [SharedLibraryJobToken], beforeSourceProof: @Sendable (SharedEntityIdentity) async throws -> Void,
+                                  beforeCommit: @Sendable () async throws -> Void) async throws -> SharedRecordingFileOutcome {
+    let views = try await snapshots(kinds: [.recording, .folder])
+    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    let stem = (filename as NSString).deletingPathExtension
+    guard index.owners(of: filename).isEmpty else { throw SharedLibraryOperationError.pathConflict(filename) }
+    for suffix in [".mp3", ".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".txt"] {
+      let url = root.appendingPathComponent(stem + suffix)
+      let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+      guard !FileManager.default.fileExists(atPath: url.path), !FileManager.default.fileExists(atPath: placeholder.path) else { throw SharedLibraryOperationError.pathConflict(stem + suffix) }
+    }
+    let manifest = try await bind(force: true)
+    let entity = SharedEntityIdentity(id: UUID(), kind: .recording)
+    let base = try await repository.load(entity: entity)
+    var bindings: [SharedMaterializationBinding] = []
+    let membership = try await memberRepository().load().membership
+    for token in tokens {
+      try await validateJob(token)
+      guard token.library == manifest.libraryID, let owned = jobs[token.id], let inputFile = owned.inputFile, !owned.lease.isRevoked else { throw SharedLibraryCoordinatorError.staleJob }
+      try await beforeSourceProof(token.entity)
+      let fresh = try await repository.load(entity: token.entity)
+      guard fresh.state.lifecycle == .alive,
+            try Self.lifecycleRevision(fresh.state) == token.lifecycle,
+            try Self.inputRevision(fresh.state, component: token.component) == token.input else { throw SharedLibraryCoordinatorError.staleJob }
+      try Self.validateProcessingState(fresh.state, input: token.component, output: nil)
+      guard fresh.writers.isSubset(of: membership.cohort) else { throw SharedLibraryCoordinatorError.unrecognizedWriter }
+      bindings += try repository.readBindings(fresh, validateSourceSet: true)
+      bindings.append(inputFile)
+    }
+    bindings.append(.init(file: root.appendingPathComponent(".docktape/format.json")) { data in
+      guard let value = try? JSONDecoder().decode(SharedBootstrapManifest.self, from: data) else { return false }
+      return value.complete && value.libraryID == manifest.libraryID && value.fingerprint == manifest.fingerprint
+    })
+    // Several sources share the format anchor. Keep one read accessor while
+    // retaining every independent source-set and format predicate.
+    let groups = Dictionary(grouping: bindings, by: \.file)
+    let proofs = groups.map { file, predicates in
+      SharedMaterializationBinding(file: file) { data in
+        for predicate in predicates where try !predicate.validate(data) { return false }
+        return true
+      }
+    }.sorted { $0.file.path < $1.file.path }
+    let selected = SharedLibraryOperation.fingerprint(bytes)
+    let provenance = tokens.map { token in ["library": token.library.uuidString, "entity": token.entity.id.uuidString, "inputRevision": token.input] }
+    let changes: [SharedLibraryMutation] = [
+      .assign(field: "initialPath", value: .text(filename)), .assign(field: "title", value: .text(stem)),
+      .assign(field: "folder", value: .unset), .assign(field: "audioFingerprint", value: .text(selected)),
+      .assign(field: "audioPublished", value: .unset),
+      .assign(field: "legacyMetadata", value: .document(try SharedDocument(id: UUID(), json: JSONEncoder().encode(metadata)))),
+      .assign(field: "mergeSources", value: .document(try SharedDocument(id: UUID(), json: JSONSerialization.data(withJSONObject: provenance, options: .sortedKeys))))]
+    try await beforeCommit()
+    try Task.checkCancellation()
+    let leases = tokens.map(\.lease)
+    let validate: @Sendable (SharedEntityState) throws -> Void = { state in
+      guard state.lifecycle == .uninitialized, leases.allSatisfy({ !$0.isRevoked }) else { throw SharedLibraryCoordinatorError.staleJob }
+    }
+    let accepted: SharedLibrarySnapshot
+    beginTransition()
+    do {
+      accepted = try await repository.commit(.init(base: base, changes: changes, validation: validate, bindings: proofs))
+      endTransition()
+    } catch { endTransition(); throw error }
+    var view = SharedLibraryViewSnapshot(libraryID: manifest.libraryID, repository: accepted)
+    publish(view, entity: entity, request: beginRead(entity))
+    await afterCommit()
+    let materializer = try await makeMaterializer(entity: entity, paths: [filename], receipts: operationReceipts(library: manifest.libraryID))
+    let staged = try await materializer.stageNewAudio(bytes, entity: entity)
+    let operation = try SharedLibraryOperation(libraryID: manifest.libraryID, entity: entity,
+      inputRevision: base.fingerprint, outputRevision: SharedStateFingerprint.of(view.state),
+      steps: [.publishAudio(path: filename, staged: staged, selectedFingerprint: selected)])
+    let result = try await materializer.replay(operation)
+    var projectionError: String?
+    if result == .complete {
+      view = try await edit(.init(base: try await read(entity), changes: [.assign(field: "audioPublished", value: .text(selected))]))
+      do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription }
+    }
+    return .init(filename: filename, result: result, projectionError: projectionError, view: view)
+  }
+
   public func createSharedFolder(named name: String) async throws {
     _ = try SharedLibraryIdentity.normalized(name)
     guard !name.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
@@ -674,9 +795,12 @@ public actor SharedLibraryCoordinator {
     return .init(filename: result == .complete ? destination : source, result: result, projectionError: projectionError, view: accepted)
   }
 
-  public func deleteSharedRecording(filename: String) async throws -> SharedRecordingFileOutcome {
-    let source = try SharedLibraryIdentity.normalized(filename)
+  public func deleteSharedRecording(filename: String, reference: SharedRecordingReference? = nil) async throws -> SharedRecordingFileOutcome {
+    let source: String
+    if let reference { source = try await resolve(reference) }
+    else { source = try SharedLibraryIdentity.normalized(filename) }
     let base = try await recording(at: source)
+    if let reference, reference.libraryID != base.libraryID || reference.entityID != base.state.id { throw SharedLibraryCoordinatorError.differentBinding }
     let entity = SharedEntityIdentity(id: base.state.id, kind: .recording)
     guard base.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
     let receipts = try operationReceipts(library: base.libraryID)

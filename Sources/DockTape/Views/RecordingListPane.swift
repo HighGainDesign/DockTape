@@ -108,7 +108,7 @@ struct RecordingListPane: View {
         }
         .alert("Delete Originals?", isPresented: $state.showMergeDeletePrompt) {
             Button("Keep Originals") {
-                state.mergeFilenames = []
+                state.clearMergeSelection()
             }
             Button("Delete Originals", role: .destructive) {
                 Task { await state.deleteMergeOriginals() }

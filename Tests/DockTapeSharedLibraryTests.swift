@@ -116,7 +116,7 @@ struct DockTapeSharedLibraryTests {
             guard ContinuousClock.now < raceDeadline else { throw Failure(description: "Summary race timed out") }
             try await Task.sleep(for: .milliseconds(10))
         }
-        try expect(await staleProvider.calls == 1, "Ready summary race must reach the synthetic provider")
+        try expect(await staleProvider.calls == 1, "Ready summary race must reach the synthetic provider: " + (state.errorMessage ?? "no error"))
         let raced = try await coordinator.read(.init(id: entity, kind: .recording))
         try expect(raced.state.currentDocument(for: .summary)?.id == oldSummaryID, "Actual summary queue must not save output from an old transcript")
         state.errorMessage = nil
@@ -161,6 +161,57 @@ struct DockTapeSharedLibraryTests {
         try expect(reopened.library.recordings.map(\.filename) == ["Other.mp3"], "New root must not show old library content")
         try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.mp3").path), "Storage switching must not move recordings")
         await reopened.sharedLibrary.close()
-        print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions and reconnect.")
+        try await mergeSelectionChecks(parent: parent, identity: identity)
+        print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions, reconnect and ID-bound merge/original deletion.")
     }
+    @MainActor static func mergeSelectionChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {
+        let root = parent.appendingPathComponent("merge-library")
+        let legacy = RecordingStore(baseDirectory: root)
+        try await legacy.setup()
+        var bytes = Data(repeating: 0, count: 417)
+        bytes.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+        for name in ["A", "B"] { _ = try await legacy.importRecording(hdaData: bytes, entry: FileEntry(filename: name + ".hda", size: UInt32(bytes.count))) }
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: parent.appendingPathComponent("merge-witnesses"))
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable isolated merge library")
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        state.library.selectedRecordings = ["A.mp3", "B.mp3"]
+        state.startMerge()
+        _ = try await state.library.store.renameRecording(filename: "B.mp3", to: "Current B")
+        await state.executeMerge(as: "Joined")
+        try expect(state.showMergeDeletePrompt && FileManager.default.fileExists(atPath: root.appendingPathComponent("Joined.mp3").path), "Actual merge dialog must follow selected IDs after rename: " + (state.errorMessage ?? ""))
+        try expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("B.mp3").path), "Merge must not recreate the old source name")
+        guard let shared = state.sharedLibrary.coordinator else { throw Failure(description: "Missing merge coordinator") }
+        let oldB = try await shared.reference(to: "Current B.mp3")
+        let oldA = try await shared.reference(to: "A.mp3")
+        _ = try await state.library.store.renameRecording(filename: "Current B.mp3", to: "Later B")
+        _ = try await state.library.store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Unrelated.hda", size: UInt32(bytes.count)))
+        _ = try await state.library.store.renameRecording(filename: "Unrelated.mp3", to: "B")
+        let unrelated = try await shared.reference(to: "B.mp3")
+        var held: [SharedLibraryJobToken] = []
+        // Veto physical disposal for every possible target, so the assertion
+        // cannot send even a failing test's fixtures to the user's Trash.
+        for (reference, path) in [(oldA, "A.mp3"), (oldB, "Later B.mp3"), (unrelated, "B.mp3")] {
+            held.append(try await shared.pinJob(.init(id: reference.entityID, kind: .recording), audioURL: root.appendingPathComponent(path)))
+        }
+        await state.deleteMergeOriginals()
+        let deletedOriginal = try await shared.read(.init(id: oldB.entityID, kind: .recording))
+        let preservedNew = try await shared.read(.init(id: unrelated.entityID, kind: .recording))
+        try expect(deletedOriginal.state.lifecycle == .deleted && preservedNew.state.lifecycle == .alive, "Delete originals must follow IDs and leave a new recording at the old filename alone")
+        for path in ["A.mp3", "Later B.mp3", "B.mp3"] {
+            try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent(path).path), "Active fixture leases must veto physical disposal")
+        }
+        for token in held { await shared.finishJob(token) }
+        state.library.selectedRecordings = ["B.mp3", "Joined.mp3"]
+        state.startMerge()
+        let other = parent.appendingPathComponent("merge-other-library")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        for name in ["B", "Joined"] { try bytes.write(to: other.appendingPathComponent(name + ".mp3")) }
+        try expect(await state.switchStorageLocation(to: .custom, customURL: other), "Switch isolated merge library")
+        await state.executeMerge(as: "Wrong library")
+        try expect(!FileManager.default.fileExists(atPath: other.appendingPathComponent("Wrong library.mp3").path), "A changed library must invalidate the open merge dialog")
+        try expect(state.errorMessage?.contains("library changed") == true, "Explain the changed merge binding")
+        await state.sharedLibrary.close()
+    }
+
 }

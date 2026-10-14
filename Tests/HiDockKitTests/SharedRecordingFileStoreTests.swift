@@ -438,4 +438,19 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertEqual(LibraryFileDiscovery.files(in: right, suffix: ".mp3").filter { $0.relativePath == "Shared source.mp3" }.count, 1)
     }
 
+    func testReusedLegacyPathResolvesNewOwnerInsteadOfOldBootstrapIdentity() async throws {
+        let (_, coordinator, store) = try await fixture()
+        let original = try await coordinator.reference(to: "Meeting.mp3")
+        _ = try await store.renameRecording(filename: "Meeting.mp3", to: "Original meeting")
+        let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+        let imported = try await store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Replacement.hda", size: UInt32(bytes.count)))
+        let replacement = try XCTUnwrap(imported?.reference)
+        _ = try await store.renameRecording(filename: "Replacement.mp3", to: "Meeting")
+        let actual = try await coordinator.reference(to: "Meeting.mp3")
+        XCTAssertEqual(actual, replacement)
+        XCTAssertNotEqual(actual, original)
+        let originalPath = try await coordinator.resolve(original)
+        XCTAssertEqual(originalPath, "Original meeting.mp3")
+    }
+
 }

@@ -344,7 +344,18 @@ public actor RecordingStore {
     /// Merge encoded audio frames, rebuilding duration metadata without re-encoding.
     /// Files are concatenated in the order provided. Returns metadata for the merged recording.
     @discardableResult
-    public func mergeRecordings(filenames: [String], as newFilename: String) async throws -> RecordingMetadata {
+    public func mergeRecordings(filenames: [String], as newFilename: String, references: [String: SharedRecordingReference] = [:]) async throws -> RecordingMetadata {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            let title = Self.sanitizeFilename(newFilename.hasSuffix(".mp3") ? String(newFilename.dropLast(4)) : newFilename)
+            guard !title.isEmpty else { throw HiDockError.invalidFilename(newFilename) }
+            let outcome = try await shared.coordinator.mergeRecordings(filenames: filenames, as: title + ".mp3", references: references)
+            sharedOperation = outcome
+            guard outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
+            try await loadLibraryMeta()
+            guard let result = allRecordings().first(where: { $0.filename == outcome.filename }) else { throw HiDockError.fileNotFound(outcome.filename) }
+            return result
+        }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         guard filenames.count >= 2 else {
             throw HiDockError.invalidFilename("Need at least 2 recordings to merge")
@@ -409,16 +420,17 @@ public actor RecordingStore {
     }
 
     /// Delete a local recording and all its sidecars.
-    public func deleteRecordingAndSidecars(filename: String) async throws {
+    public func deleteRecordingAndSidecars(filename: String, reference: SharedRecordingReference? = nil) async throws {
         if let shared {
             try shared.requireRoot(baseDirectory)
             metadataTicket += 1
-            let outcome = try await shared.coordinator.deleteSharedRecording(filename: filename)
+            let outcome = try await shared.coordinator.deleteSharedRecording(filename: filename, reference: reference)
             sharedOperation = outcome
             guard outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
-            meta.removeValue(forKey: filename); metaBaseline.removeValue(forKey: filename); recordingReferences.removeValue(forKey: filename)
+            meta.removeValue(forKey: outcome.filename); metaBaseline.removeValue(forKey: outcome.filename); recordingReferences.removeValue(forKey: outcome.filename)
             return
         }
+        if reference != nil { throw SharedLibraryCoordinatorError.differentBinding }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let basename = ((filename as NSString).lastPathComponent as NSString).deletingPathExtension
         let dir: URL
