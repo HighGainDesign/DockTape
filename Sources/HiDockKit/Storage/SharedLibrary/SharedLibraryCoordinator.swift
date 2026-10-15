@@ -329,6 +329,19 @@ public actor SharedLibraryCoordinator {
     return .init(libraryID: view.libraryID, entityID: view.state.id)
   }
   public func resolve(_ reference: SharedRecordingReference) async throws -> String {
+    try await resolve(reference, beforeValidation: {})
+  }
+  func resolve(_ reference: SharedRecordingReference, beforeValidation: @escaping @Sendable () async throws -> Void) async throws -> String {
+    // Resolution precedes job pinning and user consent. A background metadata
+    // refresh may invalidate this read without changing the recording's path.
+    for attempt in 0..<3 {
+      try Task.checkCancellation()
+      do { return try await resolveAttempt(reference, beforeValidation: beforeValidation) }
+      catch SharedLibraryCoordinatorError.staleJob where attempt < 2 { continue }
+    }
+    throw SharedLibraryCoordinatorError.staleJob
+  }
+  private func resolveAttempt(_ reference: SharedRecordingReference, beforeValidation: @escaping @Sendable () async throws -> Void) async throws -> String {
     let manifest = try await bind(force: true)
     guard manifest.libraryID == reference.libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
     let view = try await read(.init(id: reference.entityID, kind: .recording))
@@ -345,8 +358,10 @@ public actor SharedLibraryCoordinator {
         if FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path) { throw SharedLibraryOperationError.unfinishedOperation }
       }
     }
+    try await beforeValidation()
     let latest = try await read(.init(id: reference.entityID, kind: .recording))
-    guard latest.libraryID == reference.libraryID, latest.fingerprint == view.fingerprint else { throw SharedLibraryCoordinatorError.staleJob }
+    guard latest.libraryID == reference.libraryID, latest.fingerprint == view.fingerprint,
+          try await currentPath(latest) == path else { throw SharedLibraryCoordinatorError.staleJob }
     return path
   }
   private func currentPath(_ view: SharedLibraryViewSnapshot) async throws -> String {
@@ -1066,7 +1081,7 @@ public actor SharedLibraryCoordinator {
       guard !permission.revisionLease.isRevoked, try permission.validateLocalCommit() else { return false }
       let directory = scopes[items.count].url
       try SharedLibraryMaterializer.checkRoot(directory)
-      guard directory.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath() else { throw SharedLibraryOperationError.unsafePath }
+      guard directory.standardizedFileURL.resolvingSymlinksInPath().path == root.standardizedFileURL.resolvingSymlinksInPath().path else { throw SharedLibraryOperationError.unsafePath }
       for (binding, scope) in zip(bindings, scopes.dropFirst(items.count + 1)) {
         guard scope.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
               try binding.validate(Data(contentsOf: scope.url)) else { return false }

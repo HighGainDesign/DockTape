@@ -104,7 +104,7 @@ struct SharedLibraryProjectionWriter {
             try SharedLibraryMaterializer.checkRoot(root)
             let readScopes = Array(scopes.dropFirst(writes.count).prefix(reads.count))
             let physicalScopes = Array(scopes.dropFirst(writes.count + reads.count))
-            guard physicalScopes[0].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath() else { throw SharedLibraryOperationError.unsafePath }
+            guard physicalScopes[0].url.standardizedFileURL.resolvingSymlinksInPath().path == root.standardizedFileURL.resolvingSymlinksInPath().path else { throw SharedLibraryOperationError.unsafePath }
             for path in context.absentPaths {
                 let url = root.appendingPathComponent(path)
                 let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")

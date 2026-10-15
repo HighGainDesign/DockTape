@@ -176,8 +176,16 @@ public struct SharedOwnerWitness: Sendable {
               try binding.validate(Data(contentsOf: read.url)) else { throw SharedLibraryRepositoryError.staleRevision }
       }
       if let gate { try gate.validate(scopes[2], outside: head.deletingLastPathComponent()) }
+      // Resolve the existing parent before comparing a newly created file.
+      // Foundation can give a missing /private/tmp child and its existing /tmp
+      // parent different spellings even though both designate the same folder.
+      let checkpointParent = checkpoint.url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+      let expectedParent = file.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+      let checkpointType = try? FileManager.default.attributesOfItem(atPath: checkpoint.url.path)[.type] as? FileAttributeType
       guard target.url.standardizedFileURL.resolvingSymlinksInPath() == intendedHead,
-        SharedLibraryMaterializer.contained(checkpoint.url, in: directory)
+        checkpointParent == expectedParent, checkpoint.url.lastPathComponent == file.lastPathComponent,
+        SharedLibraryMaterializer.contained(checkpointParent, in: directory),
+        checkpointType != .typeSymbolicLink
       else {
         throw SharedLibraryOperationError.unsafePath
       }

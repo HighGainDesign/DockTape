@@ -292,7 +292,7 @@ public actor SharedLibraryMaterializer {
     try await access.withWrites([.init(file)] + gateItems, reading: [root] + bindings.map(\.file)) { scopes in
       let scope = scopes[0]
       if let gate { try gate.validate(scopes[1], outside: root) }
-      guard scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath(),
+      guard scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath().path == root.standardizedFileURL.resolvingSymlinksInPath().path,
             try current.validateLocalCommit() else { throw SharedLibraryOperationError.staleAuthority }
       for (binding, read) in zip(bindings, scopes.dropFirst(2 + gateItems.count)) {
         guard read.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),

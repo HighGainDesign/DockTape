@@ -6,8 +6,8 @@ import CryptoKit
 final class SharedRecordingFileStoreTests: XCTestCase {
     private var roots: [URL] = []
     override func tearDown() { for root in roots { try? FileManager.default.removeItem(at: root) } }
-    private func fixture(project: Bool = true) async throws -> (URL, SharedLibraryCoordinator, RecordingStore) {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    private func fixture(project: Bool = true, directory suppliedDirectory: URL? = nil) async throws -> (URL, SharedLibraryCoordinator, RecordingStore) {
+        let directory = suppliedDirectory ?? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         roots.append(directory)
         let root = directory.appendingPathComponent("library")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -945,8 +945,8 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Moved.mp3")), changed)
     }
 
-    private func pendingChangedMove() async throws -> (URL, SharedLibraryCoordinator, SharedRecordingOperationReview) {
-        let (root, coordinator, _) = try await fixture()
+    private func pendingChangedMove(directory: URL? = nil) async throws -> (URL, SharedLibraryCoordinator, SharedRecordingOperationReview) {
+        let (root, coordinator, _) = try await fixture(directory: directory)
         let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
         do { _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Intermediate", afterMutation: { _ in throw ReviewStop.interrupted }); XCTFail() }
         catch ReviewStop.interrupted {}
@@ -1118,6 +1118,68 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         let legacy = try JSONDecoder().decode(SharedLibraryOperation.self, from: JSONEncoder().encode(operation))
         XCTAssertNil(legacy.reviewedExistingDestinations)
         XCTAssertEqual(legacy, operation)
+    }
+
+    private actor ResolutionMutations {
+        private(set) var count = 0
+        func next() -> Int { count += 1; return count }
+    }
+    func testReferenceResolutionRetriesOneUnrelatedEditBeforeStartingWork() async throws {
+        let (_, coordinator, _) = try await fixture()
+        let reference = try await coordinator.reference(to: "Meeting.mp3")
+        let mutations = ResolutionMutations()
+        let path = try await coordinator.resolve(reference, beforeValidation: {
+            if await mutations.next() == 1 {
+                let view = try await coordinator.read(.init(id: reference.entityID, kind: .recording))
+                _ = try await coordinator.edit(.init(base: view, changes: [.assign(field: "metadata.mode", value: .text("\"Rec\""))]))
+            }
+        })
+        XCTAssertEqual(path, "Meeting.mp3")
+        let attempts = await mutations.count
+        XCTAssertEqual(attempts, 2, "Read preparation retries a changed snapshot before pinning work")
+    }
+    func testReferenceResolutionRefusesAnUnpublishedAncestorRename() async throws {
+        let (_, coordinator, store) = try await fixture()
+        try await store.createFolder(named: "Archive")
+        _ = try await store.moveRecording(filename: "Meeting.mp3", toFolder: "Archive")
+        let reference = try await coordinator.reference(to: "Archive/Meeting.mp3")
+        let folders = try await coordinator.snapshots(kinds: [.folder])
+        let folder = try XCTUnwrap(folders.first)
+        let mutations = ResolutionMutations()
+        do {
+            _ = try await coordinator.resolve(reference, beforeValidation: {
+                if await mutations.next() == 1 {
+                    _ = try await coordinator.edit(.init(base: folder, changes: [.assign(field: "name", value: .text("Unpublished"))]))
+                }
+            })
+            XCTFail("A parent changed without changing this recording's state; the old physical location must not be returned")
+        } catch SharedLibraryOperationError.unfinishedOperation {}
+    }
+    func testReferenceResolutionBoundsRetriesDuringContinuousChanges() async throws {
+        let (_, coordinator, _) = try await fixture()
+        let reference = try await coordinator.reference(to: "Meeting.mp3")
+        let mutations = ResolutionMutations()
+        do {
+            _ = try await coordinator.resolve(reference, beforeValidation: {
+                let number = await mutations.next()
+                let view = try await coordinator.read(.init(id: reference.entityID, kind: .recording))
+                _ = try await coordinator.edit(.init(base: view, changes: [.assign(field: "metadata.mode", value: .text("edit-\(number)"))]))
+            })
+            XCTFail("Continuously changing state must remain pending")
+        } catch SharedLibraryCoordinatorError.staleJob {}
+        let attempts = await mutations.count
+        XCTAssertEqual(attempts, 3)
+    }
+
+    func testUpdatedPlanUnderExplicitPrivateTmpRootUsesItsCoordinatedDirectory() async throws {
+        let requested = URL(fileURLWithPath: "/private/tmp/DockTapeReplanAlias-" + UUID().uuidString + "/data")
+        roots.append(requested.deletingLastPathComponent())
+        try FileManager.default.createDirectory(at: requested, withIntermediateDirectories: true)
+        let (root, coordinator, review) = try await pendingChangedMove(directory: requested.standardizedFileURL.resolvingSymlinksInPath())
+        let prepared = try await coordinator.prepareRecordingReplan(review)
+        let result = try await coordinator.applyRecordingReplan(prepared)
+        XCTAssertEqual(result.result, .complete); XCTAssertNil(result.projectionError)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Final.mp3")), Data("single synthetic original".utf8))
     }
 
 }

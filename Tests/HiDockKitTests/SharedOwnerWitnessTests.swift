@@ -37,6 +37,53 @@ final class SharedOwnerWitnessTests: XCTestCase {
     }
   }
   private enum Interrupted: Error { case crash }
+  func testNewWitnessUnderExplicitPrivateTmpAliasCanPublish() async throws {
+    let parent = URL(fileURLWithPath: "/private/tmp/DockTapeWitnessAlias-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: parent) }
+    let root = parent.appendingPathComponent("data/library")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let head = root.appendingPathComponent("owner.json")
+    let witness = SharedOwnerWitness(directory: parent.appendingPathComponent("data/new-local"), libraryID: UUID(), writerID: UUID())
+    let result = try await witness.withWrite(at: head, key: "record", decode: { bytes in
+      let value = try JSONDecoder().decode(Head.self, from: bytes)
+      return .init(sequence: value.sequence, fingerprint: try SharedStateFingerprint.of(value))
+    }) { _, current in
+      XCTAssertNil(current)
+      let value = Head(sequence: 1, value: "first accepted edit")
+      return .init(bytes: try JSONEncoder().encode(value), result: value.value)
+    }
+    XCTAssertEqual(result, "first accepted edit")
+    XCTAssertTrue(FileManager.default.fileExists(atPath: witness.fileURL(for: "record").path))
+    XCTAssertEqual(try JSONDecoder().decode(Head.self, from: Data(contentsOf: head)).sequence, 1)
+  }
+  func testWitnessSymlinkIntoLibraryCannotPublish() async throws {
+    let f = Fixture(); try f.setup(); defer { f.cleanup() }
+    let alias = f.parent.appendingPathComponent("local-alias")
+    try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: f.root)
+    let witness = SharedOwnerWitness(directory: alias, libraryID: f.library, writerID: f.writer)
+    XCTAssertFalse(witness.isOutside(f.root))
+    do {
+      _ = try await witness.withWrite(at: f.head, key: "record", decode: { try f.summary($0) }) { _, _ in
+        XCTFail("A local witness inside the shared root cannot accept a write")
+        return SharedOwnerPreparedWrite(bytes: Data(), result: false)
+      }
+      XCTFail("Symlink escape must remain refused")
+    } catch SharedLibraryOperationError.unsafePath {}
+    XCTAssertFalse(FileManager.default.fileExists(atPath: f.head.path))
+  }
+  func testCheckpointSymlinkCannotReadOrOverwriteAnOutsideFile() async throws {
+    let f = Fixture(); try f.setup(); defer { f.cleanup() }
+    let target = f.parent.appendingPathComponent("unrelated.json")
+    let original = Data("unrelated original".utf8)
+    try original.write(to: target)
+    let checkpoint = f.witness.fileURL(for: "record")
+    try FileManager.default.createDirectory(at: checkpoint.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(at: checkpoint, withDestinationURL: target)
+    do { _ = try await f.save("not accepted"); XCTFail("Checkpoint symlinks must remain refused") }
+    catch SharedLibraryOperationError.unsafePath {}
+    XCTAssertEqual(try Data(contentsOf: target), original)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: f.head.path))
+  }
   func testAcceptedOwnerRollbackNeverAllocatesAReusedSequence() async throws {
     let f = Fixture()
     try f.setup()

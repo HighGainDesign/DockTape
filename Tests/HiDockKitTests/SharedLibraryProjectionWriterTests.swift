@@ -23,6 +23,21 @@ final class SharedLibraryProjectionWriterTests: XCTestCase {
         _ = try await coordinator.enable()
         return (root, coordinator)
     }
+    func testFirstProjectionWithExplicitPrivateTmpRootAcceptsItsCoordinatedDirectory() async throws {
+        let requested = URL(fileURLWithPath: "/private/tmp/DockTapeProjectionAlias-" + UUID().uuidString + "/data")
+        roots.append(requested.deletingLastPathComponent())
+        try FileManager.default.createDirectory(at: requested, withIntermediateDirectories: true)
+        let parent = requested.standardizedFileURL.resolvingSymlinksInPath()
+        let root = parent.appendingPathComponent("left")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("synthetic".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("new-local"))
+        _ = try await coordinator.enable()
+        let result = try await coordinator.projectOutputs()
+        XCTAssertGreaterThan(result.written, 0)
+        let next = try await coordinator.projectOutputs()
+        XCTAssertEqual(next.written, 0)
+    }
     func testWritesCanonicalAggregatesAndReadableFilesThenSkipsIdenticalBytes() async throws {
         let (root, coordinator) = try await fixture()
         let records = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
