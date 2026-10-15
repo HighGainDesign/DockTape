@@ -504,10 +504,10 @@ import HiDockKit
         print("Actual unprepared deletion passed: retry, explicit Keep, native external-file restoration and deletion again complete without fixture repair writes.")
     }
 
-    @MainActor static func folderDeletionScopeChecks(parent: URL, peerCleanup: Bool = false) async throws {
+    @MainActor static func folderDeletionScopeChecks(parent: URL, peerCleanup: Bool = false, retainedChild: Bool = false) async throws {
         let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right"), trash = parent.appendingPathComponent("synthetic-trash")
         try FileManager.default.createDirectory(at: left.appendingPathComponent("Empty"), withIntermediateDirectories: true)
-        let owner = FolderFileReviewState(), pause = SavePause(), cleanupPause = SavePause(armed: false)
+        let owner = FolderFileReviewState(), pause = SavePause(armed: !retainedChild), cleanupPause = SavePause(armed: false)
         let identityFile = parent.appendingPathComponent("qa-writer.json")
         let identity = try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "synthetic folder scope installation").load()
         let a = SharedLibraryCoordinator(root: left, writerID: identity.writer, witnessDirectory: parent.appendingPathComponent("a-local"), afterPublishedLibraryRead: {
@@ -543,6 +543,51 @@ import HiDockKit
         guard let item = choices.items.first(where: { $0.id == entity.id }), let field = item.fields.first(where: { $0.id == "$lifecycle" }),
               let choice = field.choices.first(where: { $0.value == .flag(false) }) else { throw Failure(message: "Missing root Delete choice") }
         try expect(await choices.apply(item: item, selections: [field.id: choice.id], using: a), "Root Delete choice saves separately from child cleanup")
+        if retainedChild {
+            await owner.refresh(using: a)
+            guard let row = owner.items.first(where: { $0.id == entity.id }) else { throw Failure(message: "Missing retained-child scope") }
+            await owner.prepareDeletionScope(row, using: a)
+            try expect(await owner.applyDeletionScope(using: a), "Initial child scope saves")
+            guard let pending = owner.items.first(where: { $0.id == entity.id }) else { throw Failure(message: "Missing child preparation") }
+            try expect(await owner.perform(.prepareChildren, review: pending, using: a), "Child cleanup is prepared independently")
+            let childBefore = try await a.read(child)
+            try expect(childBefore.state.lifecycle == .deleted, "Fixture needs pending child deletion")
+            let childReceipt = parent.appendingPathComponent("a-local/Operations/" + childBefore.libraryID.uuidString + "/" + a.writerID.uuidString + "/" + child.id.uuidString + ".json")
+            let receiptBytes = try Data(contentsOf: childReceipt)
+            _ = try await b.renameFolder(from: "Empty", to: "Away")
+            _ = try await b.renameFolder(from: "Away", to: "Empty")
+            try deliver(right, to: left, writer: b.writerID)
+            try Data(contentsOf: right.appendingPathComponent("library.json")).write(to: left.appendingPathComponent("library.json"), options: .atomic)
+            await choices.refresh(using: a)
+            guard let current = choices.items.first(where: { $0.id == entity.id }), let lifecycle = current.fields.first(where: { $0.id == "$lifecycle" }),
+                  let keep = lifecycle.choices.first(where: { $0.value == .flag(true) }) else { throw Failure(message: "Missing Keep folder choice with deleted child") }
+            try expect(await choices.apply(item: current, selections: [lifecycle.id: keep.id], using: a), "Keep root remains independent of child's deletion")
+            await owner.refresh(using: a)
+            guard let row = owner.items.first(where: { $0.id == entity.id }), row.canReplan else { throw Failure(message: "Kept root needs a usable retention plan") }
+            await owner.prepareUpdatedPlan(row, using: a)
+            guard let plan = owner.updatedPlan else { throw Failure(message: "Retained deleted child cannot block same-path preview: " + (owner.message ?? "nil")) }
+            try expect(plan.source == "Empty" && plan.destination == "Empty" && plan.files.contains("Late.mp3"), "Retention preview preserves current original in place")
+            await pause.arm()
+            let action = Task { await owner.applyUpdatedPlan(using: a) }
+            for _ in 0..<500 { if await pause.entered { break }; try await Task.sleep(for: .milliseconds(20)) }
+            guard await pause.entered else { action.cancel(); await pause.release(); _ = await action.value; throw Failure(message: "Retained-child save did not reach held refresh") }
+            owner.clear()
+            let otherRoot = parent.appendingPathComponent("other-library")
+            try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
+            let other = SharedLibraryCoordinator(root: otherRoot, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("other-local"))
+            _ = try await other.enable(); await owner.refresh(using: other)
+            await pause.release()
+            try expect(await action.value, "Accepted retention survives feedback cancellation")
+            try expect(owner.items.isEmpty && owner.message == nil && owner.updatedPlan == nil && !owner.isLoading && !owner.isWorking, "Old retention feedback stays out of another library")
+            let childAfter = try await a.read(child)
+            try expect(childAfter.state == childBefore.state && (try Data(contentsOf: childReceipt)) == receiptBytes, "Root retention cannot renew child cleanup state or receipt")
+            try expect(try Data(contentsOf: left.appendingPathComponent("Empty/Late.mp3")) == audio, "Root retention preserves audio")
+            let restarted = SharedLibraryCoordinator(root: left, writerID: a.writerID, witnessDirectory: parent.appendingPathComponent("a-local"))
+            let replay = try await restarted.resumeFolderOperation(id: entity.id)
+            try expect(replay.result == .complete, "Actual model's accepted retention survives restart")
+            print("Actual retained deleted child passed: separate root Keep, same-path preview/save, untouched child cleanup/audio, restart and held-refresh library switch.")
+            return
+        }
         if peerCleanup {
             try deliver(left, to: right, writer: a.writerID)
             await owner.refresh(using: b)
@@ -1127,6 +1172,7 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--folder-retained-child-only") { try await folderDeletionScopeChecks(parent: parent, retainedChild: true); return }
         if arguments.contains("--folder-peer-cleanup-only") { try await folderDeletionScopeChecks(parent: parent, peerCleanup: true); return }
         if arguments.contains("--folder-scopes-only") || arguments.contains("--folder-scopes-ui") { try await folderDeletionScopeChecks(parent: parent); return }
         if arguments.contains("--folder-lifecycle-only") || arguments.contains("--folder-lifecycle-keep-only") || arguments.contains("--folder-lifecycle-delete-only") { try await folderLifecycleChecks(parent: parent); return }
@@ -1146,6 +1192,7 @@ import HiDockKit
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
         try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-scopes"))
         try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-peer-cleanup"), peerCleanup: true)
+        try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-retained-child"), retainedChild: true)
         try await folderLifecycleChecks(parent: parent.appendingPathComponent("folder-lifecycle"))
         try await folderPathChecks(parent: parent.appendingPathComponent("folder-paths"))
         try await recordingPathChecks(parent: parent.appendingPathComponent("recording-paths"))

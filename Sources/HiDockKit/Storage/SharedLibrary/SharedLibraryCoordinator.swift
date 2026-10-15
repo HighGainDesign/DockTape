@@ -1342,7 +1342,17 @@ public actor SharedLibraryCoordinator {
       // unknown/ordinary original files still require their original hashes.
       for member in scope.members where member.kind == .recording {
         let stem = String((member.path as NSString).deletingPathExtension.dropFirst(destination.count + 1))
-        for suffix in suffixes { requiredOriginal.removeValue(forKey: stem + suffix) }
+        for suffix in suffixes {
+          let retained = requiredOriginal.removeValue(forKey: stem + suffix)
+          if source == destination,
+             views.first(where: { $0.state.id == member.id })?.state.lifecycle == .deleted,
+             let hash = retained?.fingerprint {
+            // An inventory-only retention leaves pending deleted originals in
+            // place. After completion they may remain byte-identical or be
+            // removed by their own cleanup; neither permits changed bytes.
+            alternatives[stem + suffix, default: []].insert(hash)
+          }
+        }
       }
       for member in scope.members where member.kind == .folder {
         if views.first(where: { $0.state.id == member.id })?.state.lifecycle == .deleted {
@@ -1501,7 +1511,8 @@ public actor SharedLibraryCoordinator {
       return .init(id: view.state.id, kind: view.state.kind, path: path)
     }.sorted { $0.id.uuidString < $1.id.uuidString }
     for member in members {
-      guard let view = views.first(where: { $0.state.id == member.id }), view.state.lifecycle == .alive,
+      guard let view = views.first(where: { $0.state.id == member.id }),
+            view.state.lifecycle == .alive || view.state.lifecycle == .deleted,
             view.state.conflicts.isEmpty, index.owners(of: member.path) == [member.id] else { throw SharedSidecarError.conflictedContent }
     }
     let manifest = try await bind(force: true), membership = try await memberRepository().load().membership
@@ -1537,6 +1548,14 @@ public actor SharedLibraryCoordinator {
       }
     }
     guard sources.count == 1, let source = sources.first else { throw SharedLibraryOperationError.pathConflict(sources.first ?? destination) }
+    // Retaining an existing directory in place updates only its receipt. A
+    // deleted child's independent cleanup may remain pending inside it. Moving
+    // that directory still requires every child alive, because its saved cleanup
+    // paths cannot be silently relocated by this folder operation.
+    let retainingInPlace = review.purpose == .retain && source == destination
+    guard retainingInPlace || members.allSatisfy({ member in
+      views.first(where: { $0.state.id == member.id })?.state.lifecycle == .alive
+    }) else { throw SharedSidecarError.conflictedContent }
     let inventory = try await SharedDirectoryInventory.prepare(at: root.appendingPathComponent(source))
     var accepted: [String: String] = [:], sourceProofs: [URL: String] = [:]
     for member in members where member.kind == .recording {
@@ -1568,7 +1587,6 @@ public actor SharedLibraryCoordinator {
     // Keeping the same directory changes no physical files. Its entire current
     // inventory is still shown and bound through commit and the no-op phase.
     // Relocation continues to require an accepted original move inventory.
-    let retainingInPlace = review.purpose == .retain && source == destination
     guard retainingInPlace || baselines.contains(where: { baseline in
       let original = Dictionary(uniqueKeysWithValues: baseline.entries.map { ($0.path, $0) })
       let actual = Dictionary(uniqueKeysWithValues: inventory.entries.map { ($0.path, $0) })
@@ -3176,6 +3194,10 @@ public actor SharedLibraryCoordinator {
     }
     var excludedFolderPaths: Set<String> = []
     result.resolvedFolderPath = entity.kind == .folder ? index.resolvedPaths[entity.id] : nil
+    let retainingInPlace = !validFolderMoves.isEmpty && validFolderMoves.allSatisfy { intent in
+      guard case .moveDirectory(let source, let destination, _) = intent.steps[0] else { return false }
+      return source == destination && destination == result.resolvedFolderPath
+    }
     if entity.kind == .folder, selected.state.value(for: "physicalPath") != result.resolvedFolderPath.map(SharedFieldValue.text) || !validFolderMoves.isEmpty {
       result.directoryScopeMatches = false
       if case .document(let document)? = selected.state.value(for: "moveScope"),
@@ -3186,7 +3208,8 @@ public actor SharedLibraryCoordinator {
          Set(scope.members.map(\.id)) == affected.subtracting([entity.id]),
          scope.members.allSatisfy({ member in
            member.path.hasPrefix(scope.destination + "/") && snapshots.contains {
-             $0.state.id == member.id && $0.state.kind == member.kind && $0.state.lifecycle == .alive &&
+             $0.state.id == member.id && $0.state.kind == member.kind &&
+             ($0.state.lifecycle == .alive || (retainingInPlace && $0.state.lifecycle == .deleted)) &&
              $0.state.conflicts.isEmpty && index.resolvedPaths[member.id] == member.path
            }
          }) {

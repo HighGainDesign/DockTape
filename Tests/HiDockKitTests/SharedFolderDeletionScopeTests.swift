@@ -14,7 +14,7 @@ final class SharedFolderDeletionScopeTests: XCTestCase {
         let child: SharedEntityIdentity
         let audio: Data
     }
-    private func fixture(caseRoot: URL? = nil, legacy: Bool = false, legacyHasHash: Bool = true) async throws -> Fixture {
+    private func fixture(caseRoot: URL? = nil, legacy: Bool = false, legacyHasHash: Bool = true, transcript: Bool = false) async throws -> Fixture {
         let parent = (caseRoot ?? FileManager.default.temporaryDirectory).appendingPathComponent(UUID().uuidString); roots.append(parent)
         let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right")
         try FileManager.default.createDirectory(at: left.appendingPathComponent("Empty"), withIntermediateDirectories: true)
@@ -46,13 +46,175 @@ final class SharedFolderDeletionScopeTests: XCTestCase {
         }
         _ = try await b.relocateRecording(filename: "Late.mp3", toFolder: "Empty", changeFolder: true)
         let child = SharedEntityIdentity(id: try await b.reference(to: "Empty/Late.mp3").entityID, kind: .recording)
+        if transcript {
+            try await TranscriptStore(baseDirectory: right, shared: SharedSidecarAdapter(coordinator: b)).save(
+                Transcript(recordingFilename: "Empty/Late.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+                    segments: [.init(startTime: 0, endTime: 1, text: "Preserve this pending deleted conversation")]), mp3Filename: "Empty/Late.mp3")
+            _ = try await b.projectOutputs()
+        }
         try deliver(right, to: left, writer: b.writerID)
         if legacy { try FileManager.default.removeItem(at: left.appendingPathComponent("Late.mp3")) }
         try FileManager.default.copyItem(at: right.appendingPathComponent("Empty/Late.mp3"), to: left.appendingPathComponent("Empty/Late.mp3"))
+        if transcript {
+            for suffix in [".transcript.json", ".transcript.md", ".txt"] {
+                let source = right.appendingPathComponent("Empty/Late" + suffix)
+                if FileManager.default.fileExists(atPath: source.path) { try FileManager.default.copyItem(at: source, to: left.appendingPathComponent("Empty/Late" + suffix)) }
+            }
+        }
         try Data(contentsOf: right.appendingPathComponent("library.json")).write(to: left.appendingPathComponent("library.json"), options: .atomic)
         let choices = try await a.folderLifecycleChoices(a.read(folder))
         _ = try await a.resolveFolderLifecycle(XCTUnwrap(choices.first { !$0.keep }))
         return .init(root: left, peerRoot: right, a: a, b: b, folder: folder, child: child, audio: audio)
+    }
+    private func retainedChildPlan() async throws -> (Fixture, SharedFolderReplanReview) {
+        let f = try await fixture(transcript: true)
+        let scope = try await prepared(f)
+        _ = try await f.a.applyFolderDeletionScope(scope)
+        let pending = try await f.a.reviewFolderOperation(id: f.folder.id)
+        _ = try await f.a.prepareReviewedFolderChildren(XCTUnwrap(pending))
+        let childBefore = try await f.a.read(f.child)
+        XCTAssertEqual(childBefore.state.lifecycle, .deleted)
+        let witness = f.root.deletingLastPathComponent().appendingPathComponent("a-local")
+        let receipts = witness.appendingPathComponent("Operations/" + childBefore.libraryID.uuidString + "/" + f.a.writerID.uuidString)
+        let childReceipt = receipts.appendingPathComponent(f.child.id.uuidString + ".json")
+        let folderReceipt = receipts.appendingPathComponent(f.folder.id.uuidString + ".json")
+        let childBytes = try Data(contentsOf: childReceipt), oldFolderBytes = try Data(contentsOf: folderReceipt)
+        let transcriptFile = f.root.appendingPathComponent("Empty/Late.transcript.json"), transcriptBytes = try Data(contentsOf: transcriptFile)
+        let originalDocument = try XCTUnwrap(childBefore.state.currentDocument(for: .transcript))
+        XCTAssertEqual(try originalDocument.decode(Transcript.self).segments.first?.text, "Preserve this pending deleted conversation")
+        let note = f.root.appendingPathComponent("Empty/.notes"), noteBytes = Data("Retain ordinary folder notes".utf8)
+        try noteBytes.write(to: note)
+        // B has not received A's root resolution or child deletion. Ordinary
+        // offline renames produce the next genuine root lifecycle conflict.
+        let outward = try await f.b.renameFolder(from: "Empty", to: "Away")
+        let inward = try await f.b.renameFolder(from: "Away", to: "Empty")
+        XCTAssertEqual(outward.result, .complete); XCTAssertEqual(inward.result, .complete)
+        try deliver(f.peerRoot, to: f.root, writer: f.b.writerID)
+        try Data(contentsOf: f.peerRoot.appendingPathComponent("library.json")).write(to: f.root.appendingPathComponent("library.json"), options: .atomic)
+        let conflicted = try await f.a.read(f.folder); XCTAssertEqual(conflicted.state.lifecycle, .conflicted)
+        let choices = try await f.a.folderLifecycleChoices(conflicted)
+        let kept = try await f.a.resolveFolderLifecycle(XCTUnwrap(choices.first { $0.keep }))
+        XCTAssertEqual(kept.state.lifecycle, .alive)
+        XCTAssertEqual(kept.state.fields["deletionRequest"]?.resolvedValue, .unset)
+        let childAfterKeep = try await f.a.read(f.child)
+        XCTAssertEqual(childAfterKeep.state, childBefore.state)
+        XCTAssertEqual(try Data(contentsOf: childReceipt), childBytes)
+        XCTAssertEqual(try Data(contentsOf: folderReceipt), oldFolderBytes)
+        XCTAssertEqual(try Data(contentsOf: transcriptFile), transcriptBytes)
+        print("Retained child phase: prepare same-path folder retention")
+        let current = try await f.a.reviewFolderOperation(id: f.folder.id), row = try XCTUnwrap(current)
+        XCTAssertTrue(row.canReplan); XCTAssertFalse(row.canResume)
+        let plan = try await f.a.prepareFolderReplan(row)
+        XCTAssertEqual(plan.source, "Empty"); XCTAssertEqual(plan.destination, "Empty")
+        return (f, plan)
+    }
+    func testKeepFolderRetainsPendingDeletedChildWithoutChangingItsCleanup() async throws {
+        let (f, plan) = try await retainedChildPlan(), childBefore = try await f.a.read(f.child)
+        let witness = f.root.deletingLastPathComponent().appendingPathComponent("a-local")
+        let receipts = witness.appendingPathComponent("Operations/" + childBefore.libraryID.uuidString + "/" + f.a.writerID.uuidString)
+        let childReceipt = receipts.appendingPathComponent(f.child.id.uuidString + ".json")
+        let folderReceipt = receipts.appendingPathComponent(f.folder.id.uuidString + ".json")
+        let childBytes = try Data(contentsOf: childReceipt)
+        let oldFolder = try SharedOperationReceipt.decode(Data(contentsOf: folderReceipt))
+        let transcriptFile = f.root.appendingPathComponent("Empty/Late.transcript.json"), transcriptBytes = try Data(contentsOf: transcriptFile)
+        let applied = try await f.a.applyFolderReplan(plan, afterMutation: { _ in XCTFail("In-place retention must perform no physical mutation") })
+        XCTAssertEqual(applied.result, .complete); XCTAssertNil(applied.projectionError)
+        let savedReceipt = try SharedOperationReceipt.decode(Data(contentsOf: folderReceipt))
+        XCTAssertEqual(savedReceipt.completed, 1)
+        XCTAssertEqual(savedReceipt.operation.inputRevision, oldFolder.operation.outputRevision)
+        guard case .moveDirectory(let source, let destination, _) = savedReceipt.operation.steps.first else { return XCTFail("Missing inventory-only phase") }
+        XCTAssertEqual(source, "Empty"); XCTAssertEqual(destination, "Empty")
+        let restarted = SharedLibraryCoordinator(root: f.root, writerID: f.a.writerID, witnessDirectory: witness)
+        let resumed = try await restarted.resumeFolderOperation(id: f.folder.id)
+        XCTAssertEqual(resumed.result, .complete)
+        let repeated = try await restarted.resumeFolderOperation(id: f.folder.id)
+        XCTAssertEqual(repeated.result, .complete)
+        let childAfter = try await restarted.read(f.child)
+        XCTAssertEqual(childAfter.state, childBefore.state, "Folder retention must not restore, approve or renew a child's cleanup")
+        XCTAssertEqual(try Data(contentsOf: childReceipt), childBytes)
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent("Empty/Late.mp3")), f.audio)
+        XCTAssertEqual(try Data(contentsOf: transcriptFile), transcriptBytes)
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent("Empty/.notes")), Data("Retain ordinary folder notes".utf8))
+    }
+    func testRetainedFolderStillRefusesRelocatingPendingDeletedChild() async throws {
+        let (f, plan) = try await retainedChildPlan()
+        _ = try await f.a.applyFolderReplan(plan)
+        let before = try await f.a.read(f.child)
+        let rename = try await f.a.renameFolder(from: "Empty", to: "Other")
+        XCTAssertEqual(rename.result, .needsReplanning)
+        let pending = try await f.a.reviewFolderOperation(id: f.folder.id)
+        do { _ = try await f.a.prepareFolderReplan(XCTUnwrap(pending)); XCTFail("A real move needs independent child cleanup path reconciliation") }
+        catch SharedSidecarError.conflictedContent { }
+        let after = try await f.a.read(f.child); XCTAssertEqual(after.state, before.state)
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent("Empty/Late.mp3")), f.audio)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.root.appendingPathComponent("Other").path))
+    }
+    func testRetainedFolderRejectsChangedDeletedAudioAfterCompletion() async throws {
+        let (f, plan) = try await retainedChildPlan()
+        _ = try await f.a.applyFolderReplan(plan)
+        let before = try await f.a.read(f.child), audio = f.root.appendingPathComponent("Empty/Late.mp3")
+        let changed = Data("Unexpected replacement recording".utf8); try changed.write(to: audio)
+        let restarted = SharedLibraryCoordinator(root: f.root, writerID: f.a.writerID, witnessDirectory: f.root.deletingLastPathComponent().appendingPathComponent("a-local"))
+        let resumed = try await restarted.resumeFolderOperation(id: f.folder.id)
+        XCTAssertEqual(resumed.result, .needsReplanning)
+        let after = try await restarted.read(f.child); XCTAssertEqual(after.state, before.state)
+        XCTAssertEqual(try Data(contentsOf: audio), changed)
+    }
+    func testRetainedFolderRejectsChildRestoredDuringCommit() async throws {
+        let (f, plan) = try await retainedChildPlan(), before = try await f.a.read(f.folder)
+        do {
+            _ = try await f.a.applyFolderReplan(plan, beforeCommit: {
+                _ = try await f.a.resolve(.init(base: try await f.a.read(f.child), changes: [.restore]))
+            }); XCTFail("Child lifecycle shown for retention changed")
+        } catch SharedLibraryRepositoryError.staleRevision { }
+        let after = try await f.a.read(f.folder); XCTAssertEqual(after.state, before.state)
+        let child = try await f.a.read(f.child); XCTAssertEqual(child.state.lifecycle, .alive)
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent("Empty/Late.mp3")), f.audio)
+    }
+    func testRetainedFolderRejectsInventoryChangedDuringCommit() async throws {
+        let (f, plan) = try await retainedChildPlan(), before = try await f.a.read(f.folder)
+        let note = f.root.appendingPathComponent("Empty/late-note"), bytes = Data("Unreviewed new note".utf8)
+        do {
+            _ = try await f.a.applyFolderReplan(plan, beforeCommit: { try bytes.write(to: note) })
+            XCTFail("Current inventory must stay exact")
+        } catch SharedLibraryOperationError.contentChanged(let path) { XCTAssertEqual(path, "Empty") }
+        let after = try await f.a.read(f.folder); XCTAssertEqual(after.state, before.state)
+        let child = try await f.a.read(f.child); XCTAssertEqual(child.state.lifecycle, .deleted)
+        XCTAssertEqual(try Data(contentsOf: note), bytes)
+    }
+    func testRetainedChildCanBeKeptIndependentlyThenRenamedWithFolder() async throws {
+        let (f, plan) = try await retainedChildPlan()
+        _ = try await f.a.applyFolderReplan(plan)
+        _ = try await f.a.resolve(.init(base: try await f.a.read(f.child), changes: [.restore]))
+        _ = try await f.a.projectOutputs()
+        let oldCleanup = try await f.a.resumeRecordingOperation(id: f.child.id)
+        XCTAssertEqual(oldCleanup.result, .needsReplanning)
+        let renamed = try await f.a.relocateRecording(filename: "Empty/Late.mp3", title: "Retained")
+        XCTAssertEqual(renamed.result, .complete)
+        let folderMove = try await f.a.renameFolder(from: "Empty", to: "After")
+        XCTAssertEqual(folderMove.result, .complete); XCTAssertEqual(folderMove.id, f.folder.id)
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent("After/Retained.mp3")), f.audio)
+        let identity = try await f.a.reference(to: "After/Retained.mp3"); XCTAssertEqual(identity.entityID, f.child.id)
+        let transcript = try await TranscriptStore(baseDirectory: f.root).loadTranscript(for: "After/Retained.mp3")
+        XCTAssertEqual(transcript?.segments.first?.text, "Preserve this pending deleted conversation")
+    }
+    func testRetainedChildDeletionNeedsPeerApprovalAndDoesNotDeleteFolder() async throws {
+        let (f, plan) = try await retainedChildPlan()
+        _ = try await f.a.applyFolderReplan(plan)
+        let held = try await f.a.resumeRecordingOperation(id: f.child.id)
+        XCTAssertEqual(held.result, .waitingForAcknowledgments)
+        try deliver(f.root, to: f.peerRoot, writer: f.a.writerID)
+        try Data(contentsOf: f.root.appendingPathComponent("library.json")).write(to: f.peerRoot.appendingPathComponent("library.json"), options: .atomic)
+        let review = try await f.b.reviewRecordingOperation(id: f.child.id), approval = try XCTUnwrap(review)
+        XCTAssertTrue(approval.canAcknowledge)
+        try await f.b.acknowledgeReviewedRecordingOperation(approval)
+        try deliver(f.peerRoot, to: f.root, writer: f.b.writerID)
+        let removed = try await f.a.resumeRecordingOperation(id: f.child.id)
+        XCTAssertEqual(removed.result, .complete)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.root.appendingPathComponent("Empty/Late.mp3").path))
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent("Empty/.notes")), Data("Retain ordinary folder notes".utf8))
+        let replay = try await f.a.resumeFolderOperation(id: f.folder.id)
+        XCTAssertEqual(replay.result, .complete, "A child's approved removal remains compatible with the completed inventory-only retention")
     }
     func testLateChildRequiresUpdatedDeletionScopeBeforeApproval() async throws {
         let f = try await fixture()
