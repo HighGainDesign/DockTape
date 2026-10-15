@@ -54,6 +54,51 @@ final class SharedLibraryOperationTests: XCTestCase {
     }
     func cleanup() { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
   }
+  func testApprovalSurvivesCausalCompactionButRefusesSemanticOrLifecycleChanges() async throws {
+    for change in ["compaction", "edit", "lifecycle"] {
+      let f = try Fixture(deleted: true)
+      defer { f.cleanup() }
+      var permission = await f.authority.current()
+      permission.acknowledgments = [try permission.acknowledgment(by: f.writer, purpose: .delete)]
+      XCTAssertTrue(permission.mayDestroy(.delete))
+      let original = permission.state
+      permission.state = try original.compacting(SharedGenerationCompaction.proposed(for: original))
+      XCTAssertNotEqual(try SharedStateFingerprint.of(original), try SharedStateFingerprint.of(permission.state))
+      XCTAssertEqual(try SharedLibraryOperation.revision(for: original), try SharedLibraryOperation.revision(for: permission.state))
+      if change == "edit" {
+        try permission.state.restore(writer: f.writer)
+        try permission.state.assign(field: "title", value: .text("new choice"), writer: f.writer)
+        try permission.state.delete(writer: f.writer)
+      }
+      if change == "lifecycle" { try permission.state.restore(writer: f.writer); try permission.state.delete(writer: f.writer) }
+      XCTAssertEqual(permission.mayDestroy(.delete), change == "compaction", "Representation-only compaction preserves approval; a new semantic choice requires fresh consent")
+    }
+  }
+
+  func testCanonicalApprovalRejectsEditRevertAndSameBytesReplacementAndKeepsLegacyRawCompatibility() async throws {
+    for change in ["compaction", "edit", "revert", "generation"] {
+      let f = try Fixture()
+      defer { f.cleanup() }
+      var permission = await f.authority.current()
+      let document = try SharedDocument(id: UUID(), json: Data("{\"same\":true}".utf8))
+      try permission.state.assignGeneration(document, component: .transcript, writer: f.writer)
+      permission.acknowledgments = [try permission.acknowledgment(by: f.writer, purpose: .replaceAudio)]
+      let raw = SharedOperationAcknowledgment(writer: f.writer, entity: f.entity.id,
+        revision: try SharedStateFingerprint.of(permission.state), cohort: permission.membership.fingerprint, purpose: .replaceAudio)
+      var legacy = permission; legacy.acknowledgments = [raw]
+      XCTAssertTrue(legacy.mayDestroy(.replaceAudio), "Legacy raw approval is valid only for its unchanged raw state")
+      permission.state = try permission.state.compacting(SharedGenerationCompaction.proposed(for: permission.state))
+      legacy.state = permission.state
+      XCTAssertFalse(legacy.mayDestroy(.replaceAudio), "Do not infer a normalized historical approval from an old raw hash")
+      if change == "edit" || change == "revert" {
+        try permission.state.assign(field: "title", value: .text("changed"), writer: f.writer)
+        if change == "revert" { try permission.state.assign(field: "title", value: .text("new"), writer: f.writer) }
+      }
+      if change == "generation" { try permission.state.assignGeneration(SharedDocument(id: UUID(), json: document.json), component: .transcript, writer: f.writer) }
+      XCTAssertEqual(permission.mayDestroy(.replaceAudio), change == "compaction")
+    }
+  }
+
   func testPeerDeletionAdoptionPreservesPhysicalEvidenceAndSourceHashes() async throws {
     for scenario in ["ready", "attempted", "completed", "changed", "missing", "omitted"] {
       let f = try Fixture(deleted: true)

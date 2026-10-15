@@ -651,28 +651,65 @@ final class AppState {
         }
     }
 
+    private func folderID(named name: String, using coordinator: SharedLibraryCoordinator?) async throws -> UUID? {
+        guard let coordinator else { return nil }
+        let matches = try await coordinator.snapshots(kinds: [.folder]).filter {
+            $0.state.value(for: "name") == .text(name) || $0.state.value(for: "physicalPath") == .text(name)
+        }
+        return matches.count == 1 ? matches[0].state.id : nil
+    }
+    private func showPendingFolder(id: UUID?, purpose: SharedFolderOperationReview.Purpose, requestedName: String? = nil,
+                                   library captured: LibraryState, coordinator: SharedLibraryCoordinator?) async -> Bool {
+        guard let id, let coordinator, library === captured, sharedLibrary.coordinator === coordinator,
+              let review = try? await coordinator.reviewFolderOperation(id: id), review.purpose == purpose,
+              requestedName == nil || review.name == requestedName,
+              purpose != .delete || review.isDeletionRequest else { return false }
+        await refreshAll()
+        guard library === captured, sharedLibrary.coordinator === coordinator else { return true }
+        errorMessage = nil
+        statusMessage = purpose == .delete ? "Folder deletion is saved and pending. Open Shared Library Review → Pending Folders to continue."
+            : "Folder change is saved and pending. Open Shared Library Review → Pending Folders to continue."
+        sharedLibrary.reviewTab = .pendingFolders; sharedLibrary.showsReview = true
+        return true
+    }
     func deleteFolder(named name: String) async {
         guard requireWritableLibrary() else { return }
+        let captured = library, coordinator = sharedLibrary.coordinator
         if let playing = playback.playingFile, playing.hasPrefix(name + "/") { playback.stop() }
-        let affected = library.recordings.filter { $0.filename.hasPrefix(name + "/") }
+        let affected = captured.recordings.filter { $0.filename.hasPrefix(name + "/") }
+        var id: UUID?
         do {
-            try await library.deleteFolder(named: name)
+            id = try await folderID(named: name, using: coordinator)
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            try await captured.deleteFolder(named: name)
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             if selectedView == .folder(name) { selectedView = .allRecordings }
             for recording in affected { summarization.hasSummary.remove(recording.filename) }
-        } catch { errorMessage = "Folder delete failed: \(error.localizedDescription)" }
+        } catch {
+            if await showPendingFolder(id: id, purpose: .delete, library: captured, coordinator: coordinator) { return }
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            errorMessage = "Folder delete failed: \(error.localizedDescription)"
+        }
     }
-
     func renameFolder(from oldName: String, to newName: String) async {
-        let affected = library.recordings.filter { $0.filename.hasPrefix(oldName + "/") }
+        guard requireWritableLibrary() else { return }
+        let captured = library, coordinator = sharedLibrary.coordinator
+        let affected = captured.recordings.filter { $0.filename.hasPrefix(oldName + "/") }
+        var id: UUID?
         do {
-            let actualName = try await library.renameFolder(from: oldName, to: newName)
+            id = try await folderID(named: oldName, using: coordinator)
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            let actualName = try await captured.renameFolder(from: oldName, to: newName)
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             if selectedView == .folder(oldName) { selectedView = .folder(actualName) }
             for rec in affected {
                 let newFilename = actualName + rec.filename.dropFirst(oldName.count)
                 try await didRelocateRecording(from: rec.filename, to: newFilename,
-                                                originalSelection: library.selectedRecordings)
+                                                originalSelection: captured.selectedRecordings)
             }
         } catch {
+            if await showPendingFolder(id: id, purpose: .rename, requestedName: RecordingStore.sanitizeFilename(newName), library: captured, coordinator: coordinator) { return }
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             errorMessage = "Folder rename failed: \(error.localizedDescription)"
         }
     }

@@ -765,7 +765,7 @@ public actor RecordingStore {
     }
 
     /// Sanitize a filename by replacing illegal characters.
-    static func sanitizeFilename(_ name: String) -> String {
+    public static func sanitizeFilename(_ name: String) -> String {
         // Replace characters illegal in macOS/Windows filenames
         let illegal = CharacterSet(charactersIn: "/\\:*?\"<>|\0")
         let sanitized = name.unicodeScalars

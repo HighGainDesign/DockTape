@@ -106,15 +106,19 @@ public struct SharedMaterializationAuthority: Sendable {
     guard membership.libraryID == libraryID, state.conflicts.isEmpty, !hasPendingWork,
       !(state.kind == .folder && hasLiveDescendants),
       membership.pendingWriters.isEmpty, !membership.hasConcurrentEnrollment,
-      purpose == .delete ? state.lifecycle == .deleted : state.lifecycle == .alive,
-      let revision = try? SharedStateFingerprint.of(state)
+      purpose == .delete ? state.lifecycle == .deleted : state.lifecycle == .alive
     else { return false }
-    let approved = Set(
-      acknowledgments.filter {
-        $0.purpose == purpose && $0.entity == state.id && $0.revision == revision
-          && $0.cohort == membership.fingerprint
-      }.map(\.writer))
-    return membership.cohort.isSubset(of: approved)
+    return membership.cohort.isSubset(of: approvedWriters(for: purpose))
+  }
+  /// Compaction changes representation, not the reviewed causal choice. New
+  /// approvals use the same canonical revision as replay. Legacy raw revisions
+  /// are accepted only while they still exactly match the current state.
+  func approvedWriters(for purpose: SharedDestructivePurpose) -> Set<UUID> {
+    Set(acknowledgments.filter {
+      $0.purpose == purpose && $0.entity == state.id && $0.cohort == membership.fingerprint
+        && membership.cohort.contains($0.writer)
+        && (try? SharedLibraryOperation.matchesRevision($0.revision, state: state)) == true
+    }.map(\.writer))
   }
   public func acknowledgment(by writer: UUID, purpose: SharedDestructivePurpose) throws
     -> SharedOperationAcknowledgment
@@ -125,7 +129,7 @@ public struct SharedMaterializationAuthority: Sendable {
       purpose == .delete ? state.lifecycle == .deleted : state.lifecycle == .alive
     else { throw SharedLibraryOperationError.invalidOperation }
     return .init(
-      writer: writer, entity: state.id, revision: try SharedStateFingerprint.of(state),
+      writer: writer, entity: state.id, revision: try SharedLibraryOperation.revision(for: state),
       cohort: membership.fingerprint, purpose: purpose)
   }
 }
@@ -201,7 +205,7 @@ public struct SharedLibraryOperation: Codable, Equatable, Sendable {
   public let libraryID: UUID
   public let entity: SharedEntityIdentity
   public let inputRevision: String
-  public let outputRevision: String
+  public internal(set) var outputRevision: String
   public let steps: [Step]
   public let inputAudioFingerprint: String?
   public var reviewedExistingDestinations: [String]? = nil
@@ -298,7 +302,7 @@ public struct SharedLibraryOperation: Codable, Equatable, Sendable {
 
 struct SharedOperationReceipt: Codable, Sendable {
   let schema: Int
-  let operation: SharedLibraryOperation
+  var operation: SharedLibraryOperation
   var completed: Int
   var attempting: Bool
   var reviewedCleanups: [String: String] = [:]

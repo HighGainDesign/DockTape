@@ -28,6 +28,245 @@ final class SharedFolderStoreTests: XCTestCase {
         try await store.setup()
         return (root, coordinator, store)
     }
+    func testReviewedFolderDeletionCompletesOnlyAfterPeerApprovalAndProviderRemoval() async throws {
+        let (left, a, _) = try await fixture()
+        try await a.createSharedFolder(named: "Empty"); _ = try await a.projectOutputs()
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent); try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let right = parent.appendingPathComponent("library")
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"), trash: { try FileManager.default.removeItem(at: $0) })
+        try await b.requestEnrollment(requestID: UUID(), label: "Folder peer")
+        for _ in 0..<3 {
+            try deliver(right, to: left, writer: b.writerID); try await a.refresh()
+            try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+        }
+        let pending = try await a.deleteFolder(named: "Empty")
+        XCTAssertEqual(pending.result, .waitingForAcknowledgments)
+        let first = try await a.reviewFolderOperation(id: pending.id)
+        let owner = try XCTUnwrap(first)
+        XCTAssertEqual(owner.waitingForMacs, ["Folder peer"])
+        try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+        let observed = try await b.reviewFolderOperation(id: pending.id)
+        let peer = try XCTUnwrap(observed)
+        XCTAssertTrue(peer.canAcknowledge)
+        let entity = SharedEntityIdentity(id: pending.id, kind: .folder)
+        let before = try await b.read(entity)
+        try await b.acknowledgeReviewedFolderOperation(peer)
+        let after = try await b.read(entity)
+        XCTAssertEqual(before.state, after.state, "Folder approval changes no semantic user data")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: right.appendingPathComponent("Empty").path))
+        try deliver(right, to: left, writer: b.writerID)
+        let currentOwner = try await a.reviewFolderOperation(id: pending.id)
+        let current = try XCTUnwrap(currentOwner)
+        XCTAssertTrue(current.canResume)
+        let done = try await a.resumeReviewedFolderOperation(current)
+        XCTAssertEqual(done.result, .complete)
+        let ownerDone = try await a.reviewFolderOperation(id: pending.id)
+        XCTAssertNil(ownerDone)
+        try deliver(left, to: right, writer: a.writerID)
+        try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+        let peerPending = try await b.reviewFolderOperation(id: pending.id)
+        XCTAssertNotNil(peerPending, "Metadata-only arrival cannot hide a retained folder")
+        try FileManager.default.removeItem(at: right.appendingPathComponent("Empty"))
+        let peerDone = try await b.reviewFolderOperation(id: pending.id)
+        XCTAssertNil(peerDone, "Exact acknowledged provider removal clears the pending folder")
+    }
+
+    func testFolderReviewDoesNotHideCompletedMetadataWithBothPathsOrChangedDestination() async throws {
+        for changed in [false, true] {
+            let (root, a, _) = try await fixture()
+            let outcome = try await a.renameFolder(from: "Folder", to: "Renamed")
+            XCTAssertEqual(outcome.result, .complete)
+            if changed {
+                try Data("externally changed audio".utf8).write(to: root.appendingPathComponent("Renamed/A.mp3"))
+            } else {
+                try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+                try Data("late original".utf8).write(to: root.appendingPathComponent("Folder/Late.mp3"))
+            }
+            let row = try await a.reviewFolderOperation(id: outcome.id)
+            XCTAssertNotNil(row, "Completed metadata cannot hide remaining source or changed destination files")
+            if let row { XCTAssertFalse(row.canResume, "Conflicting paths need explicit review before moving anything") }
+        }
+    }
+
+    func testCompletedFolderMoveDoesNotReturnAfterAcceptedChildChanges() async throws {
+        for change in ["moveIn", "moveOut", "delete"] {
+            let (_, a, _) = try await fixture()
+            let outcome = try await a.renameFolder(from: "Folder", to: "Renamed")
+            XCTAssertEqual(outcome.result, .complete)
+            switch change {
+            case "moveIn":
+                let moved = try await a.relocateRecording(filename: "Renamed/Nested/B.mp3", toFolder: "Renamed", changeFolder: true)
+                XCTAssertEqual(moved.result, .complete)
+            case "moveOut":
+                let moved = try await a.relocateRecording(filename: "Renamed/A.mp3", changeFolder: true)
+                XCTAssertEqual(moved.result, .complete)
+            default:
+                let deleted = try await a.deleteSharedRecording(filename: "Renamed/A.mp3")
+                XCTAssertEqual(deleted.result, .complete)
+            }
+            let row = try await a.reviewFolderOperation(id: outcome.id)
+            XCTAssertTrue(row == nil, "Accepted child \(change) cannot revive a completed directory move")
+        }
+    }
+
+    func testFolderReviewOffersRecoveryWhenCompletedMetadataArrivesBeforeDirectoryMove() async throws {
+        let (left, a, _) = try await fixture()
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent); try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let right = parent.appendingPathComponent("library")
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Folder peer")
+        for _ in 0..<3 {
+            try deliver(right, to: left, writer: b.writerID); try await a.refresh()
+            try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+        }
+        let original = try Data(contentsOf: right.appendingPathComponent("Folder/A.mp3"))
+        let outcome = try await a.renameFolder(from: "Folder", to: "Renamed")
+        XCTAssertEqual(outcome.result, .complete)
+        try deliver(left, to: right, writer: a.writerID)
+        try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+        let observed = try await b.reviewFolderOperation(id: outcome.id)
+        let row = try XCTUnwrap(observed)
+        XCTAssertTrue(row.canResume, "Original accepted inventory needs a usable exact recovery after metadata-first arrival")
+        if row.canResume {
+            let resumed = try await b.resumeReviewedFolderOperation(row)
+            XCTAssertEqual(resumed.result, .complete)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: right.appendingPathComponent("Folder").path))
+            XCTAssertEqual(try Data(contentsOf: right.appendingPathComponent("Renamed/A.mp3")), original)
+            let finished = try await b.reviewFolderOperation(id: outcome.id)
+            XCTAssertNil(finished)
+        }
+    }
+
+    func testFolderPeerReceiptSurvivesFinalMetadataWithoutLosingMoveEvidence() async throws {
+        enum Stopped: Error { case afterMove }
+        for attempted in [false, true] {
+            let (left, a, _) = try await fixture()
+            let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            roots.append(parent); try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            let right = parent.appendingPathComponent("library")
+            try FileManager.default.copyItem(at: left, to: right)
+            let local = parent.appendingPathComponent("local")
+            let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: local)
+            try await b.requestEnrollment(requestID: UUID(), label: "Folder peer")
+            for _ in 0..<3 {
+                try deliver(right, to: left, writer: b.writerID); try await a.refresh()
+                try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+            }
+            let folder = try await a.snapshots(kinds: [.folder]).first { $0.state.value(for: "name") == .text("Folder") }
+            let id = try XCTUnwrap(folder?.state.id)
+            let reference = try await b.reference(to: "Folder/A.mp3")
+            let token = attempted ? nil : try await b.pinJob(.init(id: reference.entityID, kind: .recording), audioURL: right.appendingPathComponent("Folder/A.mp3"))
+            do { _ = try await a.renameFolder(from: "Folder", to: "Renamed", afterMutation: { _ in throw Stopped.afterMove }); XCTFail() }
+            catch Stopped.afterMove {}
+            try deliver(left, to: right, writer: a.writerID)
+            if attempted {
+                // Public legacy resume can reconstruct the selected peer intent.
+                do { _ = try await b.resumeFolderOperation(id: id, afterMutation: { _ in throw Stopped.afterMove }); XCTFail() }
+                catch Stopped.afterMove {}
+            } else {
+                let observed = try await b.reviewFolderOperation(id: id)
+                let row = try XCTUnwrap(observed)
+                let operation = try XCTUnwrap(row.operation)
+                let receipts = local.appendingPathComponent("Operations/" + row.base.libraryID.uuidString + "/" + b.writerID.uuidString)
+                let pending = SharedLibraryMaterializer(root: right, receipts: receipts, authority: {
+                    try await b.operationAuthority(entity: operation.entity, paths: Array(operation.canonicalPaths))
+                })
+                let waiting = try await pending.replay(operation)
+                XCTAssertEqual(waiting, .waitingForActiveWork)
+                if let token { await b.finishJob(token) }
+            }
+            let finished = try await a.resumeFolderOperation(id: id)
+            XCTAssertEqual(finished.result, .complete)
+            try deliver(left, to: right, writer: a.writerID)
+            try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+            let observed = try await b.reviewFolderOperation(id: id)
+            let row = try XCTUnwrap(observed)
+            XCTAssertTrue(row.canResume)
+            let receiptFile = local.appendingPathComponent("Operations/" + row.base.libraryID.uuidString + "/" + b.writerID.uuidString + "/" + id.uuidString + ".json")
+            var saved = try SharedOperationReceipt.decode(Data(contentsOf: receiptFile))
+            saved.reviewedCleanups["preserve unrelated receipt evidence"] = "synthetic witness"
+            try saved.encoded().write(to: receiptFile, options: .atomic)
+            let result = try await b.resumeReviewedFolderOperation(row)
+            let completed = try SharedOperationReceipt.decode(Data(contentsOf: receiptFile))
+            var expected = saved
+            expected.operation.outputRevision = completed.operation.outputRevision
+            expected.completed = completed.completed; expected.attempting = completed.attempting
+            XCTAssertEqual(try expected.encoded(), try completed.encoded(), "Recovery changes only output authority and actual replay phase, preserving all original receipt evidence")
+            XCTAssertEqual(result.result, .complete, "Final metadata may update output authority without discarding the same original plan or attempted phase")
+            XCTAssertEqual(try Data(contentsOf: right.appendingPathComponent("Renamed/A.mp3")), Data("Folder/A.mp3".utf8))
+        }
+    }
+
+    func testFolderResumeKeepsReviewedStateAndCohortThroughFinalRemoval() async throws {
+        for change in ["cohort", "state"] {
+            let (root, a, _) = try await fixture()
+            try await a.createSharedFolder(named: "Empty"); _ = try await a.projectOutputs()
+            let interrupted = SharedLibraryCoordinator(root: root, writerID: a.writerID,
+                witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"),
+                afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+            let task = Task { try await interrupted.deleteFolder(named: "Empty") }
+            do { _ = try await task.value; XCTFail("Expected exit after durable request") } catch is CancellationError {}
+            let folders = try await a.snapshots(kinds: [.folder])
+            let folder = try XCTUnwrap(folders.first { $0.state.value(for: "name") == .text("Empty") })
+            let current = try await a.reviewFolderOperation(id: folder.state.id)
+            let review = try XCTUnwrap(current)
+            XCTAssertTrue(review.canResume)
+            let late = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("late-local"))
+            do {
+                _ = try await a.resumeFolderDeletion(id: folder.state.id, reviewedFolder: review.base, expectedCohort: review.cohort, beforeFinalRemoval: {
+                    if change == "cohort" { try await late.requestEnrollment(requestID: UUID(), label: "Late Mac") }
+                    else {
+                        let entity = SharedEntityIdentity(id: folder.state.id, kind: .folder)
+                        _ = try await a.edit(.init(base: try await a.read(entity), changes: [.assign(field: "description", value: .text("Changed after review"))]))
+                    }
+                })
+                XCTFail("A late reviewed-state or cohort change must stop removal")
+            } catch {
+                XCTAssertTrue(error as? SharedLibraryOperationError == .staleAuthority || error as? SharedLibraryCoordinatorError == .staleReview, "Expected exact-review refusal, got \(error)")
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Empty").path), "Refusal preserves the original folder")
+        }
+    }
+
+    func testFolderDeletionRefusesMemberMoveAndPathReuseAfterRequestValidation() async throws {
+        let (root, a, _) = try await fixture()
+        let folder = try await a.snapshots(kinds: [.folder]).first { $0.state.value(for: "name") == .text("Folder") }
+        let folderID = try XCTUnwrap(folder?.state.id)
+        let original = try await a.recording(at: "Folder/A.mp3")
+        let replacement = SharedEntityIdentity(id: UUID(), kind: .recording)
+        let interrupted = SharedLibraryCoordinator(root: root, writerID: a.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"),
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let task = Task { try await interrupted.deleteFolder(named: "Folder") }
+        do { _ = try await task.value; XCTFail() } catch is CancellationError {}
+        let before = Data("new recording at reused path".utf8)
+        let originalBytes = try Data(contentsOf: root.appendingPathComponent("Folder/A.mp3"))
+        let once = CommitCounter()
+        do {
+            _ = try await a.resumeFolderDeletion(id: folderID, beforeMemberDeletion: {
+                if await once.next() == 1 {
+                    let moved = try await a.relocateRecording(filename: "Folder/A.mp3", title: "Moved", changeFolder: true)
+                    guard moved.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
+                    try before.write(to: root.appendingPathComponent("Folder/A.mp3"))
+                    _ = try await a.edit(.init(base: try await a.read(replacement), changes: [
+                        .assign(field: "initialPath", value: .text("Folder/A.mp3")), .assign(field: "title", value: .text("A")),
+                        .assign(field: "folder", value: .text(folderID.uuidString))]))
+                }
+            })
+            XCTFail("An accepted folder request cannot target a newly reused path")
+        } catch {
+            XCTAssertTrue(error as? SharedLibraryCoordinatorError == .staleReview || error as? SharedLibraryCoordinatorError == .differentBinding, "Expected requested-member refusal, got \(error)")
+        }
+        let kept = try await a.read(replacement)
+        XCTAssertEqual(kept.state.lifecycle, .alive, "Unrequested replacement must not be deleted")
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Folder/A.mp3")), before)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Moved.mp3")), originalBytes)
+    }
+
     private actor CommitCounter {
         var value = 0
         func next() -> Int { value += 1; return value }

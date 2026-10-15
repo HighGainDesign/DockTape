@@ -17,6 +17,9 @@ import SwiftUI
                 PendingRecordingFilesView(state: state, onClose: { [weak window] in window?.close() })
                     .tabItem { Text("Pending Files") }
                     .tag(SharedLibraryState.ReviewTab.pendingFiles)
+                PendingFolderFilesView(state: state, onClose: { [weak window] in window?.close() })
+                    .tabItem { Text("Pending Folders") }
+                    .tag(SharedLibraryState.ReviewTab.pendingFolders)
                 ExternalSidecarReviewView(state: state, onClose: { [weak window] in window?.close() })
                     .tabItem { Text("External Files") }
                     .tag(SharedLibraryState.ReviewTab.externalFiles)

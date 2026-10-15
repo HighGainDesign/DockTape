@@ -348,6 +348,53 @@ public actor SharedLibraryMaterializer {
     }
   }
 
+  /// The owner finalized metadata for the SAME accepted directory move after
+  /// this Mac saved its receipt. Refresh only output authority; keep every
+  /// original input, phase and cleanup witness. This never renews file hashes.
+  func refreshFolderMoveAuthority(_ previous: SharedLibraryOperationProgress, intentWriter: UUID) async throws {
+    let operation = previous.operation
+    guard operation.entity.kind == .folder, operation.steps.count == 1,
+          case .moveDirectory(_, let destination, _) = operation.steps[0],
+          active.insert(operation.entity.id).inserted else { throw SharedLibraryOperationError.unfinishedOperation }
+    defer { active.remove(operation.entity.id) }
+    let current = try await authority()
+    guard current.state.lifecycle == .alive, current.state.conflicts.isEmpty, current.directoryScopeMatches,
+          current.state.value(for: "physicalPath") == .text(destination), current.state.value(for: "name") == .text(destination),
+          case .document(let document)? = current.state.value(for: SharedEntityState.fileIntentField(writer: intentWriter)),
+          let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json),
+          intent.schema == 1, intent.libraryID == operation.libraryID, intent.entity == operation.entity,
+          intent.inputRevision == operation.inputRevision, intent.steps == operation.steps,
+          intent.reviewedExistingDestinations == operation.reviewedExistingDestinations,
+          try current.state.fileIntentGuardRevision(writer: intentWriter) == intent.guardRevision else { throw SharedLibraryOperationError.staleAuthority }
+    var rebound = operation
+    rebound.outputRevision = try SharedLibraryOperation.revision(for: current.state)
+    let replacement = rebound
+    let pending = try Self.check(replacement, authority: current)
+    guard pending == nil || pending == .waitingForActiveWork else { throw SharedLibraryOperationError.staleAuthority }
+    let root = self.root, receipts = self.receipts, gate = self.gate
+    let file = receipts.appendingPathComponent(operation.entity.id.uuidString + ".json")
+    let gateItems = try gate?.items(outside: root) ?? []
+    let bindings = current.additionalBindings + (current.binding.map { [$0] } ?? [])
+    for binding in bindings { _ = try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) }
+    try await access.withWrites([.init(file)] + gateItems, reading: [root] + bindings.map(\.file)) { scopes in
+      if let gate { try gate.validate(scopes[1], outside: root) }
+      try Self.checkRoot(root)
+      guard Self.contained(scopes[0].url, in: receipts),
+            scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath(),
+            !current.revisionLease.isRevoked, try current.validateLocalCommit() else { throw SharedLibraryOperationError.staleAuthority }
+      for (binding, read) in zip(bindings, scopes.dropFirst(2 + gateItems.count)) {
+        guard read.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
+              try binding.validate(Data(contentsOf: read.url)) else { throw SharedLibraryOperationError.staleAuthority }
+      }
+      var receipt = try SharedOperationReceipt.decode(Data(contentsOf: scopes[0].url))
+      guard receipt.operation == operation, receipt.completed == previous.completedSteps,
+            receipt.attempting == previous.phaseWasAttempted else { throw SharedLibraryOperationError.unfinishedOperation }
+      receipt.operation = replacement
+      try scopes[0].checkCancellation()
+      try receipt.encoded().write(to: scopes[0].url, options: .atomic)
+    }
+  }
+
   /// Recompute from accepted state plus current physical paths. Replanning
   /// changes metadata only and cannot silently drop a surviving owned file.
   public func replan(_ replacement: SharedLibraryOperation, replacing previousID: UUID) async throws

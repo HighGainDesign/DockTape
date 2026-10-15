@@ -225,6 +225,126 @@ import HiDockKit
         pendingModel.clear()
         print("Actual independent publication passed: resident transcript JSON/Markdown/TXT recovery finishes with unrelated recording/same-recording summary held and accepted A rename pending.")
     }
+    @MainActor static func pendingFolderChecks(parent: URL) async throws {
+        let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right")
+        try FileManager.default.createDirectory(at: left.appendingPathComponent("Empty"), withIntermediateDirectories: true)
+        UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+        let identity = parent.appendingPathComponent("identity.json")
+        let state = AppState(baseDirectory: left, sharedIdentity: {
+            try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "folder fixture").load()
+        }, sharedWitnessDirectory: parent.appendingPathComponent("a-local"), sharedTrash: { try FileManager.default.removeItem(at: $0) })
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable actual folder fixture")
+        guard let a = state.sharedLibrary.coordinator else { throw Failure(message: "Missing folder coordinator") }
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("b-local"), trash: { try FileManager.default.removeItem(at: $0) })
+        try await b.requestEnrollment(requestID: UUID(), label: "Folder peer")
+        for _ in 0..<3 {
+            try deliver(right, to: left, writer: b.writerID); try await a.refresh()
+            try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+        }
+        await state.refreshAll()
+        await state.deleteFolder(named: "Empty")
+        let pending = await state.library.store.sharedFolderOperation
+        let folderViews = try await a.snapshots(kinds: [.folder])
+        try expect(folderViews.contains { $0.state.value(for: "name") == .text("Empty") && $0.state.value(for: "deletionRequest") != nil }, "Actual folder deletion must have a durable request even when a refresh interrupts follow-through; outcome=\(String(describing: pending?.result)), error=\(String(describing: state.errorMessage))")
+        try expect(FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "Pending folder original remains until approval")
+        try expect(state.errorMessage == nil, "Accepted pending folder deletion must not be reported as failure")
+        try expect(state.sharedLibrary.showsReview && state.sharedLibrary.reviewTab == .pendingFolders, "Accepted pending folder action opens its review tab")
+        await state.sharedLibrary.close()
+        // Use the actual review model after shutting down the AppState watcher,
+        // so each approval below is tied to one displayed, unchanged snapshot.
+        let ownerModel = FolderFileReviewState(), peerModel = FolderFileReviewState()
+        await ownerModel.refresh(using: a)
+        guard let first = ownerModel.items.first else { throw Failure(message: "Accepted folder request needs a visible row") }
+        if first.canResume { try expect(await ownerModel.perform(.resume, review: first, using: a), "Continue accepted folder request through the native model") }
+        // Deliver the matching canonical library as well as its latest registry.
+        // Registry-only arrival is deliberately retained in the diagnostic log.
+        try deliver(left, to: right, writer: a.writerID)
+        try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+        try await b.refresh()
+        do { _ = try await b.reviewFolderOperation(id: first.id) }
+        catch { throw Failure(message: "Peer direct folder inspection failed: \(error)") }
+        await peerModel.refresh(using: b)
+        guard let peer = peerModel.items.first, peer.canAcknowledge else { throw Failure(message: "Peer needs a native folder deletion approval; owner=\(String(describing: ownerModel.message)), ownerRows=\(ownerModel.items.map { "\($0.name):\($0.purpose):ack\($0.canAcknowledge):resume\($0.canResume):replan\($0.needsReplanning)" }), peerRows=\(peerModel.items.map { "\($0.name):\($0.purpose):ack\($0.canAcknowledge):resume\($0.canResume):replan\($0.needsReplanning)" }), error=\(String(describing: peerModel.message))") }
+        try expect(await peerModel.perform(.acknowledge, review: peer, using: b), "Native peer approval succeeds")
+        try expect(FileManager.default.fileExists(atPath: right.appendingPathComponent("Empty").path), "Approval alone does not remove the peer folder")
+        try deliver(right, to: left, writer: b.writerID)
+        await ownerModel.refresh(using: a)
+        guard let current = ownerModel.items.first, current.canResume else { throw Failure(message: "Owner needs native Resume after cohort approval; rows=\(ownerModel.items.map { "\($0.name):ack\($0.canAcknowledge):resume\($0.canResume):replan\($0.needsReplanning):waiting\($0.waitingForMacs)" }), error=\(String(describing: ownerModel.message))") }
+        try expect(await ownerModel.perform(.resume, review: current, using: a), "Native owner Resume completes approved empty-folder deletion")
+        try expect(ownerModel.items.isEmpty && !FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "Owner row clears only after actual removal")
+        try deliver(left, to: right, writer: a.writerID)
+        try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+        await peerModel.refresh(using: b)
+        try expect(peerModel.items.count == 1, "Metadata-first arrival cannot hide a retained peer folder")
+        try FileManager.default.removeItem(at: right.appendingPathComponent("Empty"))
+        await peerModel.refresh(using: b)
+        try expect(peerModel.items.isEmpty, "Native peer row clears after acknowledged provider removal")
+        ownerModel.clear(); peerModel.clear()
+        print("Actual pending folder review passed: accepted feedback, peer approval, owner Resume and metadata-first provider removal.")
+    }
+
+    @MainActor static func rejectedFolderRenameChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+        let audio = Data("synthetic folder rename original".utf8)
+        try audio.write(to: root.appendingPathComponent("Folder/Clip.mp3"))
+        UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+        let identity = parent.appendingPathComponent("identity.json")
+        let state = AppState(baseDirectory: root, sharedIdentity: {
+            try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "folder rename fixture").load()
+        }, sharedWitnessDirectory: parent.appendingPathComponent("local"))
+        try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable rejected folder rename fixture")
+        guard let a = state.sharedLibrary.coordinator else { throw Failure(message: "Missing folder rename coordinator") }
+        do {
+            _ = try await a.renameFolder(from: "Folder", to: "Accepted", afterMutation: { _ in throw Failure(message: "accepted rename interrupted") })
+            throw Failure(message: "Expected accepted rename interruption")
+        } catch let failure as Failure { try expect(failure.message == "accepted rename interrupted", "Expected physical interruption") }
+        await state.renameFolder(from: "Folder", to: "Rejected")
+        try expect(state.errorMessage != nil, "Rejected new destination cannot be described as the older accepted pending rename")
+        let views = try await a.snapshots(kinds: [.folder])
+        try expect(views.contains { $0.state.value(for: "name") == .text("Accepted") }, "Rejected rename preserves the previously accepted target")
+        try expect(try Data(contentsOf: root.appendingPathComponent("Accepted/Clip.mp3")) == audio && !FileManager.default.fileExists(atPath: root.appendingPathComponent("Rejected").path), "Rejected rename preserves the original at its accepted location")
+        await state.sharedLibrary.close()
+        print("Actual rejected folder rename passed: an older pending plan cannot imply acceptance of a different destination.")
+    }
+
+    @MainActor static func folderFeedbackChecks(parent: URL) async throws {
+        let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right")
+        try FileManager.default.createDirectory(at: left.appendingPathComponent("Empty"), withIntermediateDirectories: true)
+        let writer = UUID(), local = parent.appendingPathComponent("local")
+        let seed = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local,
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } }, trash: { try FileManager.default.removeItem(at: $0) })
+        _ = try await seed.enable()
+        let initial = Task { try await seed.deleteFolder(named: "Empty") }
+        do { _ = try await initial.value; throw Failure(message: "Expected interruption after folder request") } catch is CancellationError {}
+        let model = FolderFileReviewState(), pause = SavePause()
+        let a = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local,
+            afterPublishedLibraryRead: {
+                if await MainActor.run(body: { model.isWorking && model.isLoading }) { await pause.pauseOnce() }
+            }, trash: { try FileManager.default.removeItem(at: $0) })
+        await model.refresh(using: a)
+        guard let row = model.items.first, row.canResume else { throw Failure(message: "Expected resumable interrupted folder request") }
+        let action = Task { await model.perform(.resume, review: row, using: a) }
+        for _ in 0..<250 {
+            if await pause.entered { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        guard await pause.entered else { action.cancel(); await pause.release(); _ = await action.value; throw Failure(message: "Folder feedback fixture did not reach post-action refresh") }
+        try expect(!FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "The action completed in its original library before feedback was held")
+        model.clear()
+        try FileManager.default.createDirectory(at: right.appendingPathComponent("Other"), withIntermediateDirectories: true)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("other-local"))
+        _ = try await b.enable()
+        await model.refresh(using: b)
+        await pause.release(); _ = await action.value
+        try expect(model.items.isEmpty && model.message == nil && !model.isWorking && !model.isLoading, "Old folder action feedback cannot overwrite the new library after its awaited refresh")
+        try expect(FileManager.default.fileExists(atPath: right.appendingPathComponent("Other").path), "Library switching cannot touch the new library's folder")
+        model.clear()
+        print("Actual folder feedback ownership passed: completed old action cannot publish into a new library.")
+    }
+
     @MainActor static func unpreparedDeletionChecks(parent: URL) async throws {
         let root = parent.appendingPathComponent("library")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -372,7 +492,13 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--folder-rejection-only") { try await rejectedFolderRenameChecks(parent: parent); return }
+        if arguments.contains("--folder-feedback-only") { try await folderFeedbackChecks(parent: parent); return }
+        if arguments.contains("--folders-only") { try await pendingFolderChecks(parent: parent); return }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
+        try await pendingFolderChecks(parent: parent.appendingPathComponent("folders"))
+        try await rejectedFolderRenameChecks(parent: parent.appendingPathComponent("folder-rejection"))
+        try await folderFeedbackChecks(parent: parent.appendingPathComponent("folder-feedback"))
         try await lifecycleReviewChecks(parent: parent.appendingPathComponent("lifecycle"))
         try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared"))
         try await externalReviewChecks(parent: parent)

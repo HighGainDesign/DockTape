@@ -9,12 +9,13 @@ import HiDockKit
 @MainActor
 final class SharedLibraryState {
     enum Phase { case legacy, connecting, ready, readOnly, failed }
-    enum ReviewTab: Hashable { case competingEdits, pendingFiles, externalFiles }
+    enum ReviewTab: Hashable { case competingEdits, pendingFiles, pendingFolders, externalFiles }
     private(set) var coordinator: SharedLibraryCoordinator?
     private(set) var root: URL?
     private(set) var phase: Phase = .legacy
     let review = SharedLibraryReviewState()
     let fileReview = RecordingFileReviewState()
+    let folderReview = FolderFileReviewState()
     let externalReview = ExternalSidecarReviewState()
     var showsReview = false
     var reviewTab: ReviewTab = .competingEdits
@@ -91,7 +92,7 @@ final class SharedLibraryState {
         }
     }
     func close() async {
-        review.clear(); fileReview.clear(); externalReview.clear(); showsReview = false; reviewTab = .competingEdits
+        review.clear(); fileReview.clear(); folderReview.clear(); externalReview.clear(); showsReview = false; reviewTab = .competingEdits
         request = UUID()
         eventsTask?.cancel(); eventsTask = nil
         refreshTask?.cancel(); refreshTask = nil
