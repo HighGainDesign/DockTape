@@ -57,6 +57,13 @@ public actor RecordingStore {
             .sorted()
     }
 
+    /// Names and their accepted identities are read in one actor turn. Unknown
+    /// directories remain visible, but have no authority for shared mutation.
+    public func folderCatalog() -> (names: [String], references: [String: SharedFolderReference]) {
+        let names = folders()
+        return (names, folderReferences.filter { names.contains($0.key) })
+    }
+
     /// Create a new top-level folder. Throws if it already exists.
     public func createFolder(named name: String) async throws {
         if let shared { try shared.requireRoot(baseDirectory); try await shared.coordinator.createSharedFolder(named: Self.sanitizeFilename(name)); return }
@@ -75,18 +82,20 @@ public actor RecordingStore {
 
     /// Rename a top-level folder.
     @discardableResult
-    public func renameFolder(from oldName: String, to newName: String) async throws -> String {
+    public func renameFolder(from oldName: String, to newName: String, reference: SharedFolderReference? = nil) async throws -> String {
         if let shared {
             try shared.requireRoot(baseDirectory)
             let name = Self.sanitizeFilename(newName)
+            guard let selected = reference ?? folderReferences[oldName] else { throw SharedSidecarError.reloadRequired }
             metadataTicket += 1
             await beforeSharedFileOperation()
-            let outcome = try await shared.coordinator.renameFolder(from: oldName, to: name)
+            let outcome = try await shared.coordinator.renameFolder(from: oldName, to: name, reference: selected)
             sharedFolderOperation = outcome
             guard outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
             try await loadLibraryMeta()
             return outcome.name
         }
+        guard reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let sanitized = Self.sanitizeFilename(newName)
         guard !sanitized.isEmpty else {
@@ -99,17 +108,19 @@ public actor RecordingStore {
     }
 
     /// Delete a top-level folder and all its contents.
-    public func deleteFolder(named name: String) async throws {
+    public func deleteFolder(named name: String, reference: SharedFolderReference? = nil) async throws {
         if let shared {
             try shared.requireRoot(baseDirectory)
+            guard let selected = reference ?? folderReferences[name] else { throw SharedSidecarError.reloadRequired }
             metadataTicket += 1
             await beforeSharedFileOperation()
-            let result = try await shared.coordinator.deleteFolder(named: name)
+            let result = try await shared.coordinator.deleteFolder(named: name, reference: selected)
             sharedFolderOperation = result
             guard result.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
             try await loadLibraryMeta()
             return
         }
+        guard reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let sanitized = Self.sanitizeFilename(name)
         guard !sanitized.isEmpty else { throw HiDockError.invalidFilename(name) }
@@ -591,6 +602,7 @@ public actor RecordingStore {
     private var meta: [String: RecordingMeta] = [:]
     private var metaBaseline: [String: RecordingMeta] = [:]
     private var recordingReferences: [String: SharedRecordingReference] = [:]
+    private var folderReferences: [String: SharedFolderReference] = [:]
     private var recordingContentRevisions: [String: String] = [:]
     /// Semantic revisions for independently loaded shared recordings. Maintenance
     /// acknowledgments and unrelated entity progress do not invalidate editors.
@@ -608,7 +620,7 @@ public actor RecordingStore {
                 progress = { catalog in await self.acceptProgress(catalog, ticket: ticket, onProgress: onProgress) }
             } else { progress = nil }
             let loaded = try await shared.loadCatalog(onProgress: progress)
-            if metadataTicket == ticket { meta = loaded.metadata; metaBaseline = loaded.metadata; recordingReferences = loaded.references; sharedVisibility = loaded.visibility; recordingContentRevisions = loaded.revisions }
+            if metadataTicket == ticket { meta = loaded.metadata; metaBaseline = loaded.metadata; recordingReferences = loaded.references; sharedVisibility = loaded.visibility; recordingContentRevisions = loaded.revisions; folderReferences = loaded.folderReferences }
             return
         }
         let url = baseDirectory.appendingPathComponent("library.json")
@@ -633,7 +645,7 @@ public actor RecordingStore {
     private func acceptProgress(_ catalog: SharedRecordingMetadataAdapter.Catalog, ticket: UInt64, onProgress: @Sendable () async -> Void) async {
         guard metadataTicket == ticket, !Task.isCancelled else { return }
         meta = catalog.metadata; metaBaseline = catalog.metadata
-        recordingReferences = catalog.references; sharedVisibility = catalog.visibility; recordingContentRevisions = catalog.revisions
+        recordingReferences = catalog.references; sharedVisibility = catalog.visibility; recordingContentRevisions = catalog.revisions; folderReferences = catalog.folderReferences
         await onProgress()
     }
 

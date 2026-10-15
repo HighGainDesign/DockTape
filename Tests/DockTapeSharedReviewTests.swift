@@ -3,6 +3,10 @@ import AppKit
 import HiDockKit
 
 @main struct DockTapeSharedReviewTests {
+    actor CommitCount {
+        private var count = 0
+        func next() -> Int { count += 1; return count }
+    }
     actor SavePause {
         private(set) var entered = false
         private var continuation: CheckedContinuation<Void, Never>?
@@ -225,7 +229,7 @@ import HiDockKit
         pendingModel.clear()
         print("Actual independent publication passed: resident transcript JSON/Markdown/TXT recovery finishes with unrelated recording/same-recording summary held and accepted A rename pending.")
     }
-    @MainActor static func pendingFolderChecks(parent: URL) async throws {
+    @MainActor static func pendingFolderChecks(parent: URL, interruptBeforeOwnerApproval: Bool = false) async throws {
         let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right")
         try FileManager.default.createDirectory(at: left.appendingPathComponent("Empty"), withIntermediateDirectories: true)
         UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
@@ -244,19 +248,34 @@ import HiDockKit
             try deliver(left, to: right, writer: a.writerID); try await b.refresh()
         }
         await state.refreshAll()
-        await state.deleteFolder(named: "Empty")
+        if interruptBeforeOwnerApproval {
+            await state.sharedLibrary.close()
+            let count = CommitCount()
+            let interrupted = SharedLibraryCoordinator(root: left, writerID: a.writerID,
+                witnessDirectory: parent.appendingPathComponent("a-local"),
+                afterCommit: { if await count.next() == 2 { withUnsafeCurrentTask { $0?.cancel() } } },
+                trash: { try FileManager.default.removeItem(at: $0) })
+            let action = Task { try await interrupted.deleteFolder(named: "Empty") }
+            do { _ = try await action.value; throw Failure(message: "Expected interruption after final deletion acceptance") }
+            catch is CancellationError {}
+        } else {
+            await state.deleteFolder(named: "Empty")
+            try expect(state.errorMessage == nil, "Accepted pending folder deletion must not be reported as failure")
+            try expect(state.sharedLibrary.showsReview && state.sharedLibrary.reviewTab == .pendingFolders, "Accepted pending folder action opens its review tab")
+        }
         let pending = await state.library.store.sharedFolderOperation
         let folderViews = try await a.snapshots(kinds: [.folder])
         try expect(folderViews.contains { $0.state.value(for: "name") == .text("Empty") && $0.state.value(for: "deletionRequest") != nil }, "Actual folder deletion must have a durable request even when a refresh interrupts follow-through; outcome=\(String(describing: pending?.result)), error=\(String(describing: state.errorMessage))")
         try expect(FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "Pending folder original remains until approval")
-        try expect(state.errorMessage == nil, "Accepted pending folder deletion must not be reported as failure")
-        try expect(state.sharedLibrary.showsReview && state.sharedLibrary.reviewTab == .pendingFolders, "Accepted pending folder action opens its review tab")
         await state.sharedLibrary.close()
         // Use the actual review model after shutting down the AppState watcher,
         // so each approval below is tied to one displayed, unchanged snapshot.
         let ownerModel = FolderFileReviewState(), peerModel = FolderFileReviewState()
         await ownerModel.refresh(using: a)
         guard let first = ownerModel.items.first else { throw Failure(message: "Accepted folder request needs a visible row") }
+        if interruptBeforeOwnerApproval {
+            try expect(first.canAcknowledge && !first.canResume, "An interrupted owner approval must stay explicit before destruction")
+        }
         if first.canResume { try expect(await ownerModel.perform(.resume, review: first, using: a), "Continue accepted folder request through the native model") }
         // Deliver the matching canonical library as well as its latest registry.
         // Registry-only arrival is deliberately retained in the diagnostic log.
@@ -271,6 +290,24 @@ import HiDockKit
         try expect(FileManager.default.fileExists(atPath: right.appendingPathComponent("Empty").path), "Approval alone does not remove the peer folder")
         try deliver(right, to: left, writer: b.writerID)
         await ownerModel.refresh(using: a)
+        if interruptBeforeOwnerApproval {
+            try expect(ownerModel.items.first?.canAcknowledge == true && ownerModel.items.first?.canResume == false,
+                       "Peer approval cannot imply the interrupted owner's consent")
+        }
+        if let unapproved = ownerModel.items.first, unapproved.canAcknowledge {
+            let entity = SharedEntityIdentity(id: first.id, kind: .folder)
+            let before = try await a.read(entity)
+            try expect(unapproved.id == first.id && FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path),
+                       "Unapproved deletion keeps the original folder")
+            try expect(await ownerModel.perform(.acknowledge, review: unapproved, using: a), "Explicit native owner approval succeeds")
+            let after = try await a.read(entity)
+            try expect(try SharedLibraryOperation.revision(for: before.state) == SharedLibraryOperation.revision(for: after.state),
+                       "Approval changes no semantic folder state")
+            try expect(FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "Approval alone cannot remove the folder")
+            try expect(ownerModel.items.first?.id == first.id && ownerModel.items.first?.canAcknowledge == false
+                       && ownerModel.items.first?.waitingForMacs.contains("This Mac") == false,
+                       "Fresh owner review records the explicit approval")
+        }
         guard let current = ownerModel.items.first, current.canResume else { throw Failure(message: "Owner needs native Resume after cohort approval; rows=\(ownerModel.items.map { "\($0.name):ack\($0.canAcknowledge):resume\($0.canResume):replan\($0.needsReplanning):waiting\($0.waitingForMacs)" }), error=\(String(describing: ownerModel.message))") }
         try expect(await ownerModel.perform(.resume, review: current, using: a), "Native owner Resume completes approved empty-folder deletion")
         try expect(ownerModel.items.isEmpty && !FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "Owner row clears only after actual removal")
@@ -494,9 +531,15 @@ import HiDockKit
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
         if arguments.contains("--folder-rejection-only") { try await rejectedFolderRenameChecks(parent: parent); return }
         if arguments.contains("--folder-feedback-only") { try await folderFeedbackChecks(parent: parent); return }
-        if arguments.contains("--folders-only") { try await pendingFolderChecks(parent: parent); return }
+        if arguments.contains("--folder-interrupted-approval-only") { try await pendingFolderChecks(parent: parent, interruptBeforeOwnerApproval: true); return }
+        if arguments.contains("--folders-only") {
+            try await pendingFolderChecks(parent: parent.appendingPathComponent("normal"))
+            try await pendingFolderChecks(parent: parent.appendingPathComponent("interrupted"), interruptBeforeOwnerApproval: true)
+            return
+        }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
         try await pendingFolderChecks(parent: parent.appendingPathComponent("folders"))
+        try await pendingFolderChecks(parent: parent.appendingPathComponent("folders-interrupted"), interruptBeforeOwnerApproval: true)
         try await rejectedFolderRenameChecks(parent: parent.appendingPathComponent("folder-rejection"))
         try await folderFeedbackChecks(parent: parent.appendingPathComponent("folder-feedback"))
         try await lifecycleReviewChecks(parent: parent.appendingPathComponent("lifecycle"))

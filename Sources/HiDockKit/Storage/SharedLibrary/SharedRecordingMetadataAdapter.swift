@@ -33,7 +33,7 @@ public actor SharedRecordingMetadataAdapter {
         }
     }
     public func load() async throws -> [String: RecordingStore.RecordingMeta] { try await loadCatalog().metadata }
-    typealias Catalog = (metadata: [String: RecordingStore.RecordingMeta], references: [String: SharedRecordingReference], revisions: [String: String], visibility: Visibility)
+    typealias Catalog = (metadata: [String: RecordingStore.RecordingMeta], references: [String: SharedRecordingReference], revisions: [String: String], visibility: Visibility, folderReferences: [String: SharedFolderReference])
     func loadCatalog(onProgress: (@Sendable (Catalog) async -> Void)? = nil) async throws -> Catalog {
         let request = UUID(); loadRequest = request
         progressiveViews = catalogViews
@@ -70,19 +70,19 @@ public actor SharedRecordingMetadataAdapter {
             let accepted = Dictionary(uniqueKeysWithValues: views.map { ($0.state.id, $0) })
             displayed = accepted; catalogViews = accepted
         }
-        return (result, references, revisions, visibility)
+        return (result, references, revisions, visibility, try Self.folderReferences(views: views, root: coordinator.root))
     }
     private func deliver(_ view: SharedLibraryViewSnapshot, request: UUID, onProgress: @Sendable (Catalog) async -> Void) async {
         guard loadRequest == request, !Task.isCancelled else { return }
         progressiveViews[view.state.id] = view
         catalogViews[view.state.id] = view
-        guard let catalog = try? Self.partialCatalog(progressiveViews) else { return }
+        guard let catalog = try? Self.partialCatalog(progressiveViews, root: coordinator.root) else { return }
         for reference in catalog.references.values { displayed[reference.entityID] = progressiveViews[reference.entityID] }
         // Folder baselines also carry the ancestor graph across a refresh.
         for value in progressiveViews.values where value.state.kind == .folder { displayed[value.state.id] = value }
         await onProgress(catalog)
     }
-    private static func partialCatalog(_ views: [UUID: SharedLibraryViewSnapshot]) throws -> Catalog {
+    private static func partialCatalog(_ views: [UUID: SharedLibraryViewSnapshot], root: URL) throws -> Catalog {
         func ancestors(_ state: SharedEntityState, field: String, visiting: Set<UUID>) -> [UUID: SharedEntityState]? {
             guard let values = state.fields[field]?.values, !values.isEmpty else { return nil }
             var result: [UUID: SharedEntityState] = [:]
@@ -101,6 +101,12 @@ public actor SharedRecordingMetadataAdapter {
                   (try? SharedLibraryPathIndex(states: Array(folders.values) + [view.state], caseSensitive: true)) != nil else { continue }
             ready.merge(folders) { old, _ in old }; ready[view.state.id] = view.state
         }
+        // Empty folders have no recording to make their ancestor graph ready.
+        for view in views.values where view.state.kind == .folder && view.state.lifecycle != .uninitialized {
+            guard let parents = ancestors(view.state, field: "parent", visiting: [view.state.id]),
+                  (try? SharedLibraryPathIndex(states: Array(parents.values) + [view.state], caseSensitive: true)) != nil else { continue }
+            ready.merge(parents) { old, _ in old }; ready[view.state.id] = view.state
+        }
         let index = try SharedLibraryPathIndex(states: Array(ready.values), caseSensitive: true)
         var metadata: [String: RecordingStore.RecordingMeta] = [:]
         var references: [String: SharedRecordingReference] = [:]
@@ -111,7 +117,20 @@ public actor SharedRecordingMetadataAdapter {
             metadata[path] = item; references[path] = .init(libraryID: view.libraryID, entityID: state.id)
             revisions[path] = try SharedStateFingerprint.of(view.state)
         }
-        return (metadata, references, revisions, .init(paths: index, deleted: Set(ready.values.filter { $0.kind == .recording && $0.lifecycle == .deleted }.map(\.id)), allowed: Set(references.keys)))
+        return (metadata, references, revisions, .init(paths: index, deleted: Set(ready.values.filter { $0.kind == .recording && $0.lifecycle == .deleted }.map(\.id)), allowed: Set(references.keys)), try folderReferences(views: ready.keys.compactMap { views[$0] }, root: root))
+    }
+    private static func folderReferences(views: [SharedLibraryViewSnapshot], root: URL) throws -> [String: SharedFolderReference] {
+        let sensitive = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
+        let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: sensitive)
+        var result: [String: SharedFolderReference] = [:]
+        for view in views where view.state.kind == .folder && view.state.lifecycle != .uninitialized && view.state.conflicts.isEmpty {
+            var paths = Set(index.resolvedPaths[view.state.id].map { [$0] } ?? [])
+            if case .text(let physical)? = view.state.value(for: "physicalPath") { paths.insert(physical) }
+            for path in paths where !path.contains("/") && index.owners(of: path) == [view.state.id] {
+                result[path] = .init(libraryID: view.libraryID, entityID: view.state.id)
+            }
+        }
+        return result
     }
     public func save(filename: String, before: RecordingStore.RecordingMeta?, after: RecordingStore.RecordingMeta) async throws -> RecordingStore.RecordingMeta {
         loadRequest = nil

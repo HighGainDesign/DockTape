@@ -9,6 +9,18 @@ import HiDockKit
 final class LibraryState {
     var recordings: [RecordingMetadata] = []
     var folders: [String] = []
+    let binding = UUID()
+    private var folderReferences: [String: SharedFolderReference] = [:]
+    var folderSelections: [FolderSelection] { folders.map { folderSelection(named: $0) } }
+    func folderSelection(named name: String) -> FolderSelection {
+        .init(name: name, reference: folderReferences[name], libraryBinding: binding)
+    }
+    private func validate(_ selection: FolderSelection) throws {
+        guard selection.libraryBinding == binding else { throw SharedLibraryCoordinatorError.differentBinding }
+        if sharedCoordinator != nil {
+            guard selection.reference != nil else { throw SharedSidecarError.reloadRequired }
+        } else if selection.reference != nil { throw SharedLibraryCoordinatorError.differentBinding }
+    }
     var selectedFolder: String? = nil  // nil = "All Recordings"
     var selectedRecording: String? = nil
     var selectedRecordings: Set<String> = []
@@ -91,14 +103,14 @@ final class LibraryState {
         guard metadataRequest == request, !Task.isCancelled else { return }
         let entries = await store.allRecordings()
         let imported = await store.allImportedDeviceFilenames()
-        let names = await store.folders()
+        let folderCatalog = await store.folderCatalog()
         let revisions = await store.contentRevisions()
         guard metadataRequest == request, !Task.isCancelled else { return }
         recordings = entries
         downloadedFilenames = Set(entries.map(\.filename))
         selectedRecordings.formIntersection(downloadedFilenames)
         if let selectedRecording, !downloadedFilenames.contains(selectedRecording) { self.selectedRecording = nil }
-        importedDeviceFilenames = imported; folders = names
+        importedDeviceFilenames = imported; folders = folderCatalog.names; folderReferences = folderCatalog.references
         contentRevisions = revisions
     }
 
@@ -126,12 +138,18 @@ final class LibraryState {
 
     func createFolder(named name: String) async throws {
         try await store.createFolder(named: name)
-        folders = await store.folders()
+        if sharedCoordinator != nil { await refresh() }
+        else { folders = await store.folders() }
     }
 
     func renameFolder(from oldName: String, to newName: String) async throws -> String {
+        try await renameFolder(selection: folderSelection(named: oldName), to: newName)
+    }
+    func renameFolder(selection: FolderSelection, to newName: String) async throws -> String {
+        try validate(selection)
+        let oldName = selection.name
         let affected = recordings.filter { $0.filename.hasPrefix(oldName + "/") }
-        let actualName = try await store.renameFolder(from: oldName, to: newName)
+        let actualName = try await store.renameFolder(from: oldName, to: newName, reference: selection.reference)
         for rec in affected {
             let newFilename = actualName + rec.filename.dropFirst(oldName.count)
             if sharedCoordinator == nil { try await transcriptStore.rename(from: rec.filename, to: newFilename) }
@@ -143,7 +161,12 @@ final class LibraryState {
     }
 
     func deleteFolder(named name: String) async throws {
-        try await store.deleteFolder(named: name)
+        try await deleteFolder(selection: folderSelection(named: name))
+    }
+    func deleteFolder(selection: FolderSelection) async throws {
+        try validate(selection)
+        let name = selection.name
+        try await store.deleteFolder(named: name, reference: selection.reference)
         if selectedFolder == name { selectedFolder = nil }
         await refresh()
     }

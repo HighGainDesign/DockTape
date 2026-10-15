@@ -167,6 +167,38 @@ final class SharedCoordinatorAuthorityTests: XCTestCase {
         }
     }
 
+    func testPreparedLocalGateAcceptsCanonicalAliasesButRefusesReplacementFiles() async throws {
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent)
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let gate = SharedLibraryLocalGate(file: parent.appendingPathComponent("local/Gates/commit.lock"))
+        try await gate.prepare(outside: root)
+        try await CoordinatedFileAccess().withWrite(at: gate.file) { try gate.validate($0, outside: root) }
+        let unrelated = parent.appendingPathComponent("unrelated.lock")
+        try Data().write(to: unrelated)
+        do {
+            try await CoordinatedFileAccess().withWrite(at: unrelated) { try gate.validate($0, outside: root) }
+            XCTFail("A different gate cannot authorize the operation")
+        } catch SharedLibraryOperationError.unsafePath {}
+        try Data("unexpected".utf8).write(to: gate.file)
+        do {
+            try await CoordinatedFileAccess().withWrite(at: gate.file) { try gate.validate($0, outside: root) }
+            XCTFail("The gate must remain an empty regular file")
+        } catch SharedLibraryOperationError.unsafePath {}
+        try FileManager.default.removeItem(at: gate.file)
+        try FileManager.default.createSymbolicLink(at: gate.file, withDestinationURL: unrelated)
+        do {
+            try await CoordinatedFileAccess().withWrite(at: gate.file) { try gate.validate($0, outside: root) }
+            XCTFail("A symlink replacement cannot authorize the operation")
+        } catch SharedLibraryOperationError.unsafePath {}
+        do {
+            try await CoordinatedFileAccess().withWrite(at: unrelated) { try gate.validate($0, outside: root) }
+            XCTFail("A redirected coordinated URL cannot bless a replaced gate")
+        } catch SharedLibraryOperationError.unsafePath {}
+        XCTAssertEqual(try Data(contentsOf: unrelated), Data())
+    }
+
     func testPhysicalPermissionCannotFollowAReboundLibraryAtTheSameRootPath() async throws {
         let (root, coordinator, entity) = try await fixture()
         let before = try await coordinator.read(entity)

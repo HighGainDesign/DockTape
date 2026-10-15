@@ -28,6 +28,105 @@ final class SharedFolderStoreTests: XCTestCase {
         try await store.setup()
         return (root, coordinator, store)
     }
+    func testDistinctCaseSensitiveFolderReferencesRemainWritable() async throws {
+        let configured = ProcessInfo.processInfo.environment["DOCKTAPE_CASE_SENSITIVE_TEST_ROOT"]
+        let base = configured.map { URL(fileURLWithPath: $0) } ?? FileManager.default.temporaryDirectory
+        let parent = base.appendingPathComponent("DockTapeCaseFixture-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true); roots.append(parent)
+        let sensitive = (try parent.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])).volumeSupportsCaseSensitiveNames == true
+        if !sensitive {
+            if configured != nil { XCTFail("Configured fixture volume must be case-sensitive"); return }
+            throw XCTSkip("Run with DOCKTAPE_CASE_SENSITIVE_TEST_ROOT on a case-sensitive fixture volume")
+        }
+        let root = parent.appendingPathComponent("library")
+        for name in ["Foo", "foo"] { try FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true) }
+        let missing = root.appendingPathComponent("Missing/Nested/file.json")
+        XCTAssertTrue(SharedLibraryMaterializer.contained(missing, in: root))
+        XCTAssertFalse(SharedLibraryMaterializer.contained(root, in: root))
+        let outside = parent.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("escape"), withDestinationURL: outside)
+        XCTAssertFalse(SharedLibraryMaterializer.contained(root.appendingPathComponent("escape/Missing/file.json"), in: root))
+        try FileManager.default.removeItem(at: root.appendingPathComponent("escape"))
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("broken"), withDestinationURL: outside.appendingPathComponent("MissingTarget"))
+        XCTAssertFalse(SharedLibraryMaterializer.contained(root.appendingPathComponent("broken/file.json"), in: root))
+        try FileManager.default.removeItem(at: root.appendingPathComponent("broken"))
+        let a = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"), trash: { try FileManager.default.removeItem(at: $0) })
+        _ = try await a.enable()
+        _ = try await a.projectOutputs()
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: a)); try await store.setup()
+        let catalog = await store.folderCatalog()
+        let upper = try XCTUnwrap(catalog.references["Foo"]), lower = try XCTUnwrap(catalog.references["foo"])
+        XCTAssertNotEqual(upper, lower)
+        let deleted = try await a.deleteFolder(named: "foo", reference: lower)
+        XCTAssertEqual(deleted.result, .complete)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Foo").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("foo").path))
+        let moved = try await a.renameFolder(from: "Foo", to: "Upper", reference: upper)
+        XCTAssertEqual(moved.result, .complete)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Upper").path))
+    }
+
+    func testDisplayedFolderReferenceSurvivesRenameButRefusesAReusedName() async throws {
+        let (root, a, store) = try await fixture()
+        let before = await store.folderCatalog()
+        let selected = try XCTUnwrap(before.references["Folder"])
+        let moved = try await a.renameFolder(from: "Folder", to: "Moved", reference: selected)
+        XCTAssertEqual(moved.result, .complete)
+        try await a.createSharedFolder(named: "Folder")
+        try await store.loadLibraryMeta()
+        let current = await store.folderCatalog()
+        XCTAssertEqual(current.references["Moved"], selected)
+        XCTAssertNotEqual(current.references["Folder"], selected)
+        for action in ["delete", "rename"] {
+            do {
+                if action == "delete" { _ = try await a.deleteFolder(named: "Folder", reference: selected) }
+                else { _ = try await a.renameFolder(from: "Folder", to: "Unexpected", reference: selected) }
+                XCTFail("Old selection cannot target the replacement")
+            } catch SharedLibraryCoordinatorError.differentBinding {}
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path))
+        }
+        let (_, _, otherStore) = try await fixture()
+        let otherCatalog = await otherStore.folderCatalog()
+        let foreign = try XCTUnwrap(otherCatalog.references["Folder"])
+        do { _ = try await a.deleteFolder(named: "Folder", reference: foreign); XCTFail("Different library must refuse") }
+        catch SharedLibraryCoordinatorError.differentBinding {}
+    }
+
+    func testStoreFolderReferenceIsCapturedBeforeAwaitAndUnknownFolderHasNoAuthority() async throws {
+        for action in ["delete", "rename"] {
+            let (root, a, _) = try await fixture()
+            let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: a), beforeSharedFileOperation: {
+                _ = try? await a.renameFolder(from: "Folder", to: "Moved")
+                try? await a.createSharedFolder(named: "Folder")
+            })
+            try await store.setup()
+            do {
+                if action == "delete" { try await store.deleteFolder(named: "Folder") }
+                else { _ = try await store.renameFolder(from: "Folder", to: "Unexpected") }
+                XCTFail("Store must retain the displayed ID across its awaited operation hook")
+            } catch SharedLibraryCoordinatorError.differentBinding {}
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path))
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Moved/A.mp3")), Data("Folder/A.mp3".utf8))
+        }
+        let (root, a, store) = try await fixture()
+        try await a.createSharedFolder(named: "Empty")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Unknown"), withIntermediateDirectories: true)
+        try await store.loadLibraryMeta()
+        let catalog = await store.folderCatalog()
+        XCTAssertNotNil(catalog.references["Empty"], "An independently loaded empty folder needs its own stable reference")
+        XCTAssertNil(catalog.references["Unknown"], "Raw directory presence cannot invent an entity selection")
+        do { try await store.deleteFolder(named: "Unknown"); XCTFail("Reload/claim required for unknown folder") }
+        catch SharedSidecarError.reloadRequired {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Unknown").path))
+        let empty = try XCTUnwrap(catalog.references["Empty"])
+        let view = try await a.read(.init(id: empty.entityID, kind: .folder))
+        _ = try await a.edit(.init(base: view, changes: [.assign(field: "name", value: .text("Folder"))]))
+        try await store.loadLibraryMeta()
+        let ambiguous = await store.folderCatalog()
+        XCTAssertNil(ambiguous.references["Folder"], "Two accepted identities at the same path grant no folder selection")
+    }
+
     func testReviewedFolderDeletionCompletesOnlyAfterPeerApprovalAndProviderRemoval() async throws {
         let (left, a, _) = try await fixture()
         try await a.createSharedFolder(named: "Empty"); _ = try await a.projectOutputs()

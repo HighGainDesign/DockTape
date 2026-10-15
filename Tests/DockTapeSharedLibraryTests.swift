@@ -28,7 +28,14 @@ struct DockTapeSharedLibraryTests {
     }
     @MainActor static func main() async {
         do {
-            if CommandLine.arguments.contains("--background-metadata-only") {
+            if CommandLine.arguments.contains("--folder-selection-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeFolderSelection-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await folderSelectionChecks(parent: parent)
+                try await capturedFolderSelectionChecks(parent: parent.appendingPathComponent("captured"))
+            } else if CommandLine.arguments.contains("--background-metadata-only") {
                 _ = NSApplication.shared
                 UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
                 let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeBackgroundMetadata-" + UUID().uuidString)
@@ -237,6 +244,8 @@ struct DockTapeSharedLibraryTests {
         try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.mp3").path), "Storage switching must not move recordings")
         await reopened.sharedLibrary.close()
         try await mergeSelectionChecks(parent: parent, identity: identity)
+        try await folderSelectionChecks(parent: parent.appendingPathComponent("folder-selection"))
+        try await capturedFolderSelectionChecks(parent: parent.appendingPathComponent("folder-captured"))
         try await folderRenameChecks(parent: parent, identity: identity)
         try await folderDeleteLibraryChecks(parent: parent)
         try await refreshStatusChecks(parent: parent)
@@ -372,7 +381,7 @@ struct DockTapeSharedLibraryTests {
         for deleted in deletedOnly ? [true] : [false, true] {
             let folder = parent.appendingPathComponent(deleted ? "deleted" : "alive")
             let root = folder.appendingPathComponent("library")
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Empty"), withIntermediateDirectories: true)
             for name in ["A.mp3", "B.mp3"] {
                 try Data("synthetic cold metadata original".utf8).write(to: root.appendingPathComponent(name))
                 try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: name, transcriptionModel: "fixture", hasSpeakerLabels: false,
@@ -405,10 +414,11 @@ struct DockTapeSharedLibraryTests {
             var setupFinished = false
             let setup = Task { try await state.setup(); setupFinished = true }
             for _ in 0..<150 {
-                if state.library.recordings.contains(where: { $0.filename == "B.mp3" }) { break }
+                if state.library.recordings.contains(where: { $0.filename == "B.mp3" }) && state.library.folderSelection(named: "Empty").reference != nil { break }
                 try await Task.sleep(for: .milliseconds(10))
             }
             let residentB = state.library.recordings.first { $0.filename == "B.mp3" }
+            let emptyReady = state.library.folderSelection(named: "Empty").reference != nil
             let unknownAVisible = state.library.recordings.contains { $0.filename == "A.mp3" }
             let templatesBefore = state.sharedLibrary.revision
             let bContentID = state.library.contentID(for: "B.mp3", fallbackRevision: 0)
@@ -455,6 +465,7 @@ struct DockTapeSharedLibraryTests {
                 let otherRoot = LibraryState(store: RecordingStore(baseDirectory: folder.appendingPathComponent("different-root")), transcriptStore: TranscriptStore(baseDirectory: root))
                 try expect(otherRoot.contentID(for: "B.mp3", fallbackRevision: 0) != bContentID, "Storage bindings must have distinct content identities")
             }
+            try expect(emptyReady, "Independent empty folder identity arrives while unrelated authoritative metadata remains held")
             try expect(residentB?.reference != nil, "First launch must expose resident B with stable identity while unrelated A metadata remains held (deleted=\(deleted))")
             try expect(residentText == "Resident B.mp3", "B transcript must be usable while A metadata remains held")
             try expect(loadingVisible && badgesReady, "Waiting feedback and resident transcript/summary badges appear before A is available")
@@ -655,6 +666,85 @@ struct DockTapeSharedLibraryTests {
         try expect(!FileManager.default.fileExists(atPath: other.appendingPathComponent("Wrong library.mp3").path), "A changed library must invalidate the open merge dialog")
         try expect(state.errorMessage?.contains("library changed") == true, "Explain the changed merge binding")
         await state.sharedLibrary.close()
+    }
+
+    @MainActor static func folderSelectionChecks(parent: URL) async throws {
+        for action in ["delete", "rename"] {
+            let directory = parent.appendingPathComponent(action), root = directory.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+            let original = Data("synthetic selected folder original".utf8)
+            try original.write(to: root.appendingPathComponent("Folder/Clip.mp3"))
+            let local = directory.appendingPathComponent("local"), identity = directory.appendingPathComponent("identity.json")
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "folder selection fixture").load()
+            }, sharedWitnessDirectory: local, sharedTrash: { try FileManager.default.removeItem(at: $0) })
+            try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable folder selection fixture")
+            guard let a = state.sharedLibrary.coordinator else { throw Failure(description: "Missing folder selection coordinator") }
+            await a.stopMonitoring()
+            let other = SharedLibraryCoordinator(root: root, writerID: a.writerID, witnessDirectory: local, trash: { try FileManager.default.removeItem(at: $0) })
+            let moved = try await other.renameFolder(from: "Folder", to: "Moved")
+            try expect(moved.result == .complete, "Actual original folder move completes")
+            try await other.createSharedFolder(named: "Folder")
+            let current = try await other.snapshots(kinds: [.folder])
+            guard let replacement = current.first(where: { $0.state.value(for: "name") == .text("Folder") }) else { throw Failure(description: "Missing replacement folder") }
+            try expect(state.library.folders == ["Folder"], "Fixture retains its actual displayed folder catalog before sync refresh")
+            if action == "delete" { await state.deleteFolder(named: "Folder") }
+            else { await state.renameFolder(from: "Folder", to: "Unexpected") }
+            let after = try await other.read(.init(id: replacement.state.id, kind: .folder))
+            try expect(after.state.lifecycle == .alive && after.state.value(for: "name") == .text("Folder") && after.state.value(for: "deletionRequest") == nil,
+                "Stale displayed \(action) must not accept an operation on the replacement folder")
+            try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path), "Replacement folder remains at its selected name")
+            try expect(try Data(contentsOf: root.appendingPathComponent("Moved/Clip.mp3")) == original, "Original moved folder bytes stay unchanged")
+            try expect(state.errorMessage != nil, "Stale displayed folder action needs a reload error")
+            await state.sharedLibrary.close()
+        }
+        print("Actual stable folder selection passed: stale displayed Rename/Delete cannot retarget a reused name.")
+    }
+
+    @MainActor static func capturedFolderSelectionChecks(parent: URL) async throws {
+        for scenario in ["editor", "same-library-copy", "legacy-root"] {
+            let directory = parent.appendingPathComponent(scenario), root = directory.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+            let original = Data("synthetic captured folder".utf8)
+            try original.write(to: root.appendingPathComponent("Folder/Clip.mp3"))
+            let local = directory.appendingPathComponent("local"), identity = directory.appendingPathComponent("identity.json")
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "captured folder fixture").load()
+            }, sharedWitnessDirectory: local, sharedTrash: { try FileManager.default.removeItem(at: $0) })
+            try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable captured folder fixture")
+            guard let a = state.sharedLibrary.coordinator else { throw Failure(description: "Missing captured folder coordinator") }
+            await a.stopMonitoring()
+            let selection = state.library.folderSelection(named: "Folder")
+            try expect(selection.reference != nil, "Displayed folder has an accepted identity")
+            if scenario == "editor" {
+                let other = SharedLibraryCoordinator(root: root, writerID: a.writerID, witnessDirectory: local)
+                _ = try await other.renameFolder(from: "Folder", to: "Moved")
+                try await other.createSharedFolder(named: "Folder")
+                await state.refreshAll()
+                try expect(state.library.folderSelection(named: "Folder").reference != selection.reference, "Fresh catalog identifies replacement")
+                await state.renameFolder(selection: selection, to: "Unexpected")
+                try expect(state.errorMessage != nil && FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path), "Editor retains original selection across refresh")
+                try expect(try Data(contentsOf: root.appendingPathComponent("Moved/Clip.mp3")) == original, "Editor cannot alter moved original")
+            } else {
+                let next = directory.appendingPathComponent("next")
+                if scenario == "same-library-copy" { try FileManager.default.copyItem(at: root, to: next) }
+                else {
+                    try FileManager.default.createDirectory(at: next.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+                    try original.write(to: next.appendingPathComponent("Folder/Clip.mp3"))
+                }
+                try expect(await state.switchStorageLocation(to: .custom, customURL: next), "Switch actual app binding before queued action")
+                let current = state.library.folderSelection(named: "Folder")
+                try expect(current.libraryBinding != selection.libraryBinding, "New LibraryState has a distinct binding")
+                if scenario == "same-library-copy" { try expect(current.reference == selection.reference, "Same library UUID still needs root-instance protection") }
+                await state.deleteFolder(selection: selection)
+                try expect(state.errorMessage != nil && FileManager.default.fileExists(atPath: next.appendingPathComponent("Folder").path), "Queued Delete cannot target new root")
+                await state.renameFolder(selection: selection, to: "Unexpected")
+                try expect(state.errorMessage != nil && FileManager.default.fileExists(atPath: next.appendingPathComponent("Folder").path), "Queued Rename cannot target new root")
+                try expect(try Data(contentsOf: next.appendingPathComponent("Folder/Clip.mp3")) == original && Data(contentsOf: root.appendingPathComponent("Folder/Clip.mp3")) == original, "Both fixture copies preserved")
+            }
+            await state.sharedLibrary.close()
+        }
+        print("Actual captured folder selection passed: refreshed editor and different-root/same-library-copy actions refuse.")
     }
 
     @MainActor static func folderRenameChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {

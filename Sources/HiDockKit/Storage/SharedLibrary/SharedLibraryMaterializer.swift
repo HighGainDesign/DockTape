@@ -903,8 +903,33 @@ public actor SharedLibraryMaterializer {
     }
   }
   static func contained(_ url: URL, in root: URL) -> Bool {
-    url.standardizedFileURL.resolvingSymlinksInPath().path.hasPrefix(
-      root.standardizedFileURL.resolvingSymlinksInPath().path + "/")
+    guard let location = canonicalLocation(url), let root = canonicalLocation(root) else { return false }
+    return location.path.hasPrefix(root.path + "/")
+  }
+  /// Resolve through the nearest existing ancestor. Foundation may retain
+  /// /private/tmp for a missing child while resolving its existing parent to
+  /// /tmp, including on a mounted volume. Resolve symlinks before preserving
+  /// the missing suffix so an escape still compares outside the library.
+  private static func canonicalLocation(_ url: URL, links: Int = 0) -> URL? {
+    guard links < 40 else { return nil }
+    var location = url.standardizedFileURL.resolvingSymlinksInPath()
+    var suffix: [String] = []
+    while !FileManager.default.fileExists(atPath: location.path), location.path != "/" {
+      // Foundation does not resolve a symlink whose destination is missing.
+      // Preserve that destination rather than treating the link as a new path.
+      if (try? FileManager.default.attributesOfItem(atPath: location.path)[.type] as? FileAttributeType) == .typeSymbolicLink {
+        guard let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: location.path) else { return nil }
+        var target = destination.hasPrefix("/") ? URL(fileURLWithPath: destination)
+          : location.deletingLastPathComponent().appendingPathComponent(destination)
+        for component in suffix.reversed() { target.appendPathComponent(component) }
+        return canonicalLocation(target, links: links + 1)
+      }
+      suffix.append(location.lastPathComponent)
+      location.deleteLastPathComponent()
+    }
+    location = location.resolvingSymlinksInPath()
+    for component in suffix.reversed() { location.appendPathComponent(component) }
+    return location
   }
   static func checkRoot(_ root: URL) throws {
     guard

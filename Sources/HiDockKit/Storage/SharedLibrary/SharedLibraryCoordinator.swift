@@ -1022,16 +1022,19 @@ public actor SharedLibraryCoordinator {
     let members: [FolderMoveMember]
   }
 
-  public func renameFolder(from source: String, to destination: String,
+  public func renameFolder(from source: String, to destination: String, reference: SharedFolderReference? = nil,
                            afterMutation: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedFolderFileOutcome {
     _ = try SharedLibraryIdentity.normalized(source); _ = try SharedLibraryIdentity.normalized(destination)
     guard !source.contains("/"), !destination.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
     let views = try await snapshots(kinds: [.recording, .folder])
-    let index = try await pathIndex(for: views)
+    let sensitive = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
+    let index = try await pathIndex(for: views, caseSensitive: sensitive)
     let matches = views.filter { view in
       view.state.kind == .folder && (index.resolvedPaths[view.state.id] == source || view.state.value(for: "physicalPath") == .text(source))
     }
     guard matches.count == 1, let base = matches.first else { throw SharedLibraryPathError.ambiguousPath }
+    if let reference, reference.libraryID != base.libraryID || reference.entityID != base.state.id { throw SharedLibraryCoordinatorError.differentBinding }
+    guard index.owners(of: source) == [base.state.id] else { throw SharedLibraryOperationError.pathConflict(source) }
     guard base.state.lifecycle == .alive, base.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
     if source == destination { return .init(id: base.state.id, name: destination, result: .complete, projectionError: nil) }
     let entity = SharedEntityIdentity(id: base.state.id, kind: .folder)
@@ -1405,17 +1408,21 @@ public actor SharedLibraryCoordinator {
     let path: String
     let members: [FolderDeletionMember]
   }
-  public func deleteFolder(named name: String, beforeFinalRemoval: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedFolderFileOutcome {
+  public func deleteFolder(named name: String, reference: SharedFolderReference? = nil, beforeFinalRemoval: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedFolderFileOutcome {
     _ = try SharedLibraryIdentity.normalized(name)
     guard !name.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
     let views = try await snapshots(kinds: [.recording, .folder])
-    let index = try await pathIndex(for: views)
+    let sensitive = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
+    let index = try await pathIndex(for: views, caseSensitive: sensitive)
     let matches = views.filter { $0.state.kind == .folder && index.resolvedPaths[$0.state.id] == name }
     guard matches.count == 1, let base = matches.first else { throw SharedLibraryPathError.ambiguousPath }
+    if let reference, reference.libraryID != base.libraryID || reference.entityID != base.state.id { throw SharedLibraryCoordinatorError.differentBinding }
+    guard index.owners(of: name) == [base.state.id] else { throw SharedLibraryOperationError.pathConflict(name) }
     if case .document = base.state.value(for: "deletionRequest") {
       return try await resumeFolderDeletion(id: base.state.id, beforeFinalRemoval: beforeFinalRemoval)
     }
     guard base.state.lifecycle == .alive, base.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
+    if let physical = base.state.value(for: "physicalPath"), physical != .text(name) { throw SharedLibraryOperationError.unfinishedOperation }
     let members = views.filter { $0.state.id != base.state.id && (index.resolvedPaths[$0.state.id]?.hasPrefix(name + "/") == true) }
     guard members.allSatisfy({ $0.state.lifecycle == .alive && $0.state.conflicts.isEmpty }) else { throw SharedSidecarError.conflictedContent }
     let request = FolderDeletionRequest(library: base.libraryID, folder: base.state.id, path: name,

@@ -17,7 +17,15 @@ public struct SharedLibraryLocalGate: Sendable {
     }
     func validate(_ scope: CoordinatedFileAccess.Scope, outside root: URL) throws {
         _ = try items(outside: root)
-        guard scope.url.standardizedFileURL.resolvingSymlinksInPath() == file else {
+        // A missing /private/tmp path can resolve to /tmp after creation.
+        // Compare both current canonical paths while refusing a replaced gate.
+        let attributes = try FileManager.default.attributesOfItem(atPath: scope.url.path)
+        let expected = try FileManager.default.attributesOfItem(atPath: file.path)
+        guard scope.url.standardizedFileURL.resolvingSymlinksInPath() == file.resolvingSymlinksInPath(),
+              expected[.type] as? FileAttributeType == .typeRegular,
+              (expected[.size] as? NSNumber)?.intValue == 0,
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              (attributes[.size] as? NSNumber)?.intValue == 0 else {
             throw SharedLibraryOperationError.unsafePath
         }
     }

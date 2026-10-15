@@ -651,13 +651,6 @@ final class AppState {
         }
     }
 
-    private func folderID(named name: String, using coordinator: SharedLibraryCoordinator?) async throws -> UUID? {
-        guard let coordinator else { return nil }
-        let matches = try await coordinator.snapshots(kinds: [.folder]).filter {
-            $0.state.value(for: "name") == .text(name) || $0.state.value(for: "physicalPath") == .text(name)
-        }
-        return matches.count == 1 ? matches[0].state.id : nil
-    }
     private func showPendingFolder(id: UUID?, purpose: SharedFolderOperationReview.Purpose, requestedName: String? = nil,
                                    library captured: LibraryState, coordinator: SharedLibraryCoordinator?) async -> Bool {
         guard let id, let coordinator, library === captured, sharedLibrary.coordinator === coordinator,
@@ -673,15 +666,18 @@ final class AppState {
         return true
     }
     func deleteFolder(named name: String) async {
+        await deleteFolder(selection: library.folderSelection(named: name))
+    }
+    func deleteFolder(selection: FolderSelection) async {
+        guard selection.libraryBinding == library.binding else { errorMessage = "The library changed. Reload before changing this folder."; return }
         guard requireWritableLibrary() else { return }
+        let name = selection.name
         let captured = library, coordinator = sharedLibrary.coordinator
         if let playing = playback.playingFile, playing.hasPrefix(name + "/") { playback.stop() }
         let affected = captured.recordings.filter { $0.filename.hasPrefix(name + "/") }
-        var id: UUID?
+        let id = selection.reference?.entityID
         do {
-            id = try await folderID(named: name, using: coordinator)
-            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
-            try await captured.deleteFolder(named: name)
+            try await captured.deleteFolder(selection: selection)
             guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             if selectedView == .folder(name) { selectedView = .allRecordings }
             for recording in affected { summarization.hasSummary.remove(recording.filename) }
@@ -692,14 +688,17 @@ final class AppState {
         }
     }
     func renameFolder(from oldName: String, to newName: String) async {
+        await renameFolder(selection: library.folderSelection(named: oldName), to: newName)
+    }
+    func renameFolder(selection: FolderSelection, to newName: String) async {
+        guard selection.libraryBinding == library.binding else { errorMessage = "The library changed. Reload before changing this folder."; return }
         guard requireWritableLibrary() else { return }
+        let oldName = selection.name
         let captured = library, coordinator = sharedLibrary.coordinator
         let affected = captured.recordings.filter { $0.filename.hasPrefix(oldName + "/") }
-        var id: UUID?
+        let id = selection.reference?.entityID
         do {
-            id = try await folderID(named: oldName, using: coordinator)
-            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
-            let actualName = try await captured.renameFolder(from: oldName, to: newName)
+            let actualName = try await captured.renameFolder(selection: selection, to: newName)
             guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             if selectedView == .folder(oldName) { selectedView = .folder(actualName) }
             for rec in affected {
