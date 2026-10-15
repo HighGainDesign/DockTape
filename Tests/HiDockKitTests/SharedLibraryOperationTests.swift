@@ -54,6 +54,48 @@ final class SharedLibraryOperationTests: XCTestCase {
     }
     func cleanup() { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
   }
+  func testPeerDeletionAdoptionPreservesPhysicalEvidenceAndSourceHashes() async throws {
+    for scenario in ["ready", "attempted", "completed", "changed", "missing", "omitted"] {
+      let f = try Fixture(deleted: true)
+      defer { f.cleanup() }
+      let audio = Data("synthetic peer original".utf8), sidecar = Data("synthetic sidecar".utf8)
+      try audio.write(to: f.root.appendingPathComponent("old.mp3"))
+      try sidecar.write(to: f.root.appendingPathComponent("old.summary.json"))
+      let steps: [SharedLibraryOperation.Step] = [.trash(path: "old.mp3", fingerprint: SharedLibraryOperation.fingerprint(audio)), .trash(path: "old.summary.json", fingerprint: SharedLibraryOperation.fingerprint(sidecar))]
+      let old = try f.operation(steps)
+      let materializer = f.materializer()
+      try await materializer.recordIntent(old)
+      let receiptFile = f.receipts.appendingPathComponent(f.entity.id.uuidString + ".json")
+      var receipt = SharedOperationReceipt(old)
+      if scenario == "attempted" { receipt.attempting = true }
+      if scenario == "completed" { receipt.completed = 1 }
+      try receipt.encoded().write(to: receiptFile, options: .atomic)
+      let before = try Data(contentsOf: receiptFile)
+      if scenario == "changed" { try Data("external changed audio".utf8).write(to: f.root.appendingPathComponent("old.mp3")) }
+      if scenario == "missing" { try FileManager.default.removeItem(at: f.root.appendingPathComponent("old.mp3")) }
+      var auth = await f.authority.current()
+      try auth.state.delete(writer: f.writer)
+      await f.authority.update(auth)
+      let next = try SharedLibraryOperation(libraryID: f.library, entity: f.entity, inputRevision: "accepted peer input",
+        outputRevision: SharedLibraryOperation.revision(for: auth.state), steps: scenario == "omitted" ? Array(steps.prefix(1)) : steps)
+      do {
+        try await materializer.adoptUnstartedDeletion(next, replacing: old)
+        XCTAssertEqual(scenario, "ready", "Only a wholly unstarted receipt with every exact source present can be adopted")
+      } catch { XCTAssertNotEqual(scenario, "ready", "The valid accepted peer intent must be locally reconstructable: \(error)") }
+      if scenario == "ready" {
+        let progress = try await materializer.progress(entity: f.entity, libraryID: f.library)
+        XCTAssertEqual(progress?.operation, next)
+        XCTAssertEqual(progress?.completedSteps, 0)
+        let result = try await materializer.replay(next)
+        XCTAssertEqual(result, .waitingForAcknowledgments, "Metadata adoption cannot approve destruction")
+      } else { XCTAssertEqual(try Data(contentsOf: receiptFile), before, "Refusal preserves exact prior physical proof") }
+      if scenario != "missing" {
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent("old.mp3")), scenario == "changed" ? Data("external changed audio".utf8) : audio)
+      }
+      XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent("old.summary.json")), sidecar)
+    }
+  }
+
   private enum Interrupted: Error { case crash }
 
   private actor TransientAuthority {
@@ -676,6 +718,53 @@ final class SharedLibraryOperationTests: XCTestCase {
       try Data(contentsOf: f.root.appendingPathComponent("new.transcript.json")), transcript)
     let finalAuthority = await f.authority.current()
     XCTAssertEqual(finalAuthority.state.value(for: "notes"), .text("independent edit"))
+  }
+
+  func testDeletionReplanPreservesCompletedAndAttemptedTrashWhileAwaitingFreshApproval() async throws {
+    for interruptedAt in [0, 1] {
+      let f = try Fixture(deleted: true)
+      defer { f.cleanup() }
+      let names = ["old.mp3", "old.transcript.json", "old.summary.json"]
+      let bytes = Data("synthetic deletion content".utf8)
+      for name in names { try bytes.write(to: f.root.appendingPathComponent(name)) }
+      var auth = await f.authority.current()
+      for name in names { auth.pathOwners[name] = [f.entity.id] }
+      auth.acknowledgments = [try auth.acknowledgment(by: f.writer, purpose: .delete)]
+      await f.authority.update(auth)
+      let operation = try f.operation(names.map { .trash(path: $0, fingerprint: SharedLibraryOperation.fingerprint(bytes)) })
+      let trash = f.root.deletingLastPathComponent().appendingPathComponent("fixture-trash")
+      try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+      let dispose: @Sendable (URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: trash.appendingPathComponent($0.lastPathComponent)) }
+      let crashed = SharedLibraryMaterializer(root: f.root, receipts: f.receipts, authority: { await f.authority.current() }, trash: dispose,
+        afterMutation: { if $0 == interruptedAt { throw Interrupted.crash } })
+      do { _ = try await crashed.replay(operation); XCTFail("Expected an actual post-trash interruption") } catch Interrupted.crash {}
+      let materializer = SharedLibraryMaterializer(root: f.root, receipts: f.receipts, authority: { await f.authority.current() }, trash: dispose)
+      let previous = try await materializer.progress(entity: f.entity, libraryID: f.library)
+      XCTAssertEqual(previous?.completedSteps, interruptedAt)
+      XCTAssertEqual(previous?.phaseWasAttempted, true)
+      try auth.state.restore(writer: f.writer)
+      try auth.state.assign(field: "notes", value: .text("Reviewed offline edit"), writer: f.writer)
+      try auth.state.delete(writer: f.writer)
+      auth.acknowledgments = []
+      await f.authority.update(auth)
+      let replacement = try SharedLibraryOperation(libraryID: f.library, entity: f.entity, inputRevision: operation.outputRevision,
+        outputRevision: SharedStateFingerprint.of(auth.state), steps: operation.steps)
+      try await materializer.replan(replacement, replacing: operation.id)
+      let pending = try await materializer.progress(entity: f.entity, libraryID: f.library)
+      XCTAssertEqual(pending?.completedSteps, interruptedAt)
+      XCTAssertEqual(pending?.phaseWasAttempted, true, "A reviewed replan must retain durable attempted-trash proof")
+      let waiting = try await materializer.replay(replacement)
+      XCTAssertEqual(waiting, .waitingForAcknowledgments)
+      XCTAssertTrue(FileManager.default.fileExists(atPath: f.root.appendingPathComponent(names.last!).path))
+      auth.acknowledgments = [try auth.acknowledgment(by: f.writer, purpose: .delete)]
+      await f.authority.update(auth)
+      let resumed = try await materializer.replay(replacement)
+      XCTAssertEqual(resumed, .waitingForFile(names[interruptedAt]), "An attempted Trash phase is not proof of completion; retain the established missing-file safety rule")
+      for (index, name) in names.enumerated() {
+        XCTAssertEqual(FileManager.default.fileExists(atPath: f.root.appendingPathComponent(name).path), index > interruptedAt)
+        if index <= interruptedAt { XCTAssertEqual(try Data(contentsOf: trash.appendingPathComponent(name)), bytes) }
+      }
+    }
   }
 
   func testRevisionChangeWhileWaitingForFileLeaseRevokesTrash() async throws {

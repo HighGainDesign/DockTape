@@ -35,7 +35,9 @@ struct SharedLibraryReviewView: View {
                     if let item {
                         VStack(alignment: .leading, spacing: 16) {
                             Text(item.title).font(.headline)
-                            Text("Choose the values to keep. Independent changes have already been combined.")
+                            Text(item.snapshot.state.lifecycle == .deleted
+                                ? "This recording is marked for deletion. Resolve its competing content before cleanup can continue."
+                                : "Choose the values to keep. Independent changes have already been combined.")
                                 .foregroundStyle(.secondary)
                             ForEach(item.visibleFields(selections: selections)) { field in
                                 SharedReviewFieldView(field: field, selection: Binding(

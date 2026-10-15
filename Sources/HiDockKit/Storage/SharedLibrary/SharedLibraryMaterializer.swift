@@ -268,6 +268,86 @@ public actor SharedLibraryMaterializer {
     }
   }
 
+  /// A causally kept recording invalidates an old removal decision. Retire only
+  /// its wholly unstarted local receipt; attempted Trash proof is never erased.
+  func discardSupersededDeletion(_ operation: SharedLibraryOperation) async throws {
+    guard operation.steps.allSatisfy({ if case .trash = $0 { return true }; return false }) else { throw SharedLibraryOperationError.invalidOperation }
+    let current = try await authority()
+    guard current.libraryID == operation.libraryID, current.state.id == operation.entity.id,
+          current.state.kind == operation.entity.kind, current.state.lifecycle == .alive,
+          current.state.conflicts.isEmpty else { throw SharedLibraryOperationError.staleAuthority }
+    let file = receipts.appendingPathComponent(operation.entity.id.uuidString + ".json")
+    let root = self.root, receipts = self.receipts, gate = self.gate
+    let gateItems = try gate?.items(outside: root) ?? []
+    let bindings = current.additionalBindings + (current.binding.map { [$0] } ?? [])
+    for binding in bindings { _ = try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) }
+    try await access.withWrites([.init(file)] + gateItems, reading: [root] + bindings.map(\.file)) { scopes in
+      if let gate { try gate.validate(scopes[1], outside: root) }
+      try Self.checkRoot(root)
+      guard Self.contained(scopes[0].url, in: receipts),
+            scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath(),
+            !current.revisionLease.isRevoked, try current.validateLocalCommit() else { throw SharedLibraryOperationError.staleAuthority }
+      for (binding, read) in zip(bindings, scopes.dropFirst(2 + gateItems.count)) {
+        guard read.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
+              try binding.validate(Data(contentsOf: read.url)) else { throw SharedLibraryOperationError.staleAuthority }
+      }
+      let old = try SharedOperationReceipt.decode(Data(contentsOf: scopes[0].url))
+      guard old.operation == operation, old.completed == 0, !old.attempting else { throw SharedLibraryOperationError.unfinishedOperation }
+      try scopes[0].checkCancellation()
+      try FileManager.default.removeItem(at: scopes[0].url)
+    }
+  }
+
+  /// Accept a peer's current deletion after an interrupted Keep. This changes
+  /// only wholly unstarted local bookkeeping; no original or proof of a prior
+  /// physical phase can be discarded, and no new source hash is invented.
+  func adoptUnstartedDeletion(_ replacement: SharedLibraryOperation, replacing previous: SharedLibraryOperation) async throws {
+    try replacement.validate()
+    guard replacement.libraryID == previous.libraryID, replacement.entity == previous.entity,
+          !replacement.steps.isEmpty, !previous.steps.isEmpty,
+          replacement.steps.allSatisfy({ if case .trash = $0 { return true }; return false }),
+          previous.steps.allSatisfy({ if case .trash = $0 { return true }; return false }),
+          previous.canonicalPaths.isSubset(of: replacement.canonicalPaths),
+          active.insert(replacement.entity.id).inserted else { throw SharedLibraryOperationError.unfinishedOperation }
+    defer { active.remove(replacement.entity.id) }
+    let current = try await authority()
+    let pending = try Self.check(replacement, authority: current)
+    guard current.state.lifecycle == .deleted, current.state.conflicts.isEmpty,
+          pending == nil || pending == .waitingForAcknowledgments || pending == .waitingForActiveWork else { throw SharedLibraryOperationError.staleAuthority }
+    let root = self.root, receipts = self.receipts, gate = self.gate
+    let file = receipts.appendingPathComponent(replacement.entity.id.uuidString + ".json")
+    let gateItems = try gate?.items(outside: root) ?? []
+    let bindings = current.additionalBindings + (current.binding.map { [$0] } ?? [])
+    let sources = replacement.steps.compactMap { step -> (String, String)? in
+      if case .trash(let path, let hash) = step { return (path, hash) }; return nil
+    }
+    let sourceFiles = sources.map { root.appendingPathComponent($0.0) }
+    for binding in bindings { _ = try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) }
+    for source in sourceFiles {
+      guard try await RecordingFileAccess().waitUntilAvailable(at: source) else { throw CocoaError(.fileReadNoSuchFile) }
+    }
+    try await access.withWrites([.init(file)] + gateItems, reading: [root] + bindings.map(\.file) + sourceFiles) { scopes in
+      if let gate { try gate.validate(scopes[1], outside: root) }
+      try Self.checkRoot(root)
+      guard Self.contained(scopes[0].url, in: receipts),
+            scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath(),
+            !current.revisionLease.isRevoked, try current.validateLocalCommit() else { throw SharedLibraryOperationError.staleAuthority }
+      let reads = scopes.dropFirst(2 + gateItems.count)
+      for (binding, scope) in zip(bindings, reads) {
+        guard scope.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
+              try binding.validate(Data(contentsOf: scope.url)) else { throw SharedLibraryOperationError.staleAuthority }
+      }
+      for ((path, hash), scope) in zip(sources, reads.dropFirst(bindings.count)) {
+        guard Self.contained(scope.url, in: root), scope.url.standardizedFileURL == root.appendingPathComponent(path).standardizedFileURL,
+              try Self.hash(scope) == hash else { throw SharedLibraryOperationError.contentChanged(path) }
+      }
+      let old = try SharedOperationReceipt.decode(Data(contentsOf: scopes[0].url))
+      guard old.operation == previous, old.completed == 0, !old.attempting else { throw SharedLibraryOperationError.unfinishedOperation }
+      try scopes[0].checkCancellation()
+      try SharedOperationReceipt(replacement).encoded().write(to: scopes[0].url, options: .atomic)
+    }
+  }
+
   /// Recompute from accepted state plus current physical paths. Replanning
   /// changes metadata only and cannot silently drop a surviving owned file.
   public func replan(_ replacement: SharedLibraryOperation, replacing previousID: UUID) async throws
@@ -278,7 +358,9 @@ public actor SharedLibraryMaterializer {
     }
     defer { active.remove(replacement.entity.id) }
     let current = try await authority()
-    guard try Self.check(replacement, authority: current) == nil else {
+    let pending = try Self.check(replacement, authority: current)
+    let deletion = replacement.steps.allSatisfy { if case .trash = $0 { return true }; return false }
+    guard pending == nil || (deletion && (pending == .waitingForAcknowledgments || pending == .waitingForActiveWork)) else {
       throw SharedLibraryOperationError.invalidOperation
     }
     let file = receipts.appendingPathComponent(replacement.entity.id.uuidString + ".json")
@@ -321,8 +403,14 @@ public actor SharedLibraryMaterializer {
           throw SharedLibraryOperationError.unfinishedOperation
         }
       }
+      let sameDeletion = deletion && old.operation.steps == replacement.steps
+      guard pending == nil || sameDeletion else { throw SharedLibraryOperationError.invalidOperation }
+      var receipt = SharedOperationReceipt(replacement)
+      // Exact deletion steps retain durable partial/attempted progress. Starting
+      // at zero would mistake already-trashed originals for missing cloud data.
+      if sameDeletion { receipt.completed = old.completed; receipt.attempting = old.attempting }
       try scope.checkCancellation()
-      try SharedOperationReceipt(replacement).encoded().write(to: scope.url, options: .atomic)
+      try receipt.encoded().write(to: scope.url, options: .atomic)
     }
   }
 

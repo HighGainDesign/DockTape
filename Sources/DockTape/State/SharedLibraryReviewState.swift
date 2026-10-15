@@ -29,7 +29,10 @@ final class SharedLibraryReviewState {
         let reviewSignature: String
 
         func visibleFields(selections: [String: String]) -> [Field] {
-            fields.filter { field in
+            if snapshot.state.lifecycle == .conflicted {
+                return fields.filter { $0.id == "$lifecycle" }
+            }
+            return fields.filter { field in
                 guard let component = field.component, let generation = field.generation else { return true }
                 let content = fields.first { $0.id == component.rawValue + ".content" }
                 let selected = content.flatMap { row in row.choices.first { $0.id == selections[row.id] } }
@@ -69,12 +72,19 @@ final class SharedLibraryReviewState {
     func apply(item: Item, selections: [String: String], using coordinator: SharedLibraryCoordinator) async -> Bool {
         guard binding === coordinator, !isApplying, !isLoading else { return false }
         let fields = item.visibleFields(selections: selections).filter { !$0.choices.isEmpty }
-        guard !fields.isEmpty, item.snapshot.state.lifecycle == .alive else { return false }
-        var changes: [SharedLibraryMutation] = []
+        let decidingLifecycle = item.snapshot.state.kind == .recording && item.snapshot.state.lifecycle == .conflicted
+        let preservingDeletion = item.snapshot.state.kind == .recording && item.snapshot.state.lifecycle == .deleted
+        guard !fields.isEmpty, item.snapshot.state.lifecycle == .alive || decidingLifecycle || preservingDeletion else { return false }
+        // These mutations are one atomic owner-envelope commit. The temporary
+        // restoration permits reviewed content edits; no alive state is published.
+        var changes: [SharedLibraryMutation] = preservingDeletion ? [.restore] : []
         // Choose content before applying edits scoped to the chosen generation.
         for field in fields.sorted(by: { ($0.generation == nil ? 0 : 1) < ($1.generation == nil ? 0 : 1) }) {
             guard let choice = field.choices.first(where: { $0.id == selections[field.id] && $0.isAvailable }) else { return false }
-            if let component = field.component {
+            if decidingLifecycle {
+                guard field.id == "$lifecycle", case .flag(let keep) = choice.value else { return false }
+                changes.append(keep ? .restore : .delete)
+            } else if let component = field.component {
                 if field.isOlderEdits || field.id == component.rawValue + ".content" {
                     guard case .document(let document) = choice.value else { return false }
                     changes.append(.generation(document, component: component))
@@ -85,6 +95,7 @@ final class SharedLibraryReviewState {
                 }
             } else { changes.append(.assign(field: field.id, value: choice.value)) }
         }
+        if preservingDeletion { changes.append(.delete) }
         let ticket = request
         isApplying = true; message = nil
         let task = Task { [weak self] in
@@ -92,11 +103,25 @@ final class SharedLibraryReviewState {
                 guard try await coordinator.mayEdit() else { throw SharedLibraryCoordinatorError.enrollmentPending }
                 try Task.checkCancellation()
                 guard let self, self.binding === coordinator, self.request == ticket else { return false }
-                _ = try await coordinator.resolve(.init(base: item.snapshot, changes: changes))
+                let accepted = try await coordinator.resolve(.init(base: item.snapshot, changes: changes))
                 var publication: String?
+                if decidingLifecycle || preservingDeletion {
+                    if accepted.state.lifecycle == .deleted {
+                        publication = "Deletion choice saved. Original files remain pending safe cleanup; deletion has not completed."
+                        if accepted.state.conflicts.isEmpty {
+                            do {
+                                let outcome = try await coordinator.prepareReviewedDeletion(accepted)
+                                publication = outcome.result == .complete ? "Deletion completed."
+                                    : "Deletion choice saved. Open Pending Files to review or approve the remaining cleanup."
+                            } catch {
+                                publication = "Deletion choice saved. Cleanup could not be prepared yet; retry after sync finishes. Existing files remain protected."
+                            }
+                        } else { publication = "Deletion choice saved. Competing content still needs recovery review before files can be removed." }
+                    } else { publication = "Recording kept with its edits. Review any remaining changes before continuing pending file operations." }
+                }
                 do { _ = try await coordinator.projectOutputs() }
                 catch SharedProjectionWriteError.untracked(let path) { publication = "Choice saved. " + path + " changed outside DockTape and needs a file review before publishing." }
-                catch { publication = "Choice saved. Readable files could not be updated yet. Reload the review or retry after sync finishes." }
+                catch { publication = (publication.map { $0 + " " } ?? "Choice saved. ") + "Readable files could not be updated yet. Reload the review or retry after sync finishes." }
                 guard self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 await self.refresh(using: coordinator)
                 if let publication { self.message = publication }
@@ -129,9 +154,18 @@ final class SharedLibraryReviewState {
             let generation = parts.count >= 4 && parts[1] == "edits" ? UUID(uuidString: parts[2]) : nil
             let isContent = component != nil && parts.count == 2 && parts[1] == "content"
             let safeScalar = ["prompt", "description"].contains(conflict.field) || conflict.field == "metadata.mode" || (state.kind == .template && conflict.field == "name")
-            let supported = state.lifecycle == .alive && (isContent || generation != nil || safeScalar)
+            let lifecycleChoice = state.kind == .recording && state.lifecycle == .conflicted && conflict.field == "$lifecycle"
+            let editableContent = state.lifecycle == .alive || (state.kind == .recording && state.lifecycle == .deleted)
+            let supported = lifecycleChoice || (editableContent && (isContent || generation != nil || safeScalar))
             let choices = supported ? conflict.values.compactMap { value -> Choice? in
                 if isContent { guard case .document = value else { return nil } }
+                if lifecycleChoice {
+                    guard case .flag(let keep) = value else { return nil }
+                    let label = keep ? "Keep Recording and Edits" : "Delete Recording"
+                    let detail = (keep ? "Keep this recording and the retained edits below. Other competing changes will still need review." : "Hide this recording. Original files remain until safe cleanup is approved by the participating Macs.")
+                        + "\n\n" + lifecyclePreview(state)
+                    return .init(id: identity(value), value: value, label: label, detail: detail, isAvailable: true)
+                }
                 let detail = preview(value, field: conflict.field)
                 let label = isContent ? contentLabel(value, component: component!) : detail
                 let available: Bool
@@ -148,12 +182,13 @@ final class SharedLibraryReviewState {
                 heading = "Action item: " + entry.text
             }
             fields.append(.init(id: conflict.field, title: heading, choices: choices,
-                explanation: supported ? (isContent ? "Edits attached to other versions will be discarded when you choose a version." : nil) : "This file or lifecycle change needs a recovery review.",
+                explanation: lifecycleChoice ? "Choose whether to keep this recording before reviewing any other competing changes. Files are removed only after the participating Macs approve safe cleanup." : supported ? (isContent ? "Edits attached to other versions will be discarded when you choose a version." : nil) : "This file or lifecycle change needs a recovery review.",
                 component: component, generation: generation, isOlderEdits: false))
         }
         for component in [SharedComponent.transcript, .summary] {
             let old = state.conflicts.filter { $0.inactiveGeneration != nil && $0.field.hasPrefix(component.rawValue + ".") }
-            guard !old.isEmpty, let document = state.currentDocument(for: component), state.lifecycle == .alive else { continue }
+            guard !old.isEmpty, let document = state.currentDocument(for: component),
+                  state.lifecycle == .alive || (state.kind == .recording && state.lifecycle == .deleted) else { continue }
             let detail = old.flatMap { $0.values }.map { preview($0, field: component.rawValue) }.sorted().joined(separator: "\n")
             let value = SharedFieldValue.document(document)
             fields.append(.init(id: component.rawValue + ".olderEdits", title: "Edits for an older " + component.rawValue,
@@ -171,6 +206,19 @@ final class SharedLibraryReviewState {
         let signature = SharedLibraryOperation.fingerprint((try? encoder.encode(context)) ?? Data())
         return .init(title: title, snapshot: snapshot, fields: fields, reviewSignature: signature)
     }
+    private static func lifecyclePreview(_ state: SharedEntityState) -> String {
+        var sections: [String] = []
+        for component in [SharedComponent.transcript, .summary] {
+            for document in state.generationValues(for: component).sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+                sections.append(preview(.document(document), field: component.rawValue + ".content"))
+            }
+            for (_, value) in state.generationEdits(for: component).sorted(by: { $0.key < $1.key }) {
+                sections.append((component == .transcript ? "Speaker: " : "Action item: ") + preview(value, field: component.rawValue))
+            }
+        }
+        return sections.isEmpty ? "The recording and its stored edits remain associated with this item." : sections.joined(separator: "\n\n")
+    }
+
     private static func fieldTitle(_ field: String) -> String {
         if field.hasPrefix("transcript.edits.") { return "Speaker name" }
         if field.hasPrefix("summary.edits.") { return "Action item status" }

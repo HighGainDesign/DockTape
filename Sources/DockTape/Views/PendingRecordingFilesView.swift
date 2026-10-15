@@ -8,6 +8,7 @@ struct PendingRecordingFilesView: View {
     @State private var selected: UUID?
     private var model: RecordingFileReviewState { state.sharedLibrary.fileReview }
     private var item: SharedRecordingOperationReview? { model.items.first { $0.id == selected } }
+    private var preparation: RecordingFileReviewState.DeletionPreparation? { model.deletionPreparations.first { $0.id == selected } }
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -19,11 +20,19 @@ struct PendingRecordingFilesView: View {
             }.padding()
             Divider()
             HSplitView {
-                List(model.items, selection: $selected) { row in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(row.title)
-                        Text(status(row)).font(.caption).foregroundStyle(.secondary)
-                    }.tag(row.id)
+                List(selection: $selected) {
+                    ForEach(model.items) { row in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(row.title)
+                            Text(status(row)).font(.caption).foregroundStyle(.secondary)
+                        }.tag(row.id)
+                    }
+                    ForEach(model.deletionPreparations) { row in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(row.title)
+                            Text("Cleanup needs preparation").font(.caption).foregroundStyle(.secondary)
+                        }.tag(row.id)
+                    }
                 }.frame(minWidth: 180, idealWidth: 220, maxWidth: 280)
                 ScrollView {
                     if let item {
@@ -55,12 +64,25 @@ struct PendingRecordingFilesView: View {
                                     .disabled(!item.canResume || model.isWorking)
                                     .accessibilityLabel("Resume file change for " + item.title)
                             }
+                            if model.canKeepForReview(id: item.id) { keepForReviewButton(id: item.id) }
                             if !item.canResume && !item.canAcknowledge && !item.needsReplanning && !item.hasActiveWork && item.waitingForMacs.isEmpty {
                                 Text("Resume this change on the Mac that started it.").foregroundStyle(.secondary)
                             }
                         }.padding().frame(maxWidth: .infinity, alignment: .leading)
+                    } else if let preparation {
+                        VStack(alignment: .leading, spacing: 14) {
+                            Text(preparation.title).font(.headline)
+                            Text("Deletion is saved, but cleanup has not been prepared. Existing files are protected.")
+                            Text("Make the recording and its companion files available, review any external changes, then retry. Participating Macs must approve before removal.").foregroundStyle(.secondary)
+                            Button("Retry Cleanup Preparation") {
+                                guard let coordinator = state.sharedLibrary.coordinator else { return }
+                                Task { if await model.prepareDeletion(preparation, using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
+                            }.disabled(model.isWorking || model.isLoading || state.sharedLibrary.phase != .ready)
+                                .accessibilityLabel("Retry cleanup preparation for " + preparation.title)
+                            keepForReviewButton(id: preparation.id)
+                        }.padding().frame(maxWidth: .infinity, alignment: .leading)
                     } else {
-                        Text(model.isLoading ? "Loading pending files…" : model.inspectionFailed ? "Some file changes could not be inspected" : model.items.isEmpty ? "No pending recording file changes" : "Select a recording to review its file change")
+                        Text(model.isLoading ? "Loading pending files…" : model.inspectionFailed ? "Some file changes could not be inspected" : model.visibleIDs.isEmpty ? "No pending recording file changes" : "Select a recording to review its file change")
                             .foregroundStyle(.secondary).padding(32).frame(maxWidth: .infinity)
                     }
                 }.frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
@@ -72,13 +94,15 @@ struct PendingRecordingFilesView: View {
         .sheet(item: Binding(get: { model.updatedPlan }, set: { if $0 == nil { model.dismissUpdatedPlan() } })) { plan in
             VStack(alignment: .leading, spacing: 16) {
                 Text("Review Updated File Plan").font(.title2)
-                Text("Move the available recording and companion files to the current recording location.")
+                Text(plan.isDeletion ? "Review deletion cleanup for the remaining files. Removal waits for approval from participating Macs." : "Move the available recording and companion files to the current recording location.")
                 Text("Current files").font(.headline)
                 ScrollView { VStack(alignment: .leading, spacing: 6) {
                     ForEach(plan.sources, id: \.self) { Text($0).textSelection(.enabled) }
                 }.frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 180)
-                Text("Destination").font(.headline)
-                Text(plan.destination).textSelection(.enabled)
+                if !plan.isDeletion {
+                    Text("Destination").font(.headline)
+                    Text(plan.destination).textSelection(.enabled)
+                }
                 if let message = model.message { Text(message).foregroundStyle(.secondary) }
                 HStack {
                     Button("Cancel") { model.dismissUpdatedPlan() }.keyboardShortcut(.cancelAction).disabled(model.isWorking)
@@ -94,7 +118,24 @@ struct PendingRecordingFilesView: View {
             }.padding(24).frame(width: 480).interactiveDismissDisabled(model.isWorking)
         }
         .task(id: state.sharedLibrary.revision) { await reload() }
-        .onChange(of: model.items.map(\.id)) { _, ids in if !ids.contains(where: { $0 == selected }) { selected = ids.first } }
+        .onChange(of: model.visibleIDs) { _, ids in if !ids.contains(where: { $0 == selected }) { selected = ids.first } }
+    }
+    private func keepForReviewButton(id: UUID) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("To compare or recover externally changed files, keep the recording first. You can delete it again after review. Files already removed are not restored automatically.")
+                .foregroundStyle(.secondary)
+            Button("Keep Recording and Review Files") {
+                guard let coordinator = state.sharedLibrary.coordinator else { return }
+                Task {
+                    if await model.keepForReview(id: id, using: coordinator), state.sharedLibrary.coordinator === coordinator {
+                        await state.refreshAll()
+                        guard state.sharedLibrary.coordinator === coordinator else { return }
+                        state.sharedLibrary.reviewTab = .externalFiles
+                        state.sharedLibrary.showsReview = true
+                    }
+                }
+            }.disabled(model.isWorking || model.isLoading || state.sharedLibrary.phase != .ready)
+        }
     }
     private func status(_ row: SharedRecordingOperationReview) -> String {
         if row.needsReplanning { return "Needs plan review" }
@@ -105,7 +146,7 @@ struct PendingRecordingFilesView: View {
     private func reload() async {
         guard let coordinator = state.sharedLibrary.coordinator else { model.clear(); return }
         await model.refresh(using: coordinator)
-        if selected == nil { selected = model.items.first?.id }
+        if selected == nil { selected = model.visibleIDs.first }
     }
     private func perform(_ action: RecordingFileReviewState.Action, _ item: SharedRecordingOperationReview) {
         guard let coordinator = state.sharedLibrary.coordinator else { return }

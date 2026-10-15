@@ -346,6 +346,191 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         try await rightStore.setup()
         let rightVisible = await rightStore.allRecordings()
         XCTAssertFalse(rightVisible.contains { $0.filename == "Meeting.mp3" }, "State-first delivery must hide the retained peer original too")
+        try deliverOwner(left, to: right, writer: a.writerID)
+        try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+        let mirroredView = try await b.read(entity)
+        let awaitingDelivery = try await b.reviewRecordingOperation(id: entity.id)
+        XCTAssertNotNil(awaitingDelivery, "Retained peer audio is not completed removal")
+        for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+            let file = right.appendingPathComponent("Meeting" + suffix)
+            if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+        }
+        do { _ = try await b.resumeRecordingOperation(id: entity.id, expectedCohort: "changed cohort"); XCTFail("Mirrored completion must retain exact reviewed cohort") }
+        catch { XCTAssertEqual(error as? SharedLibraryOperationError, .staleAuthority) }
+        let mirrored = try await b.resumeRecordingOperation(id: entity.id)
+        XCTAssertEqual(mirrored.result, .complete)
+        let noPending = try await b.reviewRecordingOperation(id: entity.id)
+        XCTAssertNil(noPending)
+        let receiptFile = parent.appendingPathComponent("local/Operations/" + mirroredView.libraryID.uuidString + "/" + b.writerID.uuidString + "/" + entity.id.uuidString + ".json")
+        var attempted = try SharedOperationReceipt.decode(Data(contentsOf: receiptFile))
+        attempted.attempting = true
+        let attemptedBytes = try attempted.encoded()
+        try attemptedBytes.write(to: receiptFile, options: .atomic)
+        let unproven = try await b.resumeRecordingOperation(id: entity.id)
+        XCTAssertEqual(unproven.result, .waitingForFile("Meeting.mp3"), "Attempted Trash evidence cannot use the untouched-receipt mirror exception")
+        let retainedReview = try await b.reviewRecordingOperation(id: entity.id)
+        XCTAssertNotNil(retainedReview, "Attempted missing original still needs review")
+        XCTAssertEqual(try Data(contentsOf: receiptFile), attemptedBytes, "Mirrored inspection must never discard attempted physical proof")
+    }
+
+    func testKeptDeletionCanApproveNewPeerPlanWithoutRewritingLifecycle() async throws {
+        try await checkKeptPeerDeletion(retireBeforeArrival: true)
+    }
+    func testUnstartedReceiptAfterKeepDoesNotBlockCurrentPeerDeletion() async throws {
+        try await checkKeptPeerDeletion(retireBeforeArrival: false)
+    }
+    private func checkKeptPeerDeletion(retireBeforeArrival: Bool) async throws {
+        let (left, a, _) = try await fixture()
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent); try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let right = parent.appendingPathComponent("library")
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"), trash: { try FileManager.default.removeItem(at: $0) })
+        try await b.requestEnrollment(requestID: UUID(), label: "Peer")
+        for _ in 0..<3 {
+            try deliverOwner(right, to: left, writer: b.writerID); try await a.refresh()
+            try deliverOwner(left, to: right, writer: a.writerID); try await b.refresh()
+        }
+        let first = try await b.deleteSharedRecording(filename: "Meeting.mp3")
+        XCTAssertEqual(first.result, .waitingForAcknowledgments)
+        let kept = try await b.resolve(.init(base: first.view, changes: [.restore]))
+        if retireBeforeArrival {
+            let retired = try await b.reviewRecordingOperation(id: kept.state.id)
+            XCTAssertNil(retired, "Keep retires only the unstarted local receipt")
+        }
+        if retireBeforeArrival { _ = try await b.projectOutputs() }
+        // Deliver the kept projection too. State-only arrival must not permit
+        // deletion of sidecars whose published provenance is still different.
+        for path in ["library.json", "Meeting.transcript.json", "Meeting.summary.json", "Meeting.transcript.md", "Meeting.summary.md", "Meeting.txt"] {
+            try Data(contentsOf: right.appendingPathComponent(path)).write(to: left.appendingPathComponent(path), options: .atomic)
+        }
+        for file in try FileManager.default.contentsOfDirectory(at: right.appendingPathComponent(".docktape/projections"), includingPropertiesForKeys: nil) where file.pathExtension == "json" {
+            try Data(contentsOf: file).write(to: left.appendingPathComponent(".docktape/projections/" + file.lastPathComponent), options: .atomic)
+        }
+        try deliverOwner(right, to: left, writer: b.writerID); try await a.refresh()
+        let second = try await a.deleteSharedRecording(filename: "Meeting.mp3")
+        XCTAssertEqual(second.result, .waitingForAcknowledgments)
+        try deliverOwner(left, to: right, writer: a.writerID); try await b.refresh()
+        let entity = SharedEntityIdentity(id: kept.state.id, kind: .recording)
+        let before = try await b.read(entity)
+        let currentReview = try await b.reviewRecordingOperation(id: kept.state.id)
+        let review = try XCTUnwrap(currentReview)
+        XCTAssertFalse(review.needsReplanning, "A stale own intent cannot hide the exact current peer plan")
+        XCTAssertTrue(review.canAcknowledge, "The peer must approve without publishing another deletion")
+        guard review.canAcknowledge else { return }
+        try await b.acknowledgeReviewedRecordingOperation(review)
+        let reused = try await b.deleteSharedRecording(filename: "Meeting.mp3")
+        XCTAssertEqual(reused.result, .complete)
+        let after = try await b.read(entity)
+        XCTAssertEqual(after.state, before.state, "Reusing accepted deletion does not rewrite lifecycle or either intent")
+        try deliverOwner(right, to: left, writer: b.writerID)
+        if retireBeforeArrival {
+            do { _ = try await a.resumeRecordingOperation(id: entity.id); XCTFail("A newer registry arriving before library.json must wait for its matching projection") }
+            catch SharedProjectionWriteError.untracked(let path) { XCTAssertEqual(path, "library.json") }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: left.appendingPathComponent("Meeting.mp3").path), "Out-of-order projection delivery preserves the original")
+        }
+        try Data(contentsOf: right.appendingPathComponent("library.json")).write(to: left.appendingPathComponent("library.json"), options: .atomic)
+        let finished = try await a.resumeRecordingOperation(id: entity.id)
+        XCTAssertEqual(finished.result, .complete, "Peer acknowledgment remains valid for the initiating plan")
+    }
+
+    func testResolvedDeleteCanReviewAndReplanStaleCleanupAfterOfflineEdit() async throws {
+        try await checkResolvedLifecycleCleanup(keep: false)
+    }
+    func testKeepAfterPendingDeletionCanPublishAndUseTheRetainedRecording() async throws {
+        try await checkResolvedLifecycleCleanup(keep: true)
+    }
+    func testResolvedDeletionReplanSurvivesLossOfLocalReceipts() async throws {
+        try await checkResolvedLifecycleCleanup(keep: false, restart: true)
+    }
+    private func checkResolvedLifecycleCleanup(keep: Bool, restart: Bool = false) async throws {
+        let (left, a, _) = try await fixture()
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent); try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let right = parent.appendingPathComponent("library")
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Offline peer")
+        for _ in 0..<3 {
+            try deliverOwner(right, to: left, writer: b.writerID); try await a.refresh()
+            try deliverOwner(left, to: right, writer: a.writerID); try await b.refresh()
+        }
+        let original = try await b.recording(at: "Meeting.mp3")
+        let pending = try await a.deleteSharedRecording(filename: "Meeting.mp3")
+        XCTAssertEqual(pending.result, .waitingForAcknowledgments)
+        _ = try await b.edit(.init(base: original, changes: [.assign(field: "metadata.mode", value: .text("\"Pho\""))]))
+        try deliverOwner(right, to: left, writer: b.writerID)
+        let entity = SharedEntityIdentity(id: original.state.id, kind: .recording)
+        let conflicted = try await a.read(entity)
+        XCTAssertEqual(conflicted.state.lifecycle, .conflicted)
+        if keep {
+            _ = try await a.resolve(.init(base: conflicted, changes: [.restore]))
+            _ = try await a.projectOutputs()
+            let store = RecordingStore(baseDirectory: left, shared: SharedRecordingMetadataAdapter(coordinator: a))
+            try await store.setup()
+            let rows = await store.allRecordings()
+            XCTAssertEqual(rows.map(\.filename), ["Meeting.mp3"])
+            let job = try await a.pinJob(entity)
+            await a.finishJob(job)
+            XCTAssertEqual(try Data(contentsOf: left.appendingPathComponent("Meeting.mp3")), Data("single synthetic original".utf8))
+            let resumed = try await a.resumeRecordingOperation(id: entity.id)
+            XCTAssertEqual(resumed.result, .needsReplanning, "Old delete may never remove a kept recording")
+            let moved = try await a.relocateRecording(filename: "Meeting.mp3", title: "Kept recording")
+            XCTAssertEqual(moved.result, .complete, "Keeping a recording must allow a later independent file operation")
+            return
+        }
+        _ = try await a.resolve(.init(base: conflicted, changes: [.delete]))
+        if restart {
+            let receipt = left.deletingLastPathComponent().appendingPathComponent("local/Operations/" + conflicted.libraryID.uuidString + "/" + a.writerID.uuidString + "/" + entity.id.uuidString + ".json")
+            try FileManager.default.removeItem(at: receipt)
+        }
+        let owner = restart ? SharedLibraryCoordinator(root: left, writerID: a.writerID,
+            witnessDirectory: left.deletingLastPathComponent().appendingPathComponent("local"), trash: { try FileManager.default.removeItem(at: $0) }) : a
+        let reviewed = try await owner.reviewRecordingOperation(id: entity.id)
+        let review = try XCTUnwrap(reviewed)
+        XCTAssertTrue(review.canReplan, "Confirmed deletion needs an actionable new cleanup plan after its old lifecycle receipt becomes stale")
+        guard review.canReplan else { return }
+        let originalAudio = try Data(contentsOf: left.appendingPathComponent("Meeting.mp3"))
+        if restart {
+            let held = parent.appendingPathComponent("held-synthetic.mp3")
+            try FileManager.default.moveItem(at: left.appendingPathComponent("Meeting.mp3"), to: held)
+            do { _ = try await owner.prepareRecordingReplan(review); XCTFail("Missing audio without a local receipt is not completed deletion") }
+            catch { XCTAssertTrue(FileManager.default.fileExists(atPath: held.path)) }
+            try FileManager.default.moveItem(at: held, to: left.appendingPathComponent("Meeting.mp3"))
+        }
+        let plan = try await owner.prepareRecordingReplan(review)
+        if restart {
+            let changedAudio = originalAudio + Data("changed after review".utf8)
+            try changedAudio.write(to: left.appendingPathComponent("Meeting.mp3"))
+            do { _ = try await owner.applyRecordingReplan(plan); XCTFail("Changed bytes after review must refuse the plan") }
+            catch { XCTAssertEqual(try Data(contentsOf: left.appendingPathComponent("Meeting.mp3")), changedAudio) }
+            try originalAudio.write(to: left.appendingPathComponent("Meeting.mp3"))
+        }
+        let accepted = try await owner.applyRecordingReplan(plan)
+        XCTAssertEqual(accepted.result, .waitingForAcknowledgments, "Accepting an updated cleanup plan must not require the offline peer's old approval")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: left.appendingPathComponent("Meeting.mp3").path))
+        try deliverOwner(left, to: right, writer: a.writerID); try await b.refresh()
+        try await b.acknowledgeOperation(entity: entity, purpose: .delete)
+        try deliverOwner(right, to: left, writer: b.writerID)
+        let completed = try await owner.resumeRecordingOperation(id: entity.id)
+        XCTAssertEqual(completed.result, .complete)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: left.appendingPathComponent("Meeting.mp3").path))
+    }
+
+    func testAlreadyDeletedWithoutRecipePublishesDurableCleanupIntent() async throws {
+        let (root, a, _) = try await fixture()
+        let original = try await a.recording(at: "Meeting.mp3")
+        let entity = SharedEntityIdentity(id: original.state.id, kind: .recording)
+        let lease = try await a.pinJob(entity)
+        let selected = try await a.resolve(.init(base: original, changes: [.delete]))
+        let outcome = try await a.prepareReviewedDeletion(selected)
+        XCTAssertEqual(outcome.result, .waitingForAcknowledgments, "An active lease prevents the initiating Mac from acknowledging removal")
+        let restart = SharedLibraryCoordinator(root: root, writerID: a.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("restart-local"))
+        let pending = try await restart.reviewRecordingOperation(id: entity.id)
+        XCTAssertNotNil(pending, "A confirmed delete must publish its cleanup intent, not leave the only recipe in a local receipt")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path))
+        await a.finishJob(lease)
     }
 
     func testResumingCompletedRenameIsIdempotentAfterNewProjectionReleasedOldPath() async throws {

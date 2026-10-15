@@ -5,12 +5,20 @@ import HiDockKit
 
 @Observable @MainActor final class RecordingFileReviewState {
     enum Action { case resume, acknowledge }
+    struct DeletionPreparation: Identifiable {
+        var id: UUID { snapshot.state.id }
+        let title: String
+        let snapshot: SharedLibraryViewSnapshot
+    }
+    private(set) var deletionPreparations: [DeletionPreparation] = []
+    var visibleIDs: [UUID] { items.map(\.id) + deletionPreparations.map(\.id) }
     private(set) var items: [SharedRecordingOperationReview] = []
     private(set) var isLoading = false
     private(set) var isWorking = false
     private(set) var inspectionFailed = false
     private(set) var message: String?
     private(set) var updatedPlan: SharedRecordingReplanReview?
+    private var deletionSnapshots: [UUID: SharedLibraryViewSnapshot] = [:]
     private var binding: SharedLibraryCoordinator?
     private var request = UUID()
     private var action: Task<Bool, Never>?
@@ -18,7 +26,7 @@ import HiDockKit
 
     func clear() {
         request = UUID(); workID = UUID(); action?.cancel(); action = nil
-        binding = nil; items = []; message = nil; updatedPlan = nil; isLoading = false; isWorking = false; inspectionFailed = false
+        binding = nil; items = []; deletionPreparations = []; deletionSnapshots = [:]; message = nil; updatedPlan = nil; isLoading = false; isWorking = false; inspectionFailed = false
     }
     func refresh(using coordinator: SharedLibraryCoordinator) async {
         if binding !== coordinator { clear(); binding = coordinator }
@@ -26,20 +34,88 @@ import HiDockKit
         defer { if request == ticket { isLoading = false } }
         do {
             let views = try await coordinator.snapshots(kinds: [.recording])
-            var rows: [SharedRecordingOperationReview] = [], failures = 0
-            for view in views where view.state.fields.keys.contains(where: { $0.hasPrefix("materialization.") }) {
+            var rows: [SharedRecordingOperationReview] = [], preparations: [DeletionPreparation] = [], failures = 0
+            for view in views {
                 try Task.checkCancellation()
-                do { if let row = try await coordinator.reviewRecordingOperation(id: view.state.id) { rows.append(row) } }
-                catch is CancellationError { throw CancellationError() }
-                catch { failures += 1 }
+                if view.state.fields.keys.contains(where: { $0.hasPrefix("materialization.") }) {
+                    do { if let row = try await coordinator.reviewRecordingOperation(id: view.state.id) { rows.append(row) } }
+                    catch is CancellationError { throw CancellationError() }
+                    catch { failures += 1 }
+                }
+                let hasRecipe = view.state.fields.contains { field, register in
+                    guard field.hasPrefix("materialization.files.") else { return false }
+                    if case .document? = register.resolvedValue { return true }; return false
+                }
+                if view.state.lifecycle == .deleted, view.state.conflicts.isEmpty, !hasRecipe,
+                   !rows.contains(where: { $0.id == view.state.id }) {
+                    let name: String
+                    if case .text(let title)? = view.state.value(for: "title") { name = title } else { name = "Recording" }
+                    preparations.append(.init(title: name, snapshot: view))
+                }
             }
             guard request == ticket, binding === coordinator, !Task.isCancelled else { return }
             items = rows.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+            deletionPreparations = preparations.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+            let visible = Set(visibleIDs)
+            deletionSnapshots = Dictionary(uniqueKeysWithValues: views.filter {
+                visible.contains($0.state.id) && $0.state.lifecycle == .deleted && $0.state.conflicts.isEmpty
+            }.map { ($0.state.id, $0) })
             if failures > 0 { inspectionFailed = true; message = "Some pending file changes could not be inspected. Reload after sync finishes or join this library before continuing." }
         } catch {
             if request == ticket, binding === coordinator, !(error is CancellationError) { inspectionFailed = true; message = "Pending file changes could not be loaded. Reload after the library is available." }
         }
     }
+    @discardableResult func prepareDeletion(_ candidate: DeletionPreparation, using coordinator: SharedLibraryCoordinator) async -> Bool {
+        guard binding === coordinator, !isLoading, !isWorking else { return false }
+        let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
+        let task = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                let outcome = try await coordinator.prepareReviewedDeletion(candidate.snapshot)
+                guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
+                await self.refresh(using: coordinator)
+                self.message = outcome.result == .complete ? "Deletion completed." : "Cleanup prepared. Review the remaining file changes and participating Mac approvals."
+                return true
+            } catch {
+                guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return false }
+                await self.refresh(using: coordinator)
+                self.message = "Cleanup could not be prepared. Reload or retry after the recording and its companion files are available and any changed files have been reviewed."
+                return false
+            }
+        }
+        action = task
+        let result = await task.value
+        if binding === coordinator, workID == work { isWorking = false; action = nil }
+        return result
+    }
+
+    func canKeepForReview(id: UUID) -> Bool { visibleIDs.contains(id) && deletionSnapshots[id] != nil }
+
+    @discardableResult func keepForReview(id: UUID, using coordinator: SharedLibraryCoordinator) async -> Bool {
+        guard binding === coordinator, !isLoading, !isWorking, visibleIDs.contains(id),
+              let snapshot = deletionSnapshots[id] else { return false }
+        let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
+        let task = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                _ = try await coordinator.resolve(.init(base: snapshot, changes: [.restore]))
+                guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
+                await self.refresh(using: coordinator)
+                self.message = "Recording kept. Review its external files before deleting again. Files already removed are not restored automatically."
+                return true
+            } catch {
+                guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return false }
+                await self.refresh(using: coordinator)
+                self.message = "The recording or library changed. Reload before keeping it for file review."
+                return false
+            }
+        }
+        action = task
+        let result = await task.value
+        if binding === coordinator, workID == work { isWorking = false; action = nil }
+        return result
+    }
+
     func dismissUpdatedPlan() {
         guard !isWorking else { return }
         updatedPlan = nil

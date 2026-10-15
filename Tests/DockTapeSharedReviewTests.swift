@@ -225,6 +225,138 @@ import HiDockKit
         pendingModel.clear()
         print("Actual independent publication passed: resident transcript JSON/Markdown/TXT recovery finishes with unrelated recording/same-recording summary held and accepted A rename pending.")
     }
+    @MainActor static func unpreparedDeletionChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("Synthetic pending cleanup audio".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+        try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Pending preparation")]), mp3Filename: "Meeting.mp3")
+        let a = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"), trash: { try FileManager.default.removeItem(at: $0) })
+        _ = try await a.enable(); _ = try await a.projectOutputs()
+        let original = try await a.recording(at: "Meeting.mp3")
+        let deleted = try await a.resolve(.init(base: original, changes: [.delete]))
+        let file = root.appendingPathComponent("Meeting.transcript.json")
+        let canonical = try Data(contentsOf: file)
+        var changed = try JSONSerialization.jsonObject(with: canonical) as! [String: Any]
+        var segments = changed["segments"] as! [[String: Any]]
+        segments[0]["text"] = "Unreviewed replacement content"; changed["segments"] = segments
+        try JSONSerialization.data(withJSONObject: changed).write(to: file)
+        do { _ = try await a.prepareReviewedDeletion(deleted); throw Failure(message: "Unreviewed changed sidecar must prevent cleanup preparation") }
+        catch let failure as Failure { throw failure }
+        catch {}
+        try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path), "Failed preparation must preserve the synthetic original")
+        let model = RecordingFileReviewState()
+        await model.refresh(using: a)
+        guard let candidate = model.deletionPreparations.first(where: { $0.id == original.state.id }) else { throw Failure(message: "A semantic delete without a recipe needs a native Retry Cleanup Preparation action") }
+        try expect(!(await model.prepareDeletion(candidate, using: a)) && !model.deletionPreparations.isEmpty, "Failed retry must leave its preparation action available")
+        try expect(!(await model.keepForReview(id: UUID(), using: a)), "An undisplayed identity cannot withdraw deletion")
+        _ = try await a.resolve(.init(base: try await a.recording(at: "Meeting.mp3"), changes: [.restore, .assign(field: "metadata.mode", value: .text("\"Pho\"")), .delete]))
+        try expect(!(await model.keepForReview(id: candidate.id, using: a)), "Changed semantic state must reject stale Keep consent")
+        try expect(try await a.recording(at: "Meeting.mp3").state.lifecycle == .deleted, "Rejected stale Keep cannot restore the recording")
+        try expect(await model.keepForReview(id: candidate.id, using: a), "Explicit Keep must withdraw deletion before external-file comparison")
+        let kept = try await a.recording(at: "Meeting.mp3")
+        try expect(kept.state.lifecycle == .alive, "Keep for review must restore the exact identity")
+        let external = ExternalSidecarReviewState()
+        await external.refresh(using: a)
+        guard let row = external.items.first(where: { $0.review?.filename == "Meeting.mp3" }) else { throw Failure(message: "Kept recording must offer the actual external-file comparison") }
+        try expect(await external.apply(row, useChangedFile: false, using: a), "Native Restore Current must repair the sidecar without fixture writes")
+        try expect(external.message == "Current content restored.", "Native recovery must finish publication")
+        let repaired = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+        try expect((repaired["segments"] as? [[String: Any]])?.first?["text"] as? String == "Pending preparation", "Explicit recovery restores current transcript")
+        let deleteAgain = try await a.resolve(.init(base: try await a.recording(at: "Meeting.mp3"), changes: [.delete]))
+        await model.refresh(using: a)
+        guard let next = model.deletionPreparations.first(where: { $0.id == deleteAgain.state.id }) else { throw Failure(message: "Deletion after native recovery must remain preparable") }
+        try expect(await model.prepareDeletion(next, using: a), "Retry must finish deletion after native file recovery")
+        try expect(model.deletionPreparations.isEmpty && model.items.isEmpty, "Completed deletion must not leave a false retry candidate")
+        try expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path), "Explicit retry may finish safe synthetic cleanup")
+        print("Actual unprepared deletion passed: retry, explicit Keep, native external-file restoration and deletion again complete without fixture repair writes.")
+    }
+
+    @MainActor static func lifecycleReviewChecks(parent: URL) async throws {
+        for keep in [true, false] { try await lifecycleReviewCase(parent: parent.appendingPathComponent(keep ? "keep" : "delete"), keep: keep) }
+        try await lifecycleReviewCase(parent: parent.appendingPathComponent("delete-with-content"), keep: false, competing: true)
+        print("Actual lifecycle choices passed: Keep/Delete preserve edits and files, stale decisions refuse, replicas converge, deleted content remains reviewable.")
+    }
+    @MainActor static func lifecycleReviewCase(parent: URL, keep: Bool, competing: Bool = false) async throws {
+        let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right")
+        try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
+        let audio = Data("Synthetic lifecycle original".utf8)
+        try audio.write(to: left.appendingPathComponent("Meeting.mp3"))
+        try await TranscriptStore(baseDirectory: left).save(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture", hasSpeakerLabels: true,
+            segments: [.init(startTime: 0, endTime: 1, text: "Retain offline edits", speakerID: "s")]), mp3Filename: "Meeting.mp3")
+        let a = SharedLibraryCoordinator(root: left, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("a-local"))
+        _ = try await a.enable(); _ = try await a.projectOutputs()
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("b-local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Offline editing Mac")
+        for _ in 0..<3 {
+            try deliver(right, to: left, writer: b.writerID); try await a.refresh()
+            try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+        }
+        try expect(try await b.mayEdit(), "Lifecycle peer must enroll before offline edits")
+        let baseA = try await a.recording(at: "Meeting.mp3"), baseB = try await b.recording(at: "Meeting.mp3")
+        guard let document = baseB.state.currentDocument(for: .transcript) else { throw Failure(message: "Missing lifecycle transcript") }
+        if competing {
+            let encoder = JSONEncoder()
+            let first = try SharedDocument(id: UUID(), json: encoder.encode(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "A", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: "Retained version A")])))
+            let second = try SharedDocument(id: UUID(), json: encoder.encode(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "B", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: "Retained version B")])))
+            let replaced = try await a.edit(.init(base: baseA, changes: [.generation(first, component: .transcript)]))
+            _ = try await a.edit(.init(base: replaced, changes: [.delete]))
+            _ = try await b.edit(.init(base: baseB, changes: [.generation(second, component: .transcript)]))
+            try deliver(right, to: left, writer: b.writerID)
+            let model = SharedLibraryReviewState(); await model.refresh(using: a)
+            guard let item = model.items.first(where: { $0.id == baseA.state.id }), let field = item.fields.first(where: { $0.id == "$lifecycle" }),
+                  let remove = field.choices.first(where: { $0.value == .flag(false) }) else { throw Failure(message: "Missing mixed lifecycle decision") }
+            try expect(await model.apply(item: item, selections: [field.id: remove.id], using: a), "Mixed conflict must accept explicit deletion while preserving competing content")
+            guard let contentItem = model.items.first(where: { $0.id == item.id }), let versions = contentItem.fields.first(where: { $0.id == "transcript.content" }),
+                  let keepVersion = versions.choices.first(where: { $0.value == .document(second) }) else { throw Failure(message: "A deleted recording must keep its competing content actionable before cleanup") }
+            try expect(await model.apply(item: contentItem, selections: [versions.id: keepVersion.id], using: a), "Content review must resolve without restoring the deleted recording")
+            let accepted = try await a.read(.init(id: item.id, kind: .recording))
+            try expect(accepted.state.lifecycle == .deleted && accepted.state.currentDocument(for: .transcript)?.id == second.id && accepted.state.conflicts.isEmpty, "Review must retain the selected content and the user's deletion decision")
+            let pending = RecordingFileReviewState(); await pending.refresh(using: a)
+            try expect(pending.items.contains(where: { $0.id == item.id && $0.purpose == .delete }), "Resolved deleted content must have safe cleanup available")
+            try expect(try Data(contentsOf: left.appendingPathComponent("Meeting.mp3")) == audio, "Offline peer still vetoes physical cleanup")
+            return
+        }
+        _ = try await a.edit(.init(base: baseA, changes: [.delete]))
+        _ = try await b.edit(.init(base: baseB, changes: [.generationEdit(component: .transcript, generation: document.id, key: "s", value: .text("Offline Alice"))]))
+        try deliver(right, to: left, writer: b.writerID)
+        let model = SharedLibraryReviewState()
+        await model.refresh(using: a)
+        guard let item = model.items.first(where: { $0.id == baseA.state.id }), let lifecycle = item.fields.first(where: { $0.id == "$lifecycle" }) else { throw Failure(message: "Missing actual delete-versus-edit review") }
+        try expect(Set(lifecycle.choices.map(\.value)) == [.flag(true), .flag(false)], "Actual lifecycle review must offer Keep Recording and Delete Recording decisions")
+        guard let choice = lifecycle.choices.first(where: { $0.value == .flag(keep) }) else { throw Failure(message: "Missing lifecycle decision") }
+        try expect(choice.detail.contains("Offline Alice") && choice.detail.contains("Retain offline edits"), "Lifecycle decisions must show the retained offline content and speaker edit")
+        let newerB = try await b.read(.init(id: baseB.state.id, kind: .recording))
+        _ = try await b.edit(.init(base: newerB, changes: [.generationEdit(component: .transcript, generation: document.id, key: "s", value: .text("Latest Alice"))]))
+        try deliver(right, to: left, writer: b.writerID)
+        try expect(!(await model.apply(item: item, selections: [lifecycle.id: choice.id], using: a)), "A lifecycle decision must refuse an edit received after review")
+        try expect(model.message?.contains("changed during review") == true, "Stale lifecycle consent must explain reloading")
+        await model.refresh(using: a)
+        guard let fresh = model.items.first(where: { $0.id == item.id }), let field = fresh.fields.first(where: { $0.id == "$lifecycle" }), let current = field.choices.first(where: { $0.value == .flag(keep) }) else { throw Failure(message: "Missing fresh lifecycle decision") }
+        try expect(fresh.reviewSignature != item.reviewSignature, "Refreshing lifecycle review after a new speaker edit must clear the native Keep/Delete selection")
+        try expect(await model.apply(item: fresh, selections: [field.id: current.id], using: a), "Reviewed lifecycle decision must commit")
+        let resolved = try await a.read(.init(id: item.id, kind: .recording))
+        try expect(resolved.state.lifecycle == (keep ? .alive : .deleted), "Explicit Keep/Delete must resolve only the lifecycle")
+        try expect(resolved.state.generationEdits(for: .transcript)["s"] == .text("Latest Alice"), "Lifecycle decision must retain the offline edit")
+        try expect(try Data(contentsOf: left.appendingPathComponent("Meeting.mp3")) == audio, "Lifecycle decision must not remove or rewrite the original")
+        try expect(model.message != nil, "Logical lifecycle acceptance must explain remaining physical work")
+        if !keep {
+            let pending = RecordingFileReviewState()
+            await pending.refresh(using: a)
+            try expect(pending.items.contains { $0.id == item.id && $0.purpose == .delete && !$0.waitingForMacs.isEmpty }, "Confirmed deletion must have a visible durable pending cleanup, not just a hidden semantic flag")
+        }
+        try deliver(left, to: right, writer: a.writerID)
+        let peer = try await b.read(.init(id: item.id, kind: .recording))
+        try expect(peer.state.lifecycle == resolved.state.lifecycle, "Peer must converge on the explicit decision")
+        try deliver(right, to: left, writer: b.writerID)
+        try expect(try await a.read(.init(id: item.id, kind: .recording)).state.lifecycle == resolved.state.lifecycle, "Old deletion/edit delivery must not undo the decision")
+        model.clear()
+        try expect(!(await model.apply(item: fresh, selections: [field.id: current.id], using: a)), "Cleared context cannot reuse lifecycle consent")
+    }
+
     @MainActor static func run() async throws {
         _ = NSApplication.shared
         let arguments = CommandLine.arguments
@@ -240,6 +372,9 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
+        try await lifecycleReviewChecks(parent: parent.appendingPathComponent("lifecycle"))
+        try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared"))
         try await externalReviewChecks(parent: parent)
         let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right")
         try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
@@ -500,8 +635,21 @@ import HiDockKit
         await peerFiles.refresh(using: peer)
         try expect(peerFiles.items.count == 1 && FileManager.default.fileExists(atPath: peerRoot.appendingPathComponent("Recovered.mp3").path), "Metadata arrival alone cannot claim local deletion completed")
         try FileManager.default.removeItem(at: peerRoot.appendingPathComponent("Recovered.mp3")) // Simulated late provider removal, disposable data only.
+        let lateCompanion = peerRoot.appendingPathComponent("Recovered.summary.md")
+        let lateBytes = Data("late provider companion, not approved for removal".utf8)
+        try lateBytes.write(to: lateCompanion)
+        await peerFiles.refresh(using: peer)
+        try expect(peerFiles.items.count == 1 && (try Data(contentsOf: lateCompanion)) == lateBytes, "A late unplanned companion keeps cleanup visible and unchanged")
+        try FileManager.default.removeItem(at: lateCompanion)
+        let latePlaceholder = peerRoot.appendingPathComponent(".Recovered.summary.md.icloud")
+        try Data().write(to: latePlaceholder)
+        await peerFiles.refresh(using: peer)
+        try expect(peerFiles.items.count == 1, "A late companion placeholder cannot be mistaken for completed removal")
+        try FileManager.default.removeItem(at: latePlaceholder)
         await peerFiles.refresh(using: peer)
         try expect(peerFiles.items.isEmpty, "Exact acknowledged absence clears the mirrored pending row")
+        let mirrored = try await peer.resumeRecordingOperation(id: try await peer.snapshots(kinds: [.recording])[0].state.id)
+        try expect(mirrored.result == .complete, "Exact mirrored completion must also be resumable without claiming local Trash work")
         let peerViews = try await peer.snapshots(kinds: [.recording])
         guard let peerRecording = peerViews.first else { throw Failure(message: "Missing peer fixture") }
         let brokenHead = peerRoot.appendingPathComponent(".docktape/records/" + peerRecording.state.id.uuidString.lowercased() + "/" + recovery.writerID.uuidString.lowercased() + ".json")
