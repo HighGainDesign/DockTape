@@ -2,6 +2,14 @@
 
 import Foundation
 
+/// Immutable baseline for one visible editor draft. A background store reload
+/// cannot change what the user reviewed, and a different store cannot use it.
+public struct TemplateEditContext: Sendable {
+    public let template: Template
+    let storeID: UUID
+    let snapshot: SharedLibraryViewSnapshot?
+}
+
 /// Actor that manages built-in and user-created summary templates.
 /// Built-in templates can be overridden (prompt text customized) but not deleted.
 /// User-created templates can be added, edited, and deleted.
@@ -13,6 +21,7 @@ public actor TemplateStore {
     private var userTemplates: [Template] = []
     private let baseDirectory: URL
     private let shared: SharedTemplateAdapter?
+    private let storeID = UUID()
 
     // MARK: - Init
 
@@ -178,6 +187,57 @@ public actor TemplateStore {
         try await mutateTemplate(template, adding: false)
     }
 
+    public func beginEditing(id: String, refreshing: Bool = false) async throws -> TemplateEditContext {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            let snapshot = try await shared.editingSnapshot(id: id, refreshing: refreshing)
+            let template: Template
+            if snapshot.state.lifecycle == .uninitialized,
+               let original = Self.builtInDefaults.first(where: { $0.id == id }) { template = original }
+            else {
+                guard snapshot.state.lifecycle == .alive else { throw SharedSidecarError.conflictedContent }
+                template = try SharedTemplateAdapter.render(snapshot)
+            }
+            return .init(template: template, storeID: storeID, snapshot: snapshot)
+        }
+        if refreshing { try await load() }
+        guard let template = template(forID: id) else { throw SharedSidecarError.reloadRequired }
+        return .init(template: template, storeID: storeID, snapshot: nil)
+    }
+
+    /// Save only the fields changed from the editor's captured baseline.
+    /// Return the accepted baseline atomically, never a later mutable cache.
+    @discardableResult
+    public func update(_ template: Template, basedOn context: TemplateEditContext) async throws -> TemplateEditContext {
+        guard context.storeID == storeID, template.id == context.template.id,
+              template.isBuiltIn == context.template.isBuiltIn else { throw SharedLibraryCoordinatorError.differentBinding }
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            guard let snapshot = context.snapshot else { throw SharedLibraryCoordinatorError.differentBinding }
+            persistenceTicket += 1
+            let accepted = try await shared.saveDraft(template, before: context.template, base: snapshot)
+            cacheAccepted(accepted.template)
+            return .init(template: accepted.template, storeID: storeID, snapshot: accepted.snapshot)
+        }
+        guard context.snapshot == nil else { throw SharedLibraryCoordinatorError.differentBinding }
+        try await mutateTemplate(template, adding: false, baseline: context.template)
+        guard let accepted = self.template(forID: template.id) else { throw SharedSidecarError.reloadRequired }
+        return .init(template: accepted, storeID: storeID, snapshot: nil)
+    }
+
+    public func delete(id: String, basedOn context: TemplateEditContext) async throws {
+        guard context.storeID == storeID, context.template.id == id, !context.template.isBuiltIn else {
+            throw SharedLibraryCoordinatorError.differentBinding
+        }
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            guard let snapshot = context.snapshot else { throw SharedLibraryCoordinatorError.differentBinding }
+            persistenceTicket += 1
+            try await shared.deleteDraft(id: id, base: snapshot)
+            userTemplates.removeAll { $0.id == id }
+        } else { try await delete(id: id) }
+    }
+
     public func delete(id: String) async throws {
         if let shared {
             try shared.requireRoot(baseDirectory)
@@ -192,6 +252,24 @@ public actor TemplateStore {
             values.removeAll { $0["id"] as? String == id }
             object["userTemplates"] = values
         }
+    }
+
+    @discardableResult
+    public func resetToDefault(id: String, basedOn context: TemplateEditContext) async throws -> TemplateEditContext {
+        guard context.storeID == storeID, context.template.id == id, context.template.isBuiltIn else {
+            throw SharedLibraryCoordinatorError.differentBinding
+        }
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            guard let snapshot = context.snapshot else { throw SharedLibraryCoordinatorError.differentBinding }
+            persistenceTicket += 1
+            let accepted = try await shared.resetDraft(id: id, base: snapshot)
+            cacheAccepted(accepted.template)
+            return .init(template: accepted.template, storeID: storeID, snapshot: accepted.snapshot)
+        }
+        try await resetToDefault(id: id)
+        guard let original = Self.builtInDefaults.first(where: { $0.id == id }) else { throw SharedSidecarError.invalidContent }
+        return .init(template: original, storeID: storeID, snapshot: nil)
     }
 
     public func resetToDefault(id: String) async throws {
@@ -216,9 +294,9 @@ public actor TemplateStore {
         else { userTemplates.append(template) }
     }
 
-    private func mutateTemplate(_ template: Template, adding: Bool) async throws {
+    private func mutateTemplate(_ template: Template, adding: Bool, baseline captured: Template? = nil) async throws {
         let bytes = try JSONEncoder().encode(template)
-        let baseline = try self.template(forID: template.id).map { try JSONEncoder().encode($0) }
+        let baseline = try (captured ?? self.template(forID: template.id)).map { try JSONEncoder().encode($0) }
         let collection = template.isBuiltIn ? "builtInOverrides" : "userTemplates"
         try await mutateStored { object in
             let desired = try JSONSerialization.jsonObject(with: bytes) as! [String: Any]

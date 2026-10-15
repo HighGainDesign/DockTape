@@ -62,6 +62,7 @@ final class AppState {
     var device: DeviceState
     var playback: PlaybackState
     var transcription: TranscriptionState
+    let templateEditor = TemplateEditingState()
     var summarization: SummarizationState
     var templateStore: TemplateStore
     var sharedLibrary: SharedLibraryState

@@ -3,6 +3,16 @@ import AppKit
 import HiDockKit
 
 @main struct DockTapeSharedReviewTests {
+    actor SavePause {
+        private(set) var entered = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        func pauseOnce() async {
+            guard !entered else { return }
+            entered = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+        func release() { continuation?.resume(); continuation = nil }
+    }
     struct Failure: Error { let message: String }
     static func expect(_ condition: Bool, _ message: String) throws { if !condition { throw Failure(message: message) } }
     static func deliver(_ source: URL, to destination: URL, writer: UUID) throws {
@@ -167,6 +177,80 @@ import HiDockKit
         try expect(await model.apply(item: templateItem, selections: [prompt.id: selectedPrompt.id], using: a), "Template review must persist")
         try await templates.load()
         try expect(await templates.template(forID: "review-template")?.promptText == "Prompt B", "Actual template adapter must reload the reviewed prompt")
+        // Settings drafts retain the exact displayed context through refresh.
+        let editor = TemplateEditingState()
+        await editor.select(id: "review-template", using: templates)
+        editor.change { $0.name = "Unsaved template name" }
+        let otherTemplates = TemplateStore(baseDirectory: left, shared: SharedTemplateAdapter(coordinator: a))
+        try await otherTemplates.load()
+        var remoteTemplate = await otherTemplates.template(forID: "review-template")!
+        remoteTemplate.promptText = "Remote prompt during draft"
+        try await otherTemplates.update(remoteTemplate)
+        try await templates.load()
+        await editor.select(id: "review-template", using: templates)
+        try expect(editor.template?.name == "Unsaved template name" && editor.hasChanges, "External refresh must retain unsaved draft")
+        try expect(await editor.save(using: templates), "Independent remote field must merge with draft")
+        try expect(editor.template?.promptText == "Remote prompt during draft" && !editor.hasChanges, "Accepted baseline includes independent remote changes")
+        editor.change { $0.promptText = "Keep my unsaved prompt" }
+        try await otherTemplates.load()
+        remoteTemplate = await otherTemplates.template(forID: "review-template")!
+        remoteTemplate.promptText = "New unseen remote prompt"
+        try await otherTemplates.update(remoteTemplate)
+        try await templates.load()
+        await editor.select(id: "review-template", using: templates)
+        try expect(!(await editor.save(using: templates)), "Unseen competing prompt must reject")
+        try expect(editor.template?.promptText == "Keep my unsaved prompt" && editor.hasChanges && editor.message != nil, "Failure must retain draft and explain review")
+        await editor.compareLatest(using: templates)
+        try expect(editor.comparison?.latest.template.promptText == "New unseen remote prompt", "Comparison shows the actual new version without dropping draft")
+        editor.change { $0.description = "Typed while comparing" }
+        editor.acceptComparison(keepingEdits: true)
+        try expect(editor.comparison == nil && editor.hasChanges, "A changed draft invalidates its earlier comparison")
+        await editor.compareLatest(using: templates)
+        editor.acceptComparison(keepingEdits: true)
+        try await otherTemplates.load()
+        remoteTemplate = await otherTemplates.template(forID: "review-template")!
+        remoteTemplate.promptText = "Arrived after comparison"
+        try await otherTemplates.update(remoteTemplate)
+        try expect(!(await editor.save(using: templates)), "A review cannot consume a later unseen change")
+        await editor.compareLatest(using: templates)
+        editor.acceptComparison(keepingEdits: true)
+        try expect(await editor.save(using: templates), "An explicit fresh comparison permits keeping the draft")
+        try expect(editor.template?.promptText == "Keep my unsaved prompt" && editor.template?.description == "Typed while comparing", "Keep only explicitly edited fields")
+        editor.change { $0.name = "Another unsaved name" }
+        await editor.compareLatest(using: templates)
+        editor.acceptComparison(keepingEdits: false)
+        try expect(!editor.hasChanges && editor.template?.name == "Unsaved template name", "Use Latest explicitly discards the draft")
+        editor.change { $0.promptText = "Keep my unsaved prompt" + " after selecting another template" }
+        await editor.select(id: "meeting", using: templates)
+        await editor.select(id: "review-template", using: templates)
+        try expect(editor.template?.promptText == "Keep my unsaved prompt after selecting another template", "Switching templates must preserve unsaved draft")
+        let anotherStore = TemplateStore(baseDirectory: right, shared: SharedTemplateAdapter(coordinator: b))
+        try await anotherStore.load()
+        await editor.select(id: "meeting", using: anotherStore)
+        try expect(editor.template?.id == "meeting" && !editor.hasChanges, "A library switch cannot apply old drafts to a new store")
+        let pause = SavePause()
+        let pausedCoordinator = SharedLibraryCoordinator(root: left, writerID: a.writerID, witnessDirectory: parent.appendingPathComponent("a-local"), afterCommit: { await pause.pauseOnce() })
+        let pausedStore = TemplateStore(baseDirectory: left, shared: SharedTemplateAdapter(coordinator: pausedCoordinator))
+        try await pausedStore.load()
+        let typing = TemplateEditingState()
+        await typing.select(id: "review-template", using: pausedStore)
+        typing.change { $0.description = "Accepted description" }
+        let saving = Task { await typing.save(using: pausedStore) }
+        for _ in 0..<500 {
+            if await pause.entered { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try expect(await pause.entered, "Save must reach its actual accepted commit")
+        typing.change { $0.description = "New typing during save" }
+        await pause.release()
+        try expect(await saving.value, "Accepted save succeeds")
+        try expect(typing.template?.description == "New typing during save" && typing.hasChanges, "An in-flight completion cannot erase later typing")
+        try expect(await typing.save(using: pausedStore) && !typing.hasChanges, "Later typing saves against the accepted context")
+        await typing.select(id: "meeting", using: pausedStore)
+        typing.change { $0.promptText = "Custom built-in override" }
+        try expect(await typing.save(using: pausedStore), "Built-in draft override saves")
+        try expect(await typing.reset(id: "meeting", using: pausedStore), "Native reset uses reviewed context")
+        try expect(typing.template == TemplateStore.builtInDefaults[0] && !typing.hasChanges, "Native reset returns to a clean default baseline")
         model.clear()
         try expect(model.items.isEmpty && model.message == nil, "Library switching clears old review")
         if ui {
@@ -192,6 +276,6 @@ import HiDockKit
             NSApp.activate()
             qaWindow = host
         }
-        print("Actual shared review passed: real two-root speaker/generation/older-edit/checklist/template conflicts, readable alternatives, stale refusal, explicit publication and binding reset.")
+        print("Actual shared review passed: real two-root speaker/generation/older-edit/checklist/template conflicts, readable alternatives, stale refusal, publication, retained drafts, explicit comparisons, accepted-save typing and binding reset.")
     }
 }

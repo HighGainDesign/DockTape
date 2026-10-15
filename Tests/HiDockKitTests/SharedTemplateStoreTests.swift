@@ -97,4 +97,126 @@ final class SharedTemplateStoreTests: XCTestCase {
         XCTAssertEqual(cached?.promptText, "Accepted prompt")
     }
 
+    func testOpenDraftPreservesIndependentRemoteFieldAfterBackgroundReload() async throws {
+        let (root, coordinator, user) = try await fixture()
+        let editor = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        let other = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        try await editor.load(); try await other.load()
+        let context = try await editor.beginEditing(id: user.id)
+        var draft = context.template; draft.name = "Draft name"
+        var remote = user; remote.promptText = "Unseen remote prompt"
+        try await other.update(remote)
+        try await editor.load() // AppState refresh while Settings still has its draft.
+        _ = try await editor.update(draft, basedOn: context)
+        try await other.load()
+        let saved = await other.template(forID: user.id)
+        XCTAssertEqual(saved?.name, "Draft name")
+        XCTAssertEqual(saved?.promptText, "Unseen remote prompt", "Only fields edited in the captured draft may change")
+    }
+    func testOpenDraftCannotConsumeSameFieldChangeDuringBackgroundReload() async throws {
+        let (root, coordinator, user) = try await fixture()
+        let editor = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        let other = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        try await editor.load(); try await other.load()
+        let context = try await editor.beginEditing(id: user.id)
+        var draft = context.template; draft.promptText = "Unsaved local draft"
+        var remote = user; remote.promptText = "Unseen remote prompt"
+        try await other.update(remote)
+        try await editor.load()
+        do { _ = try await editor.update(draft, basedOn: context); XCTFail("Background refresh is not consent to overwrite a new prompt") }
+        catch SharedLibraryCoordinatorError.staleReview {}
+        try await other.load()
+        let saved = await other.template(forID: user.id)
+        XCTAssertEqual(saved?.promptText, "Unseen remote prompt")
+        XCTAssertEqual(draft.promptText, "Unsaved local draft", "The caller must retain its draft after rejection")
+    }
+
+    func testEditorContextCannotBeUsedByAnotherStore() async throws {
+        let (root, coordinator, user) = try await fixture()
+        let one = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        let two = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        try await one.load(); try await two.load()
+        let context = try await one.beginEditing(id: user.id)
+        var draft = context.template; draft.name = "Wrong binding"
+        do { _ = try await two.update(draft, basedOn: context); XCTFail("An editor context belongs to its store") }
+        catch SharedLibraryCoordinatorError.differentBinding {}
+        try await two.load()
+        let saved = await two.template(forID: user.id)
+        XCTAssertEqual(saved, user)
+    }
+    func testPristineBuiltInDraftCannotOverwriteAnUnseenFirstOverride() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let one = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        let two = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        try await one.load(); try await two.load()
+        let context = try await one.beginEditing(id: "meeting")
+        var mine = context.template; mine.promptText = "My first override"
+        var remote = context.template; remote.promptText = "Their first override"
+        try await two.update(remote); try await one.load()
+        do { _ = try await one.update(mine, basedOn: context); XCTFail("An uninitialized baseline cannot consume an unseen first override") }
+        catch SharedLibraryCoordinatorError.staleReview {}
+    }
+    func testReviewedTemplateDeleteRejectsAChangedTemplateAfterReload() async throws {
+        let (root, coordinator, user) = try await fixture()
+        let one = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        let two = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        try await one.load(); try await two.load()
+        let context = try await one.beginEditing(id: user.id)
+        var remote = user; remote.promptText = "Changed before delete"
+        try await two.update(remote); try await one.load()
+        do { try await one.delete(id: user.id, basedOn: context); XCTFail("A fresh cache cannot expand deletion consent") }
+        catch SharedLibraryCoordinatorError.staleReview {}
+        let latest = try await one.beginEditing(id: user.id, refreshing: true)
+        try await one.delete(id: user.id, basedOn: latest)
+        try await two.load()
+        let deleted = await two.template(forID: user.id)
+        XCTAssertNil(deleted)
+    }
+    func testLegacyDraftChangesOnlyItsEditedFieldAfterReload() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(root); try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let user = Template.makeUserTemplate(name: "Original", description: "", promptText: "Prompt")
+        let one = TemplateStore(baseDirectory: root), two = TemplateStore(baseDirectory: root)
+        try await one.addUserTemplate(user); try await two.load()
+        let context = try await one.beginEditing(id: user.id)
+        var draft = user; draft.name = "Local draft"
+        var remote = user; remote.promptText = "Remote prompt"
+        try await two.update(remote); try await one.load()
+        _ = try await one.update(draft, basedOn: context)
+        try await two.load()
+        let saved = await two.template(forID: user.id)
+        XCTAssertEqual(saved?.name, "Local draft"); XCTAssertEqual(saved?.promptText, "Remote prompt")
+    }
+
+    func testFreshEditorContextDoesNotReadAnUnrelatedCorruptTemplate() async throws {
+        let (root, coordinator, user) = try await fixture()
+        let store = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        try await store.load()
+        let other = Template.makeUserTemplate(name: "Unavailable", description: "", promptText: "Unavailable")
+        try await store.addUserTemplate(other)
+        let id = try SharedLibraryIdentity.legacy(relativePath: "template-" + other.id)
+        let file = root.appendingPathComponent(".docktape/templates/\(id.uuidString.lowercased())/\(coordinator.writerID.uuidString.lowercased()).json")
+        try Data("unreadable unrelated template".utf8).write(to: file, options: .atomic)
+        let context = try await store.beginEditing(id: user.id, refreshing: true)
+        XCTAssertEqual(context.template, user)
+    }
+
+    func testReviewedBuiltInResetUsesUnsetAndRefusesUnseenOverride() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let one = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        let two = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        try await one.load(); try await two.load()
+        let pristine = try await one.beginEditing(id: "meeting")
+        var remote = pristine.template; remote.promptText = "New override"
+        try await two.update(remote)
+        do { _ = try await one.resetToDefault(id: "meeting", basedOn: pristine); XCTFail("A reset cannot consume an unseen override") }
+        catch SharedLibraryCoordinatorError.staleReview {}
+        let reviewed = try await one.beginEditing(id: "meeting", refreshing: true)
+        let reset = try await one.resetToDefault(id: "meeting", basedOn: reviewed)
+        XCTAssertEqual(reset.template, TemplateStore.builtInDefaults[0])
+        let id = try SharedLibraryIdentity.legacy(relativePath: "template-meeting")
+        let state = try await coordinator.read(.init(id: id, kind: .template)).state
+        XCTAssertEqual(state.fields["prompt"]?.resolvedValue, .unset, "Reset removes the override rather than pinning today's default text")
+    }
+
 }
