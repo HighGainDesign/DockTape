@@ -32,6 +32,7 @@ final class SharedLibraryReviewState {
         let folderRequests: [String: SharedFolderDeletionRequestReview]
         let recordingPaths: [String: SharedRecordingPathReview]
         let folderPaths: [String: SharedFolderPathReview]
+        let folderLifecycles: [String: SharedFolderLifecycleReview]
 
         func visibleFields(selections: [String: String]) -> [Field] {
             if snapshot.state.lifecycle == .conflicted {
@@ -80,7 +81,8 @@ final class SharedLibraryReviewState {
                 let requests = view.state.kind == .folder ? try await coordinator.folderDeletionRequestChoices(view) : []
                 let paths = view.state.kind == .recording ? try await coordinator.recordingPathChoices(view) : []
                 let folders = view.state.kind == .folder ? try await coordinator.folderPathChoices(view) : []
-                loaded.append(Self.item(view, writerLabels: labels, folderRequests: requests, recordingPaths: paths, folderPaths: folders))
+                let lifecycle = view.state.kind == .folder ? try await coordinator.folderLifecycleChoices(view) : []
+                loaded.append(Self.item(view, writerLabels: labels, folderRequests: requests, recordingPaths: paths, folderPaths: folders, folderLifecycles: lifecycle))
             }
             guard request == ticket, binding === coordinator, !Task.isCancelled else { return }
             items = loaded.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
@@ -103,6 +105,10 @@ final class SharedLibraryReviewState {
         if let field = fields.first(where: { $0.id == "deletionRequest" }), item.snapshot.state.kind == .folder {
             guard let selected = selections[field.id], let review = item.folderRequests[selected], fields.count == 1 else { return false }
             return await applyFolderRequest(review, using: coordinator)
+        }
+        if item.snapshot.state.kind == .folder, let lifecycle = fields.first(where: { $0.id == "$lifecycle" }) {
+            guard fields.count == 1, let selected = selections[lifecycle.id], let review = item.folderLifecycles[selected] else { return false }
+            return await applyFolderLifecycle(review, using: coordinator)
         }
         let supportsLifecycle = item.snapshot.state.kind == .recording || item.snapshot.state.kind == .template
         let decidingLifecycle = supportsLifecycle && item.snapshot.state.lifecycle == .conflicted
@@ -202,6 +208,29 @@ final class SharedLibraryReviewState {
         if binding === coordinator { isApplying = false; action = nil }
         return result
     }
+    private func applyFolderLifecycle(_ review: SharedFolderLifecycleReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
+        let ticket = request; isApplying = true; message = nil
+        let task = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                _ = try await coordinator.resolveFolderLifecycle(review)
+                guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
+                await self.refresh(using: coordinator)
+                guard self.binding === coordinator, !Task.isCancelled else { return true }
+                self.message = review.keep
+                    ? "Folder kept. Child recording decisions are preserved. Open Pending Folders to review remaining file work."
+                    : "Folder deletion selected. Files remain until the child scope and fresh approvals are reviewed in Pending Folders."
+                return true
+            } catch {
+                guard let self, self.binding === coordinator, self.request == ticket else { return false }
+                if !(error is CancellationError) { self.message = "The folder, its children or participating Macs changed. Reload its lifecycle choices before deciding." }
+                return false
+            }
+        }
+        action = task; let result = await task.value
+        if binding === coordinator { isApplying = false; action = nil }
+        return result
+    }
     private func applyFolderPath(_ review: SharedFolderPathReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
         let ticket = request
         isApplying = true; message = nil
@@ -252,13 +281,14 @@ final class SharedLibraryReviewState {
         if binding === coordinator { isApplying = false; action = nil }
         return result
     }
-    private static func item(_ snapshot: SharedLibraryViewSnapshot, writerLabels: [UUID: String], folderRequests requests: [SharedFolderDeletionRequestReview] = [], recordingPaths: [SharedRecordingPathReview] = [], folderPaths: [SharedFolderPathReview] = []) -> Item {
+    private static func item(_ snapshot: SharedLibraryViewSnapshot, writerLabels: [UUID: String], folderRequests requests: [SharedFolderDeletionRequestReview] = [], recordingPaths: [SharedRecordingPathReview] = [], folderPaths: [SharedFolderPathReview] = [], folderLifecycles: [SharedFolderLifecycleReview] = []) -> Item {
         let state = snapshot.state
         let requestChoices = Dictionary(uniqueKeysWithValues: requests.map { (identity($0.value), $0) })
         let title = text(state.value(for: state.kind == .recording ? "title" : "name"))
             ?? text(state.value(for: "initialPath")) ?? (state.kind == .template ? "Summary template" : "Library item")
         var fields: [Field] = []
         let pathChoices = Dictionary(recordingPaths.map { (identity(.text($0.destination)), $0) }, uniquingKeysWith: { first, _ in first })
+        let lifecycleChoices = Dictionary(folderLifecycles.map { (identity(.flag($0.keep)), $0) }, uniquingKeysWith: { first, _ in first })
         let folderChoices = Dictionary(folderPaths.map { (identity(.text($0.destination)), $0) }, uniquingKeysWith: { first, _ in first })
         let folderConflict = state.kind == .folder && (state.fields["name"]?.isConflicted == true || state.fields["parent"]?.isConflicted == true)
         if folderConflict, state.lifecycle == .alive {
@@ -299,7 +329,7 @@ final class SharedLibraryReviewState {
             let generation = parts.count >= 4 && parts[1] == "edits" ? UUID(uuidString: parts[2]) : nil
             let isContent = component != nil && parts.count == 2 && parts[1] == "content"
             let safeScalar = ["prompt", "description"].contains(conflict.field) || conflict.field == "metadata.mode" || (state.kind == .template && conflict.field == "name")
-            let lifecycleChoice = (state.kind == .recording || state.kind == .template) && state.lifecycle == .conflicted && conflict.field == "$lifecycle"
+            let lifecycleChoice = (state.kind == .recording || state.kind == .template || state.kind == .folder) && state.lifecycle == .conflicted && conflict.field == "$lifecycle"
             let editableContent = state.lifecycle == .alive || ((state.kind == .recording || state.kind == .template) && state.lifecycle == .deleted)
             let folderRequest = state.kind == .folder && conflict.field == "deletionRequest" && (state.lifecycle == .alive || state.lifecycle == .deleted)
             let supported = folderRequest || lifecycleChoice || (editableContent && (isContent || generation != nil || safeScalar))
@@ -318,6 +348,16 @@ final class SharedLibraryReviewState {
                 }
                 if lifecycleChoice {
                     guard case .flag(let keep) = value else { return nil }
+                    if state.kind == .folder {
+                        guard let reviewed = lifecycleChoices[identity(value)] else { return nil }
+                        let children = reviewed.members.map { member in
+                            let status = member.state.lifecycle == .deleted ? "Pending deletion" : member.state.lifecycle == .alive ? "Kept" : "Needs review"
+                            return member.path + " · " + status + "\n" + lifecyclePreview(member.state, labels: writerLabels)
+                        }.joined(separator: "\n\n")
+                        let detail = (keep ? "Keep the folder and cancel its pending deletion request. Child decisions and edits are preserved separately." : "Choose deletion for the folder. Children and original files remain protected until their scope and fresh cleanup approvals are reviewed.")
+                            + "\n\n" + lifecyclePreview(state, labels: writerLabels) + "\n\n" + (children.isEmpty ? "No owned descendants." : children)
+                        return .init(id: identity(value), value: value, label: keep ? "Keep Folder" : "Delete Folder", detail: origin + detail, isAvailable: true, sources: contributors)
+                    }
                     let template = state.kind == .template
                     let label = template ? (keep ? "Keep Template and Edits" : "Delete Template") : (keep ? "Keep Recording and Edits" : "Delete Recording")
                     let explanation = template
@@ -342,7 +382,7 @@ final class SharedLibraryReviewState {
                 heading = "Action item: " + entry.text
             }
             fields.append(.init(id: conflict.field, title: heading, choices: choices,
-                explanation: lifecycleChoice ? (state.kind == .template ? "Choose whether to keep the template before reviewing its retained competing edits." : "Choose whether to keep this recording before reviewing any other competing changes. Files are removed only after the participating Macs approve safe cleanup.") : supported ? (isContent ? "Edits attached to other versions will be discarded when you choose a version." : nil) : "This file or lifecycle change needs a recovery review.",
+                explanation: lifecycleChoice ? (state.kind == .folder ? "Choose the folder's lifecycle first. Child decisions remain separate; file work requires a Pending Folders review." : state.kind == .template ? "Choose whether to keep the template before reviewing its retained competing edits." : "Choose whether to keep this recording before reviewing any other competing changes. Files are removed only after the participating Macs approve safe cleanup.") : supported ? (isContent ? "Edits attached to other versions will be discarded when you choose a version." : nil) : "This file or lifecycle change needs a recovery review.",
                 component: component, generation: generation, isOlderEdits: false))
         }
         for component in [SharedComponent.transcript, .summary] {
@@ -366,11 +406,16 @@ final class SharedLibraryReviewState {
         for key in keys { if let register = state.fields[key] { context[key] = (try? encoder.encode(register))?.base64EncodedString() } }
         for (id, review) in pathChoices { context["recording.path." + id] = review.contextFingerprint }
         for (id, review) in folderChoices { context["folder.path." + id] = review.contextFingerprint }
+        for (id, review) in lifecycleChoices { context["folder.lifecycle." + id] = review.contextFingerprint }
         let signature = SharedLibraryOperation.fingerprint((try? encoder.encode(context)) ?? Data())
-        return .init(title: title, snapshot: snapshot, fields: fields, reviewSignature: signature, folderRequests: requestChoices, recordingPaths: pathChoices, folderPaths: folderChoices)
+        return .init(title: title, snapshot: snapshot, fields: fields, reviewSignature: signature, folderRequests: requestChoices, recordingPaths: pathChoices, folderPaths: folderChoices, folderLifecycles: lifecycleChoices)
     }
     private static func lifecyclePreview(_ state: SharedEntityState, labels: [UUID: String]) -> String {
         var sections: [String] = []
+        if state.kind == .folder {
+            let names = (state.fields["name"]?.values ?? []).map { attributedPreview($0, field: "name", state: state, labels: labels) }.sorted()
+            return "Folder names:\n" + names.joined(separator: "\n\n")
+        }
         if state.kind == .template {
             for (field, label) in [("name", "Name"), ("description", "Description"), ("prompt", "Instructions")] {
                 let alternatives = (state.fields[field]?.values ?? []).map { attributedPreview($0, field: field, state: state, labels: labels) }.sorted()

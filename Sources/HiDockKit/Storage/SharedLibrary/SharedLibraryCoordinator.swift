@@ -1257,7 +1257,7 @@ public actor SharedLibraryCoordinator {
       switch operation?.steps.first {
       case .createDirectory: purpose = .create
       case .moveDirectory: purpose = .rename
-      case .removeEmptyDirectory: purpose = .delete
+      case .removeEmptyDirectory: purpose = view.state.lifecycle == .alive ? .retain : .delete
       default: throw SharedLibraryOperationError.invalidOperation
       }
     }
@@ -1267,7 +1267,7 @@ public actor SharedLibraryCoordinator {
     // Children retain their own recording/folder authorities. This inspection
     // checks only the root path while aggregating descendant jobs and state.
     let authorityPaths = request.map { [$0.path] } ?? paths
-    let permission = try await operationAuthority(entity: entity, paths: purpose == .rename ? [] : authorityPaths)
+    let permission = try await operationAuthority(entity: entity, paths: (purpose == .rename || purpose == .retain) ? [] : authorityPaths)
     guard try SharedLibraryOperation.matchesRevision(SharedLibraryOperation.revision(for: view.state), state: permission.state) else { throw SharedLibraryOperationError.staleAuthority }
     var conflict = !view.state.conflicts.isEmpty
     if !conflict, view.state.lifecycle == .alive {
@@ -1295,7 +1295,7 @@ public actor SharedLibraryCoordinator {
     let waiting = deleting ? permission.membership.cohort.subtracting(approved).map { $0 == writerID ? "This Mac" : permission.membership.label(for: $0) }.sorted() : []
     let canAcknowledge = deleting && !needsReplanning && !permission.hasPendingWork && !permission.hasLiveDescendants
       && stable && permission.membership.cohort.contains(writerID) && !approved.contains(writerID)
-    let canResume = !needsReplanning && !permission.hasPendingWork && permission.membership.mayEdit(writerID)
+    let canResume = purpose != .retain && !needsReplanning && !permission.hasPendingWork && permission.membership.mayEdit(writerID)
       && (!deleting || permission.mayDestroy(.delete))
     let name = request?.path ?? view.state.value(for: "name").flatMap { if case .text(let text) = $0 { return text }; return nil } ?? "Folder"
     return .init(name: name, purpose: purpose, paths: paths, waitingForMacs: waiting, hasActiveWork: permission.hasPendingWork,
@@ -1472,7 +1472,12 @@ public actor SharedLibraryCoordinator {
     let progress = try await reader.progress(entity: selectedOperation.entity, libraryID: review.base.libraryID)
     guard progress?.operation == review.localOperation else { throw SharedLibraryCoordinatorError.staleReview }
     let operation = progress?.operation ?? selectedOperation
-    guard operation.steps.count == 1, case .moveDirectory = operation.steps[0] else { throw SharedLibraryOperationError.unfinishedOperation }
+    guard operation.steps.count == 1 else { throw SharedLibraryOperationError.unfinishedOperation }
+    switch operation.steps[0] {
+    case .moveDirectory: break
+    case .removeEmptyDirectory where review.purpose == .retain: break
+    default: throw SharedLibraryOperationError.unfinishedOperation
+    }
     let views = try await snapshots(kinds: [.recording, .folder])
     let sensitive = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
     let index = try await pathIndex(for: views, caseSensitive: sensitive)
@@ -1490,7 +1495,13 @@ public actor SharedLibraryCoordinator {
     var recipes: [SharedLibraryOperation.Step] = operation.steps
     for (_, _, intent) in try SharedPublishedLocations.fileIntents(state: review.base.state, library: review.base.libraryID) { recipes += intent.steps }
     var paths: Set<String> = [destination]
-    for step in recipes { if case .moveDirectory(let source, let target, _) = step { paths.formUnion([source, target]) } }
+    for step in recipes {
+      switch step {
+      case .moveDirectory(let source, let target, _): paths.formUnion([source, target])
+      case .removeEmptyDirectory(let path) where review.purpose == .retain: paths.insert(path)
+      default: break
+      }
+    }
     for value in review.base.state.fields["physicalPath"]?.values ?? [] {
       guard case .text(let path) = value else { throw SharedLibraryOperationError.invalidReceipt }; paths.insert(path)
     }
@@ -1540,7 +1551,11 @@ public actor SharedLibraryCoordinator {
     let baselines = recipes.compactMap { step -> SharedDirectoryInventory? in
       if case .moveDirectory(let from, let to, let original) = step, from == source || to == source { return original }; return nil
     }
-    guard baselines.contains(where: { baseline in
+    // Keeping the same directory changes no physical files. Its entire current
+    // inventory is still shown and bound through commit and the no-op phase.
+    // Relocation continues to require an accepted original move inventory.
+    let retainingInPlace = review.purpose == .retain && source == destination
+    guard retainingInPlace || baselines.contains(where: { baseline in
       let original = Dictionary(uniqueKeysWithValues: baseline.entries.map { ($0.path, $0) })
       let actual = Dictionary(uniqueKeysWithValues: inventory.entries.map { ($0.path, $0) })
       guard baseline.entries.allSatisfy({ actual[$0.path]?.directory == $0.directory }) else { return false }
@@ -1645,51 +1660,55 @@ public actor SharedLibraryCoordinator {
         members: request.members.sorted { $0.path < $1.path }.map { .init(path: $0.path, kind: $0.kind) }, base: base, document: document)
     }.sorted { $0.document.id.uuidString < $1.document.id.uuidString }
   }
+  /// Rebinds an accepted removal recipe without renewing its physical evidence.
+  private func folderRemovalPlan(base: SharedLibraryViewSnapshot, path: String) async throws -> SharedPreparedFileOperation {
+    let entity = SharedEntityIdentity(id: base.state.id, kind: .folder)
+    let steps: [SharedLibraryOperation.Step] = [.removeEmptyDirectory(path: path)]
+    let prefix = "materialization.files."
+    let fields = base.state.fields.keys.filter { $0.hasPrefix(prefix) }.sorted {
+      if $0 == fileIntentField { return $1 != fileIntentField }
+      if $1 == fileIntentField { return false }
+      return $0 < $1
+    }
+    let candidates = fields.compactMap { field -> SharedAcceptedFileIntent? in
+      guard case .document(let document)? = base.state.value(for: field),
+            let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json),
+            intent.schema == 1, intent.libraryID == base.libraryID, intent.entity == entity, intent.steps == steps else { return nil }
+      return intent
+    }
+    let reader = try await makeMaterializer(entity: entity, paths: [], receipts: operationReceipts(library: base.libraryID))
+    let previous = try await reader.progress(entity: entity, libraryID: base.libraryID)
+    // An unrelated intent owned by this writer must not be overwritten,
+    // even if a peer has a matching removal intent for the local receipt.
+    if fields.contains(fileIntentField), !candidates.contains(where: { candidate in
+      guard case .document(let own)? = base.state.value(for: fileIntentField),
+            let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: own.json) else { return false }
+      return candidate.steps == intent.steps && candidate.inputRevision == intent.inputRevision
+    }) { throw SharedLibraryOperationError.unfinishedOperation }
+    let original: SharedAcceptedFileIntent?
+    if let previous {
+      guard previous.operation.steps == steps, let matching = candidates.first(where: {
+        $0.inputRevision == previous.operation.inputRevision && $0.reviewedExistingDestinations == previous.operation.reviewedExistingDestinations
+      }) else { throw SharedLibraryOperationError.unfinishedOperation }
+      original = matching
+    } else {
+      guard fields.isEmpty || !candidates.isEmpty else { throw SharedLibraryOperationError.unfinishedOperation }
+      original = candidates.first
+    }
+    var plan = SharedPreparedFileOperation(libraryID: base.libraryID, entity: entity,
+      inputRevision: original?.inputRevision ?? base.fingerprint, steps: steps)
+    plan.replacesOperationID = original?.replacesOperationID
+    plan.retainedFiles = original?.retainedFiles ?? [:]
+    plan.reviewedExistingDestinations = original?.reviewedExistingDestinations
+    return plan
+  }
   /// Saves only the reviewed request. It grants no cleanup/acknowledgment authority.
   public func resolveFolderDeletionRequest(_ review: SharedFolderDeletionRequestReview) async throws -> SharedLibraryViewSnapshot {
     let request = try validatedFolderDeletionRequest(review.document, base: review.base)
     guard review.base.state.fields["deletionRequest"]?.values.contains(review.value) == true else { throw SharedLibraryCoordinatorError.staleReview }
     var prepared: SharedPreparedFileOperation?
     if review.base.state.lifecycle == .deleted {
-      let entity = SharedEntityIdentity(id: review.base.state.id, kind: .folder)
-      let steps: [SharedLibraryOperation.Step] = [.removeEmptyDirectory(path: request.path)]
-      let prefix = "materialization.files."
-      let fields = review.base.state.fields.keys.filter { $0.hasPrefix(prefix) }.sorted {
-        if $0 == fileIntentField { return $1 != fileIntentField }
-        if $1 == fileIntentField { return false }
-        return $0 < $1
-      }
-      let candidates = fields.compactMap { field -> SharedAcceptedFileIntent? in
-        guard case .document(let document)? = review.base.state.value(for: field),
-              let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json),
-              intent.schema == 1, intent.libraryID == review.base.libraryID, intent.entity == entity, intent.steps == steps else { return nil }
-        return intent
-      }
-      let reader = try await makeMaterializer(entity: entity, paths: [], receipts: operationReceipts(library: review.base.libraryID))
-      let previous = try await reader.progress(entity: entity, libraryID: review.base.libraryID)
-      // An unrelated intent owned by this writer must not be overwritten,
-      // even if a peer has a matching removal intent for the local receipt.
-      if fields.contains(fileIntentField), !candidates.contains(where: { candidate in
-        guard case .document(let own)? = review.base.state.value(for: fileIntentField),
-              let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: own.json) else { return false }
-        return candidate.steps == intent.steps && candidate.inputRevision == intent.inputRevision
-      }) { throw SharedLibraryOperationError.unfinishedOperation }
-      let original: SharedAcceptedFileIntent?
-      if let previous {
-        guard previous.operation.steps == steps, let matching = candidates.first(where: {
-          $0.inputRevision == previous.operation.inputRevision && $0.reviewedExistingDestinations == previous.operation.reviewedExistingDestinations
-        }) else { throw SharedLibraryOperationError.unfinishedOperation }
-        original = matching
-      } else {
-        guard fields.isEmpty || !candidates.isEmpty else { throw SharedLibraryOperationError.unfinishedOperation }
-        original = candidates.first
-      }
-      var plan = SharedPreparedFileOperation(libraryID: review.base.libraryID, entity: entity,
-        inputRevision: original?.inputRevision ?? review.base.fingerprint, steps: steps)
-      plan.replacesOperationID = original?.replacesOperationID
-      plan.retainedFiles = original?.retainedFiles ?? [:]
-      plan.reviewedExistingDestinations = original?.reviewedExistingDestinations
-      prepared = plan
+      prepared = try await folderRemovalPlan(base: review.base, path: request.path)
     }
     var changes: [SharedLibraryMutation] = review.base.state.lifecycle == .deleted ? [.restore] : []
     changes.append(.assign(field: "deletionRequest", value: review.value))
@@ -3014,6 +3033,63 @@ public actor SharedLibraryCoordinator {
         fields: view.state.fields.filter { fields.contains($0.key) || $0.key.hasPrefix("materialization.") || (view.state.kind == .folder && $0.key == "$lifecycle") })
     }.sorted { $0.id.uuidString < $1.id.uuidString })
   }
+  public func folderLifecycleChoices(_ base: SharedLibraryViewSnapshot) async throws -> [SharedFolderLifecycleReview] {
+    guard base.state.kind == .folder, base.state.lifecycle == .conflicted else { return [] }
+    let manifest = try await bind(force: true)
+    guard manifest.libraryID == base.libraryID, repository.accepts(base.repository) else { throw SharedLibraryCoordinatorError.differentBinding }
+    let views = try await snapshots(kinds: [.recording, .folder])
+    guard views.contains(where: { $0.state.id == base.state.id && $0.state == base.state }) else { throw SharedLibraryCoordinatorError.staleReview }
+    var descendants: Set<UUID> = [base.state.id]
+    while true {
+      let found = Set(views.filter { view in
+        let field = view.state.kind == .folder ? "parent" : "folder"
+        return (view.state.fields[field]?.values ?? []).contains { value in
+          if case .text(let text) = value, let id = UUID(uuidString: text) { return descendants.contains(id) }; return false
+        }
+      }.map { $0.state.id })
+      let next = descendants.union(found)
+      if next == descendants { break }; descendants = next
+    }
+    descendants.remove(base.state.id)
+    let sensitive = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
+    let index = try? SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: sensitive)
+    let members = views.filter { descendants.contains($0.state.id) }.map { view -> SharedFolderLifecycleReview.Member in
+      let initial = view.state.value(for: "initialPath").flatMap { if case .text(let path) = $0 { return path }; return nil }
+      return .init(path: index?.resolvedPaths[view.state.id] ?? ((initial ?? "Item") + " (location needs review)"), state: view.state)
+    }.sorted { $0.state.id.uuidString < $1.state.id.uuidString }
+    struct Context: Encodable { let graph: String; let members: [SharedEntityState] }
+    let context = try SharedStateFingerprint.of(Context(graph: recordingPathContext(views), members: members.map(\.state)))
+    let cohort = try await memberRepository().load().membership.fingerprint
+    return [true, false].compactMap { keep in
+      guard base.state.fields["$lifecycle"]?.values.contains(.flag(keep)) == true else { return nil }
+      return .init(keep: keep, members: members, base: base, context: context, cohort: cohort)
+    }
+  }
+  public func resolveFolderLifecycle(_ review: SharedFolderLifecycleReview,
+      beforeCommit: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedLibraryViewSnapshot {
+    let current = try await read(.init(id: review.base.state.id, kind: .folder))
+    guard current.libraryID == review.base.libraryID, repository.accepts(review.base.repository) else { throw SharedLibraryCoordinatorError.differentBinding }
+    guard current.state == review.base.state else { throw SharedLibraryCoordinatorError.staleReview }
+    func matches(_ choices: [SharedFolderLifecycleReview]) -> Bool {
+      choices.contains { $0.keep == review.keep && $0.context == review.context && $0.cohort == review.cohort }
+    }
+    guard matches(try await folderLifecycleChoices(current)) else { throw SharedLibraryCoordinatorError.staleReview }
+    let permission = try await operationAuthority(entity: .init(id: current.state.id, kind: .folder), paths: [])
+    guard permission.state == current.state, permission.membership.fingerprint == review.cohort,
+          matches(try await folderLifecycleChoices(current)) else { throw SharedLibraryCoordinatorError.staleReview }
+    var prepared: SharedPreparedFileOperation?
+    if !review.keep, case .document(let document)? = current.state.value(for: "deletionRequest") {
+      let request = try validatedFolderDeletionRequest(document, base: current)
+      if current.state.value(for: "name") == .text(request.path), current.state.fields["parent"]?.resolvedValue == .unset {
+        prepared = try await folderRemovalPlan(base: current, path: request.path)
+      }
+    }
+    let changes: [SharedLibraryMutation] = review.keep ? [.restore, .assign(field: "deletionRequest", value: .unset)] : [.delete]
+    let bindings = permission.additionalBindings + (permission.binding.map { [$0] } ?? [])
+    try await beforeCommit(); try Task.checkCancellation()
+    return try await commit(.init(base: current, changes: changes), review: true, exact: true, bindings: bindings, preparedFileOperation: prepared)
+  }
+
   public func folderPathChoices(_ base: SharedLibraryViewSnapshot) async throws -> [SharedFolderPathReview] {
     guard base.state.kind == .folder, base.state.lifecycle == .alive,
           base.state.fields["name"]?.isConflicted == true || base.state.fields["parent"]?.isConflicted == true else { return [] }

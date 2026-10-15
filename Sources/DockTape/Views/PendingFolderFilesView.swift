@@ -30,6 +30,7 @@ struct PendingFolderFilesView: View {
                         VStack(alignment: .leading, spacing: 14) {
                             Text(item.name).font(.headline)
                             Text(status(item))
+                            if item.purpose == .retain { Text("Keep this folder by reviewing its current files. The previous deletion will not restart.") }
                             if item.purpose == .delete { Text("Continue deletion of this folder after related recordings and folders have the required approvals. Unknown files are preserved for review.") }
                             if item.needsReplanning { Text("Competing changes prevent this plan from continuing. Review the competing edits before trying again.").foregroundStyle(.secondary) }
                             if !item.waitingForMacs.isEmpty { Text("Waiting for: " + item.waitingForMacs.joined(separator: ", ")).foregroundStyle(.secondary) }
@@ -94,6 +95,7 @@ struct PendingFolderFilesView: View {
         if row.needsReplanning { return "Needs plan review" }
         if row.hasActiveWork { return "Waiting for active work" }
         if !row.waitingForMacs.isEmpty { return "Waiting for folder approval" }
+        if row.purpose == .retain { return "Folder retention needs review" }
         return row.purpose == .delete ? "Folder deletion pending" : row.purpose == .rename ? "Folder rename pending" : "Folder creation pending"
     }
     private func reload() async {

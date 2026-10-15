@@ -501,6 +501,100 @@ import HiDockKit
         print("Actual unprepared deletion passed: retry, explicit Keep, native external-file restoration and deletion again complete without fixture repair writes.")
     }
 
+    @MainActor static func folderLifecycleChecks(parent: URL) async throws {
+        let choices = CommandLine.arguments.contains("--folder-lifecycle-keep-only") ? [true] : CommandLine.arguments.contains("--folder-lifecycle-delete-only") ? [false] : [true, false]
+        for keep in choices {
+            let directory = parent.appendingPathComponent(keep ? "keep" : "delete"), left = directory.appendingPathComponent("left"), right = directory.appendingPathComponent("right")
+            try FileManager.default.createDirectory(at: left.appendingPathComponent("Empty"), withIntermediateDirectories: true)
+            if keep { try Data("Independent synthetic recording".utf8).write(to: left.appendingPathComponent("Unrelated.mp3")) }
+            let writer = UUID(), local = directory.appendingPathComponent("a-local")
+            let model = SharedLibraryReviewState(), pause = SavePause()
+            let a = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local, afterPublishedLibraryRead: {
+                if keep, await MainActor.run(body: { model.isApplying && model.isLoading }) { await pause.pauseOnce() }
+            })
+            _ = try await a.enable(); _ = try await a.projectOutputs()
+            let folders = try await a.snapshots(kinds: [.folder])
+            guard let folder = folders.first(where: { $0.state.value(for: "name") == .text("Empty") }) else { throw Failure(message: "Missing empty folder") }
+            let entity = SharedEntityIdentity(id: folder.state.id, kind: .folder)
+            try FileManager.default.copyItem(at: left, to: right)
+            let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: directory.appendingPathComponent("b-local"))
+            try await b.requestEnrollment(requestID: UUID(), label: "Folder lifecycle peer")
+            for _ in 0..<3 { try deliver(right, to: left, writer: b.writerID); try await a.refresh(); try deliver(left, to: right, writer: a.writerID); try await b.refresh() }
+            if keep {
+                let record = try await a.recording(at: "Unrelated.mp3")
+                let other = SharedEntityIdentity(id: record.state.id, kind: .recording)
+                _ = try await a.edit(.init(base: record, changes: [.assign(field: "title", value: .text("Local other"))]))
+                _ = try await b.edit(.init(base: try await b.read(other), changes: [.assign(field: "title", value: .text("Peer other"))]))
+            }
+            let pending = try await a.deleteFolder(named: "Empty")
+            try expect(pending.result == .waitingForAcknowledgments, "Unseen peer cannot be automatically approved")
+            try expect(FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "Original remains before peer approval")
+            _ = try await b.renameFolder(from: "Empty", to: "Elsewhere")
+            _ = try await b.renameFolder(from: "Elsewhere", to: "Empty")
+            try deliver(right, to: left, writer: b.writerID)
+            let view = try await a.read(entity)
+            try expect(view.state.lifecycle == .conflicted, "Concurrent folder deletion and rename produce lifecycle conflict")
+            await model.refresh(using: a)
+            guard let item = model.items.first(where: { $0.id == entity.id }), let lifecycle = item.fields.first(where: { $0.id == "$lifecycle" }),
+                  let choice = lifecycle.choices.first(where: { $0.value == .flag(keep) && $0.isAvailable }) else { throw Failure(message: "Folder lifecycle conflict must offer usable Keep Folder and Delete Folder choices") }
+            try expect(choice.label.contains("Folder"), "Folder decisions use folder wording")
+            try expect(choice.detail.contains("Folder lifecycle peer") || !keep, "Keep explains the Mac whose edit is retained")
+            if keep {
+                let action = Task { await model.apply(item: item, selections: [lifecycle.id: choice.id], using: a) }
+                for _ in 0..<500 { if await pause.entered { break }; try await Task.sleep(for: .milliseconds(20)) }
+                guard await pause.entered else { action.cancel(); await pause.release(); _ = await action.value; throw Failure(message: "Lifecycle choice did not reach held feedback refresh") }
+                model.clear()
+                let otherRoot = directory.appendingPathComponent("other-library")
+                try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
+                let other = SharedLibraryCoordinator(root: otherRoot, writerID: UUID(), witnessDirectory: directory.appendingPathComponent("other-local"))
+                _ = try await other.enable(); await model.refresh(using: other)
+                await pause.release()
+                try expect(await action.value, "Semantic choice remains accepted across a library switch")
+                try expect(model.items.isEmpty && model.message == nil && !model.isApplying && !model.isLoading, "Old lifecycle feedback must not cross a library switch during refresh")
+            } else { try expect(await model.apply(item: item, selections: [lifecycle.id: choice.id], using: a), "Folder lifecycle decision is actionable") }
+            let accepted = try await a.read(entity)
+            try expect(accepted.state.lifecycle == (keep ? .alive : .deleted), "Exact selected root lifecycle saved")
+            try expect(FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "Semantic decision alone never removes the directory")
+            print("Actual folder lifecycle semantic choice passed: " + (keep ? "keep" : "delete"))
+            let owner = FolderFileReviewState(); await owner.refresh(using: a)
+            guard let row = owner.items.first(where: { $0.id == entity.id }) else { throw Failure(message: "Lifecycle choice needs an inspectable Pending Folders route") }
+            if keep {
+                try expect(row.canReplan && !row.canResume && !row.canAcknowledge, "Kept deletion must offer a retention plan and never restart removal")
+                await owner.prepareUpdatedPlan(row, using: a)
+                guard let plan = owner.updatedPlan else { throw Failure(message: "Kept folder needs an actionable physical retention preview: " + (owner.message ?? "nil")) }
+                try expect(plan.source == "Empty" && plan.destination == "Empty", "Keeping available original directory requires no relocation")
+                try expect(await owner.applyUpdatedPlan(using: a), "Reviewed retention plan finishes")
+                try expect(FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "Retaining a folder never removes it")
+                try expect(owner.items.isEmpty, "Kept deletion has no resurrected cleanup action")
+                let renamed = try await a.renameFolder(from: "Empty", to: "After")
+                try expect(renamed.id == entity.id && renamed.result == .complete, "Ordinary work resumes with the same folder ID")
+                try expect(FileManager.default.fileExists(atPath: left.appendingPathComponent("After").path), "Ordinary rename operates after retention recovery")
+            } else {
+                try expect(row.canAcknowledge && !row.canResume, "New root deletion needs fresh explicit owner approval before removal")
+                try expect(await owner.perform(.acknowledge, review: row, using: a), "Owner approves current root deletion")
+                try deliver(left, to: right, writer: a.writerID)
+                try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+                let peer = FolderFileReviewState(); await peer.refresh(using: b)
+                guard let peerRow = peer.items.first(where: { $0.id == entity.id }), peerRow.canAcknowledge else { throw Failure(message: "Peer needs a fresh current-revision deletion approval") }
+                try expect(await peer.perform(.acknowledge, review: peerRow, using: b), "Peer approves current deletion separately")
+                try expect(FileManager.default.fileExists(atPath: right.appendingPathComponent("Empty").path), "Approval does not remove the peer's directory")
+                try deliver(right, to: left, writer: b.writerID)
+                await owner.refresh(using: a)
+                guard let ready = owner.items.first(where: { $0.id == entity.id }), ready.canResume else { throw Failure(message: "Fresh cohort approval must permit reviewed empty-folder cleanup") }
+                try expect(await owner.perform(.resume, review: ready, using: a), "Reviewed deletion continuation succeeds")
+                try expect(owner.items.isEmpty && !FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "Deletion completes only after actual removal")
+                try deliver(left, to: right, writer: a.writerID)
+                try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+                await peer.refresh(using: b)
+                try expect(peer.items.count == 1, "Metadata-first completion cannot hide retained peer directory")
+                try FileManager.default.removeItem(at: right.appendingPathComponent("Empty"))
+                await peer.refresh(using: b)
+                try expect(peer.items.isEmpty, "Peer completion follows controlled provider absence")
+            }
+            print("Actual folder lifecycle physical continuation passed: " + (keep ? "keep" : "delete"))
+        }
+    }
+
     @MainActor static func folderPathChecks(parent: URL) async throws {
         for stage in ["unstarted", "attempted", "published"] {
             let directory = parent.appendingPathComponent(stage), left = directory.appendingPathComponent("left"), right = directory.appendingPathComponent("right")
@@ -912,6 +1006,7 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--folder-lifecycle-only") || arguments.contains("--folder-lifecycle-keep-only") || arguments.contains("--folder-lifecycle-delete-only") { try await folderLifecycleChecks(parent: parent); return }
         if arguments.contains("--folder-paths-only") { try await folderPathChecks(parent: parent); return }
         if arguments.contains("--recording-paths-only") || arguments.contains("--recording-path-published-only") || arguments.contains("--recording-path-deleted-published-only") { try await recordingPathChecks(parent: parent); return }
         if arguments.contains("--source-macs-only") { try await sourceMacChecks(parent: parent); return }
@@ -926,6 +1021,7 @@ import HiDockKit
             return
         }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
+        try await folderLifecycleChecks(parent: parent.appendingPathComponent("folder-lifecycle"))
         try await folderPathChecks(parent: parent.appendingPathComponent("folder-paths"))
         try await recordingPathChecks(parent: parent.appendingPathComponent("recording-paths"))
         try await sourceMacChecks(parent: parent.appendingPathComponent("source-macs"))
