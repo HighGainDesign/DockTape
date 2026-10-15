@@ -8,6 +8,19 @@ struct SharedPublishedLocations: Sendable {
     static let completedIntentsKey = "_docktape_completed_file_intents"
     private var initial: [String: String] = [:]
     private var markers: [SharedProjectionMarker] = []
+    private enum ReadError: Error { case changed }
+    private func validateReads(absent: Set<URL>, registries: Set<String>?, directory: URL) async throws {
+        if let registries, Set(LibraryFileDiscovery.files(in: directory, suffix: ".json").map(\.relativePath)) != registries {
+            throw ReadError.changed
+        }
+        for (url, expected) in proofs.sorted(by: { $0.key.path < $1.key.path }) {
+            let bytes = try await RecordingFileAccess().readDataIfPresent(at: url)
+            guard bytes.map(SharedLibraryOperation.fingerprint) == expected else { throw ReadError.changed }
+        }
+        for url in absent {
+            guard try await RecordingFileAccess().readDataIfPresent(at: url) == nil else { throw ReadError.changed }
+        }
+    }
     func validateCompanion(path: String, bytes: Data, entity: UUID, library: UUID, kind: String) throws {
         if initial[path] == SharedLibraryOperation.fingerprint(bytes) { return }
         guard let marker = try? SharedProjectionDocument.marker(in: bytes),
@@ -68,7 +81,21 @@ struct SharedPublishedLocations: Sendable {
         }
         return result
     }
-    static func load(root: URL, manifest: SharedBootstrapManifest, membership: SharedLibraryMembership) async throws -> Self {
+    static func load(root: URL, manifest: SharedBootstrapManifest, membership: SharedLibraryMembership,
+                     afterLibraryRead: @escaping @Sendable () async throws -> Void = {}) async throws -> Self {
+        // Canonical files and registries are read separately so hydration does
+        // not hold a global file lease. Retry a changed read set before judging
+        // an otherwise app-owned publication to be an external edit.
+        for attempt in 0..<3 {
+            try Task.checkCancellation()
+            do { return try await loadOnce(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterLibraryRead) }
+            catch ReadError.changed where attempt < 2 { continue }
+            catch ReadError.changed { throw SharedProjectionWriteError.stale }
+        }
+        throw SharedProjectionWriteError.stale
+    }
+    private static func loadOnce(root: URL, manifest: SharedBootstrapManifest, membership: SharedLibraryMembership,
+                                 afterLibraryRead: @escaping @Sendable () async throws -> Void) async throws -> Self {
         var result = Self()
         let inputURL = SharedProjectionInputs.file(in: root)
         let inputBytes = try await CoordinatedFileAccess().read(at: inputURL)
@@ -78,13 +105,17 @@ struct SharedPublishedLocations: Sendable {
         result.proofs[inputURL] = SharedLibraryOperation.fingerprint(inputBytes)
         let libraryURL = root.appendingPathComponent("library.json")
         let bytes = try await RecordingFileAccess().readDataIfPresent(at: libraryURL)
+        let absent: Set<URL> = bytes == nil ? [libraryURL] : []
+        let directory = root.appendingPathComponent(".docktape/projections")
+        try await afterLibraryRead()
         if let bytes {
             result.proofs[libraryURL] = SharedLibraryOperation.fingerprint(bytes)
             if let marker = try? SharedProjectionDocument.marker(in: bytes) {
                 guard marker.libraryID == manifest.libraryID, marker.kind == "library" else { throw SharedProjectionWriteError.untracked("library.json") }
                 var recognized = false
-                let directory = root.appendingPathComponent(".docktape/projections")
-                for file in LibraryFileDiscovery.files(in: directory, suffix: ".json") {
+                let files = LibraryFileDiscovery.files(in: directory, suffix: ".json")
+                let registries = Set(files.map(\.relativePath))
+                for file in files {
                     let url = directory.appendingPathComponent(file.relativePath)
                     guard SharedLibraryMaterializer.contained(url, in: directory) else { throw SharedLibraryOperationError.unsafePath }
                     let data = try await CoordinatedFileAccess().read(at: url)
@@ -94,6 +125,7 @@ struct SharedPublishedLocations: Sendable {
                     result.markers += Array(registry.files.values) + Array(registry.pending?.values ?? [:].values)
                     recognized = recognized || registry.files["library.json"] == marker || registry.pending?["library.json"] == marker
                 }
+                try await result.validateReads(absent: absent, registries: registries, directory: directory)
                 guard recognized, let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else {
                     throw SharedProjectionWriteError.untracked("library.json")
                 }
@@ -116,6 +148,7 @@ struct SharedPublishedLocations: Sendable {
             }
             guard inputs.files["library.json"] == SharedLibraryOperation.fingerprint(bytes) else { throw SharedProjectionWriteError.untracked("library.json") }
         } else if inputs.files["library.json"] != nil { throw SharedProjectionWriteError.untracked("library.json") }
+        try await result.validateReads(absent: absent, registries: nil, directory: directory)
         // Bootstrap claims remain reserved until first physical publication,
         // including an interrupted move after the audio phase has completed.
         for reference in manifest.references where reference.entity.kind == .recording {

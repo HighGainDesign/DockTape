@@ -26,7 +26,11 @@ struct DockTapeSharedLibraryTests {
         func wait() async { waiting = true; await withCheckedContinuation { continuation = $0 } }
         func release() { continuation?.resume(); continuation = nil }
     }
-    @MainActor static func main() async throws {
+    @MainActor static func main() async {
+        do { try await run() }
+        catch { fputs("Shared AppState checks failed: \(error)\n", stderr); exit(1) }
+    }
+    @MainActor static func run() async throws {
         _ = NSApplication.shared
         UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
         let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeSharedApp-" + UUID().uuidString)

@@ -105,6 +105,7 @@ public actor SharedLibraryCoordinator {
   private let repository: SharedLibraryRepository
   private let witnessDirectory: URL?
   private let afterCommit: @Sendable () async -> Void
+  private let afterPublishedLibraryRead: @Sendable () async throws -> Void
   private let trash: @Sendable (URL) throws -> Void
   private var manifest: SharedBootstrapManifest?
   private var members: SharedMemberRepository?
@@ -134,6 +135,7 @@ public actor SharedLibraryCoordinator {
   public init(
     root: URL, writerID: UUID, versionAccess: RecordingFileVersionAccess = .init(),
     witnessDirectory: URL? = nil, afterCommit: @escaping @Sendable () async -> Void = {},
+    afterPublishedLibraryRead: @escaping @Sendable () async throws -> Void = {},
     trash: @escaping @Sendable (URL) throws -> Void = { try SharedLibraryMaterializer.moveToTrash($0) }
   ) {
     self.root = root.standardizedFileURL.resolvingSymlinksInPath()
@@ -141,6 +143,7 @@ public actor SharedLibraryCoordinator {
     self.versionAccess = versionAccess
     self.witnessDirectory = witnessDirectory
     self.afterCommit = afterCommit
+    self.afterPublishedLibraryRead = afterPublishedLibraryRead
     self.trash = trash
     bootstrap = LegacyLibraryBootstrap(
       root: root, writerID: writerID, witnessDirectory: witnessDirectory)
@@ -320,7 +323,7 @@ public actor SharedLibraryCoordinator {
   private func pathIndex(for views: [SharedLibraryViewSnapshot], caseSensitive: Bool = false) async throws -> SharedLibraryPathIndex {
     let manifest = try await bind(force: true)
     let membership = try await memberRepository().load().membership
-    let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
     return try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: caseSensitive,
       retainedLocations: locations.reservations(states: views.map(\.state), library: manifest.libraryID))
   }
@@ -348,7 +351,7 @@ public actor SharedLibraryCoordinator {
     guard view.libraryID == reference.libraryID, view.state.lifecycle == .alive else { throw SharedLibraryCoordinatorError.staleJob }
     let path = try await currentPath(view)
     let membership = try await memberRepository().load().membership
-    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
     guard published.recordings[reference.entityID]?.contains(path) == true else { throw SharedLibraryOperationError.unfinishedOperation }
     for original in published.recordings[reference.entityID] ?? [] where original != path {
       let stem = (original as NSString).deletingPathExtension
@@ -577,7 +580,7 @@ public actor SharedLibraryCoordinator {
       guard existing.state.lifecycle == .alive, existing.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
       let manifest = try await bind(force: true)
       let membership = try await memberRepository().load().membership
-      let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+      let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
       hasPublishedAudio = locations.recordings[existing.state.id]?.isEmpty == false
       if hasPublishedAudio {
         filename = try await resolve(.init(libraryID: existing.libraryID, entityID: existing.state.id))
@@ -903,7 +906,7 @@ public actor SharedLibraryCoordinator {
     let inventory = try await SharedDirectoryInventory.prepare(at: root.appendingPathComponent(source))
     let manifest = try await bind(force: true)
     let membership = try await memberRepository().load().membership
-    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
     for view in views where view.state.kind == .recording {
       guard let path = index.resolvedPaths[view.state.id], path.hasPrefix(source + "/") else { continue }
       let stem = (path as NSString).deletingPathExtension
@@ -1219,7 +1222,7 @@ public actor SharedLibraryCoordinator {
     let destinationStem = (destination as NSString).deletingPathExtension
     let manifest = try await bind(force: true)
     let membership = try await memberRepository().load().membership
-    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
     var steps: [SharedLibraryOperation.Step] = []
     var sourceBindings = published.proofs.map { file, hash in
       SharedMaterializationBinding(file: file) { SharedLibraryOperation.fingerprint($0) == hash }
@@ -1292,7 +1295,7 @@ public actor SharedLibraryCoordinator {
     }
     let manifest = try await bind(force: true)
     let membership = try await memberRepository().load().membership
-    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
     let stem = (source as NSString).deletingPathExtension
     var steps: [SharedLibraryOperation.Step] = []
     for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
@@ -1356,7 +1359,7 @@ public actor SharedLibraryCoordinator {
             case .document(let document)? = view.state.value(for: fileIntentField) else { return nil }
       let manifest = try await bind(force: true)
       let membership = try await memberRepository().load().membership
-      let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+      let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
       if published.completedFileIntents[id]?[writerID.uuidString.lowercased()] == SharedLibraryOperation.fingerprint(document.json) { return nil }
       let destination = try await currentPath(view)
       let locations = try published.reservations(states: [view.state], library: view.libraryID)
@@ -1623,7 +1626,7 @@ public actor SharedLibraryCoordinator {
     let views = try await snapshots(kinds: [.recording, .folder, .template])
     let after = try await SharedLibraryProjectionWriter.authoritySources(root: root)
     let membership = try await memberRepository().load().membership
-    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
     let pathStates = views.map { view -> SharedEntityState in
       let fields = view.state.kind == .folder ? ["name", "parent"] : ["title", "folder"]
       return fields.contains(where: { view.state.fields[$0]?.isConflicted == true }) ? (view.confirmedState ?? view.state) : view.state
@@ -1754,7 +1757,7 @@ public actor SharedLibraryCoordinator {
       guard selected.state.lifecycle == .uninitialized, selected.writers.isEmpty else { throw SharedLibraryOperationError.invalidOperation }
     }
     let sensitivity = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
-    let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
     let knownIDs = Set(snapshots.filter { $0.state.kind == .recording }.map { $0.state.id })
     guard Set(locations.recordings.keys).isSubset(of: knownIDs) else { throw SharedProjectionWriteError.untracked("library.json") }
     let index = try SharedLibraryPathIndex(states: snapshots.map(\.state), caseSensitive: sensitivity, retainedLocations: locations.reservations(states: snapshots.map(\.state), library: manifest.libraryID))
@@ -2177,7 +2180,7 @@ public actor SharedLibraryCoordinator {
     let document = try SharedDocument(id: id, json: externalBody(bytes, snapshot: snapshot, component: component))
     let manifest = try await bind(force: true)
     let membership = try await memberRepository().load().membership
-    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
     let relative = String(url.standardizedFileURL.resolvingSymlinksInPath().path.dropFirst(root.path.count + 1))
     if (try? published.validateCompanion(path: relative, bytes: bytes, entity: entity.id,
          library: snapshot.libraryID, kind: component.rawValue)) != nil { return nil }

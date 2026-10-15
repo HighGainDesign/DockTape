@@ -38,6 +38,64 @@ final class SharedLibraryProjectionWriterTests: XCTestCase {
         let next = try await coordinator.projectOutputs()
         XCTAssertEqual(next.written, 0)
     }
+    private actor ReadStage {
+        private var count = 0
+        func first() -> Bool { count += 1; return count == 1 }
+        func observations() -> Int { count }
+    }
+    func testPublishedLocationsReadRetriesWhenKnownProjectionAdvancesBetweenFiles() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let view = try await coordinator.recording(at: "Meeting.mp3")
+        let permission = try await coordinator.operationAuthority(entity: .init(id: view.state.id, kind: .recording), paths: [])
+        let manifest = try JSONDecoder().decode(SharedBootstrapManifest.self, from: Data(contentsOf: root.appendingPathComponent(".docktape/format.json")))
+        let stage = ReadStage()
+        let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: permission.membership, afterLibraryRead: {
+            if await stage.first() {
+                let current = try await coordinator.read(.init(id: view.state.id, kind: .recording))
+                _ = try await coordinator.edit(.init(base: current, changes: [.assign(field: "metadata.mode", value: .text("\"Mee\""))]))
+                _ = try await coordinator.projectOutputs()
+            }
+        })
+        let library = root.appendingPathComponent("library.json")
+        XCTAssertEqual(locations.proofs[library], SharedLibraryOperation.fingerprint(try Data(contentsOf: library)))
+        XCTAssertEqual(locations.recordings[view.state.id], ["Meeting.mp3"])
+    }
+    func testPublishedLocationsReadStillRefusesStableExternalLibraryAfterRace() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let view = try await coordinator.recording(at: "Meeting.mp3")
+        let permission = try await coordinator.operationAuthority(entity: .init(id: view.state.id, kind: .recording), paths: [])
+        let manifest = try JSONDecoder().decode(SharedBootstrapManifest.self, from: Data(contentsOf: root.appendingPathComponent(".docktape/format.json")))
+        let external = Data("{\"External.mp3\":{\"mode\":\"Rec\"}}".utf8)
+        let stage = ReadStage()
+        do {
+            _ = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: permission.membership, afterLibraryRead: {
+                if await stage.first() { try external.write(to: root.appendingPathComponent("library.json"), options: .atomic) }
+            })
+            XCTFail("A retry must not adopt an unmarked external library")
+        } catch SharedProjectionWriteError.untracked(let path) { XCTAssertEqual(path, "library.json") }
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("library.json")), external)
+    }
+    func testPublishedLocationsReadBoundsRetriesWhenEveryProjectionChanges() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let view = try await coordinator.recording(at: "Meeting.mp3")
+        let permission = try await coordinator.operationAuthority(entity: .init(id: view.state.id, kind: .recording), paths: [])
+        let manifest = try JSONDecoder().decode(SharedBootstrapManifest.self, from: Data(contentsOf: root.appendingPathComponent(".docktape/format.json")))
+        let stage = ReadStage()
+        do {
+            _ = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: permission.membership, afterLibraryRead: {
+                _ = await stage.first()
+                let current = try await coordinator.read(.init(id: view.state.id, kind: .recording))
+                _ = try await coordinator.edit(.init(base: current, changes: [.assign(field: "metadata.mode", value: .text("\"Mee\""))]))
+                _ = try await coordinator.projectOutputs()
+            })
+            XCTFail("Continuously changing input must not yield a mixed snapshot")
+        } catch SharedProjectionWriteError.stale {}
+        let attempts = await stage.observations()
+        XCTAssertEqual(attempts, 3)
+    }
     func testWritesCanonicalAggregatesAndReadableFilesThenSkipsIdenticalBytes() async throws {
         let (root, coordinator) = try await fixture()
         let records = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))

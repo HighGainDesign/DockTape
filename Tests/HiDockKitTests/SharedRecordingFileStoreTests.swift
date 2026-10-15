@@ -1182,4 +1182,47 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Final.mp3")), Data("single synthetic original".utf8))
     }
 
+    func testIDBoundStoreDeletionSurvivesKnownPublicationBetweenCanonicalAndRegistryReads() async throws {
+        let (root, owner, _) = try await fixture()
+        let reference = try await owner.reference(to: "Meeting.mp3")
+        let stage = ResolutionMutations()
+        let local = root.deletingLastPathComponent().appendingPathComponent("local")
+        let recycled = root.deletingLastPathComponent().appendingPathComponent("race-recycled")
+        let reader = SharedLibraryCoordinator(root: root, writerID: owner.writerID, witnessDirectory: local, afterPublishedLibraryRead: {
+            if await stage.next() == 1 {
+                let view = try await owner.read(.init(id: reference.entityID, kind: .recording))
+                _ = try await owner.edit(.init(base: view, changes: [.assign(field: "metadata.mode", value: .text("\"Rec\""))]))
+                _ = try await owner.projectOutputs()
+            }
+        }, trash: { url in
+            try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: url, to: recycled.appendingPathComponent(url.lastPathComponent))
+        })
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: reader))
+        try await store.setup()
+        try await store.deleteRecordingAndSidecars(filename: "Meeting.mp3", reference: reference)
+        let outcome = await store.sharedOperation
+        XCTAssertEqual(outcome?.result, .complete); XCTAssertNil(outcome?.projectionError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path))
+        XCTAssertEqual(try Data(contentsOf: recycled.appendingPathComponent("Meeting.mp3")), Data("single synthetic original".utf8))
+    }
+    func testIDBoundStoreDeletionPreservesExternalLibraryArrivingDuringRead() async throws {
+        let (root, owner, _) = try await fixture()
+        let reference = try await owner.reference(to: "Meeting.mp3")
+        let stage = ResolutionMutations()
+        let external = Data("{\"External.mp3\":{}}".utf8)
+        let reader = SharedLibraryCoordinator(root: root, writerID: owner.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"), afterPublishedLibraryRead: {
+                if await stage.next() == 1 { try external.write(to: root.appendingPathComponent("library.json"), options: .atomic) }
+            }, trash: { _ in XCTFail("An external library must block before touching originals") })
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: reader))
+        try await store.setup()
+        do { try await store.deleteRecordingAndSidecars(filename: "Meeting.mp3", reference: reference); XCTFail() }
+        catch SharedProjectionWriteError.untracked(let path) { XCTAssertEqual(path, "library.json") }
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("library.json")), external)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), Data("single synthetic original".utf8))
+        let view = try await owner.read(.init(id: reference.entityID, kind: .recording))
+        XCTAssertEqual(view.state.lifecycle, .alive)
+    }
+
 }
