@@ -20,8 +20,7 @@ public actor SharedTemplateAdapter {
             guard case .text(let id)? = view.state.value(for: "templateID") else { throw SharedSidecarError.invalidContent }
             guard seen[id] == nil else { throw SharedSidecarError.ambiguousPath }
             seen[id] = view
-            if view.state.lifecycle == .alive { values.append(try Self.render(view)) }
-            else if view.state.lifecycle == .conflicted { throw SharedSidecarError.conflictedContent }
+            if let template = try Self.visibleTemplate(view) { values.append(template) }
         }
         try Task.checkCancellation()
         if loadRequest == request { displayed = seen }
@@ -127,17 +126,59 @@ public actor SharedTemplateAdapter {
         displayed[id] = accepted
         return try Self.render(accepted)
     }
-    static func render(_ view: SharedLibraryViewSnapshot) throws -> Template {
-        guard case .text(let id)? = view.state.value(for: "templateID"),
-              case .flag(let builtIn)? = view.state.value(for: "isBuiltIn") else { throw SharedSidecarError.invalidContent }
+    private enum RenderingError: Error { case unavailableConflict }
+
+    /// Validate the entire current template before deciding whether an unresolved
+    /// field can be omitted. An earlier unavailable field must not hide a later
+    /// malformed value and silently remove the template from published JSON.
+    private static func validate(_ state: SharedEntityState) throws -> (id: String, builtIn: Bool, fallback: Template?) {
+        guard state.kind == .template,
+              case .text(let id)? = state.value(for: "templateID"),
+              case .flag(let builtIn)? = state.value(for: "isBuiltIn") else { throw SharedSidecarError.invalidContent }
         let fallback = TemplateStore.builtInDefaults.first { $0.id == id }
         guard (fallback != nil) == builtIn else { throw SharedSidecarError.invalidContent }
+        for field in ["name", "description", "prompt"] {
+            let values = state.fields[field]?.values ?? []
+            guard (!values.isEmpty || builtIn), values.allSatisfy({ value in
+                if case .text = value { return true }
+                return builtIn && value == .unset
+            }) else { throw SharedSidecarError.invalidContent }
+        }
+        return (id, builtIn, fallback)
+    }
+    /// Conflicted lifecycles retain only the certified common template, never
+    /// an arrival-order winner. A deleted/unconfirmed item stays out of catalogs.
+    static func visibleTemplate(_ view: SharedLibraryViewSnapshot) throws -> Template? {
+        if view.state.lifecycle == .alive {
+            do { return try render(view.state, confirmed: view.confirmedState) }
+            catch RenderingError.unavailableConflict { return nil }
+        }
+        guard view.state.lifecycle == .conflicted else { return nil }
+        let current = try validate(view.state)
+        guard let confirmed = view.confirmedState,
+              confirmed.id == view.state.id, confirmed.kind == .template, confirmed.lifecycle == .alive else { return nil }
+        let previous = try validate(confirmed)
+        guard previous.id == current.id, previous.builtIn == current.builtIn else { throw SharedSidecarError.invalidContent }
+        do { return try render(confirmed, confirmed: nil) }
+        catch RenderingError.unavailableConflict { throw SharedSidecarError.conflictedContent }
+    }
+    static func render(_ view: SharedLibraryViewSnapshot) throws -> Template {
+        do { return try render(view.state, confirmed: view.confirmedState) }
+        catch RenderingError.unavailableConflict { throw SharedSidecarError.conflictedContent }
+    }
+    private static func render(_ state: SharedEntityState, confirmed: SharedEntityState?) throws -> Template {
+        let (id, builtIn, fallback) = try validate(state)
+        if let confirmed {
+            let previous = try validate(confirmed)
+            guard confirmed.id == state.id, previous.id == id, previous.builtIn == builtIn else { throw SharedSidecarError.invalidContent }
+        }
         func text(_ field: String, default defaultText: String?) throws -> String {
-            let register = view.state.fields[field]
-            let value = register?.isConflicted == true ? view.confirmedState?.fields[field]?.resolvedValue : register?.resolvedValue
+            let register = state.fields[field]
+            let value = register?.isConflicted == true ? confirmed?.fields[field]?.resolvedValue : register?.resolvedValue
             if case .text(let result)? = value { return result }
             if value == nil || value == .unset, let defaultText { return defaultText }
-            throw SharedSidecarError.conflictedContent
+            if value == nil, register?.isConflicted == true { throw RenderingError.unavailableConflict }
+            throw SharedSidecarError.invalidContent
         }
         return try Template(id: id, name: text("name", default: fallback?.name),
                             description: text("description", default: fallback?.description),

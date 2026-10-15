@@ -83,8 +83,9 @@ final class SharedLibraryReviewState {
             guard let selected = selections[field.id], let review = item.folderRequests[selected], fields.count == 1 else { return false }
             return await applyFolderRequest(review, using: coordinator)
         }
-        let decidingLifecycle = item.snapshot.state.kind == .recording && item.snapshot.state.lifecycle == .conflicted
-        let preservingDeletion = item.snapshot.state.kind == .recording && item.snapshot.state.lifecycle == .deleted
+        let supportsLifecycle = item.snapshot.state.kind == .recording || item.snapshot.state.kind == .template
+        let decidingLifecycle = supportsLifecycle && item.snapshot.state.lifecycle == .conflicted
+        let preservingDeletion = supportsLifecycle && item.snapshot.state.lifecycle == .deleted
         guard !fields.isEmpty, item.snapshot.state.lifecycle == .alive || decidingLifecycle || preservingDeletion else { return false }
         // These mutations are one atomic owner-envelope commit. The temporary
         // restoration permits reviewed content edits; no alive state is published.
@@ -116,7 +117,7 @@ final class SharedLibraryReviewState {
                 guard let self, self.binding === coordinator, self.request == ticket else { return false }
                 let accepted = try await coordinator.resolve(.init(base: item.snapshot, changes: changes))
                 var publication: String?
-                if decidingLifecycle || preservingDeletion {
+                if (decidingLifecycle || preservingDeletion) && accepted.state.kind == .recording {
                     if accepted.state.lifecycle == .deleted {
                         publication = "Deletion choice saved. Original files remain pending safe cleanup; deletion has not completed."
                         if accepted.state.conflicts.isEmpty {
@@ -129,6 +130,10 @@ final class SharedLibraryReviewState {
                             }
                         } else { publication = "Deletion choice saved. Competing content still needs recovery review before files can be removed." }
                     } else { publication = "Recording kept with its edits. Review any remaining changes before continuing pending file operations." }
+                } else if (decidingLifecycle || preservingDeletion) && accepted.state.kind == .template {
+                    publication = accepted.state.lifecycle == .deleted
+                        ? "Template deleted. Any remaining competing edits are retained for review."
+                        : "Template kept with its edits. Review any remaining competing changes."
                 }
                 do { _ = try await coordinator.projectOutputs() }
                 catch SharedProjectionWriteError.untracked(let path) { publication = "Choice saved. " + path + " changed outside DockTape and needs a file review before publishing." }
@@ -193,8 +198,8 @@ final class SharedLibraryReviewState {
             let generation = parts.count >= 4 && parts[1] == "edits" ? UUID(uuidString: parts[2]) : nil
             let isContent = component != nil && parts.count == 2 && parts[1] == "content"
             let safeScalar = ["prompt", "description"].contains(conflict.field) || conflict.field == "metadata.mode" || (state.kind == .template && conflict.field == "name")
-            let lifecycleChoice = state.kind == .recording && state.lifecycle == .conflicted && conflict.field == "$lifecycle"
-            let editableContent = state.lifecycle == .alive || (state.kind == .recording && state.lifecycle == .deleted)
+            let lifecycleChoice = (state.kind == .recording || state.kind == .template) && state.lifecycle == .conflicted && conflict.field == "$lifecycle"
+            let editableContent = state.lifecycle == .alive || ((state.kind == .recording || state.kind == .template) && state.lifecycle == .deleted)
             let folderRequest = state.kind == .folder && conflict.field == "deletionRequest" && (state.lifecycle == .alive || state.lifecycle == .deleted)
             let supported = folderRequest || lifecycleChoice || (editableContent && (isContent || generation != nil || safeScalar))
             let choices = supported ? conflict.values.compactMap { value -> Choice? in
@@ -210,9 +215,12 @@ final class SharedLibraryReviewState {
                 }
                 if lifecycleChoice {
                     guard case .flag(let keep) = value else { return nil }
-                    let label = keep ? "Keep Recording and Edits" : "Delete Recording"
-                    let detail = (keep ? "Keep this recording and the retained edits below. Other competing changes will still need review." : "Hide this recording. Original files remain until safe cleanup is approved by the participating Macs.")
-                        + "\n\n" + lifecyclePreview(state)
+                    let template = state.kind == .template
+                    let label = template ? (keep ? "Keep Template and Edits" : "Delete Template") : (keep ? "Keep Recording and Edits" : "Delete Recording")
+                    let explanation = template
+                        ? (keep ? "Keep this template and its retained edits. Other competing changes still need review." : "Remove this template from the catalog. Its retained competing edits remain available for review.")
+                        : (keep ? "Keep this recording and the retained edits below. Other competing changes will still need review." : "Hide this recording. Original files remain until safe cleanup is approved by the participating Macs.")
+                    let detail = explanation + "\n\n" + lifecyclePreview(state)
                     return .init(id: identity(value), value: value, label: label, detail: detail, isAvailable: true)
                 }
                 let detail = preview(value, field: conflict.field)
@@ -231,7 +239,7 @@ final class SharedLibraryReviewState {
                 heading = "Action item: " + entry.text
             }
             fields.append(.init(id: conflict.field, title: heading, choices: choices,
-                explanation: lifecycleChoice ? "Choose whether to keep this recording before reviewing any other competing changes. Files are removed only after the participating Macs approve safe cleanup." : supported ? (isContent ? "Edits attached to other versions will be discarded when you choose a version." : nil) : "This file or lifecycle change needs a recovery review.",
+                explanation: lifecycleChoice ? (state.kind == .template ? "Choose whether to keep the template before reviewing its retained competing edits." : "Choose whether to keep this recording before reviewing any other competing changes. Files are removed only after the participating Macs approve safe cleanup.") : supported ? (isContent ? "Edits attached to other versions will be discarded when you choose a version." : nil) : "This file or lifecycle change needs a recovery review.",
                 component: component, generation: generation, isOlderEdits: false))
         }
         for component in [SharedComponent.transcript, .summary] {
@@ -257,6 +265,13 @@ final class SharedLibraryReviewState {
     }
     private static func lifecyclePreview(_ state: SharedEntityState) -> String {
         var sections: [String] = []
+        if state.kind == .template {
+            for (field, label) in [("name", "Name"), ("description", "Description"), ("prompt", "Instructions")] {
+                let alternatives = (state.fields[field]?.values ?? []).map { preview($0, field: field) }.sorted()
+                if !alternatives.isEmpty { sections.append(label + ":\n" + alternatives.joined(separator: "\n\n")) }
+            }
+            return sections.joined(separator: "\n\n")
+        }
         for component in [SharedComponent.transcript, .summary] {
             for document in state.generationValues(for: component).sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
                 sections.append(preview(.document(document), field: component.rawValue + ".content"))

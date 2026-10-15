@@ -500,6 +500,70 @@ import HiDockKit
         print("Actual unprepared deletion passed: retry, explicit Keep, native external-file restoration and deletion again complete without fixture repair writes.")
     }
 
+    @MainActor static func templateLifecycleChecks(parent: URL) async throws {
+        for keep in [true, false] {
+            let directory = parent.appendingPathComponent(keep ? "keep" : "delete"), left = directory.appendingPathComponent("left"), right = directory.appendingPathComponent("right")
+            try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
+            let user = Template.makeUserTemplate(name: "Contested template", description: "Original description", promptText: "Original prompt")
+            let other = Template.makeUserTemplate(name: "Unrelated template", description: "Keep this", promptText: "Unrelated prompt")
+            let legacy = TemplateStore(baseDirectory: left)
+            try await legacy.addUserTemplate(user); try await legacy.addUserTemplate(other)
+            let a = SharedLibraryCoordinator(root: left, writerID: UUID(), witnessDirectory: directory.appendingPathComponent("a-local"))
+            _ = try await a.enable(); _ = try await a.projectOutputs()
+            try FileManager.default.copyItem(at: left, to: right)
+            let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: directory.appendingPathComponent("b-local"))
+            try await b.requestEnrollment(requestID: UUID(), label: "Template editing Mac")
+            for _ in 0..<3 {
+                try deliver(right, to: left, writer: b.writerID); try await a.refresh()
+                try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+            }
+            let storeA = TemplateStore(baseDirectory: left, shared: SharedTemplateAdapter(coordinator: a))
+            let storeB = TemplateStore(baseDirectory: right, shared: SharedTemplateAdapter(coordinator: b))
+            try await storeA.load(); try await storeB.load()
+            var first = user; first.promptText = "Retained prompt A"
+            var second = user; second.promptText = "Retained prompt B"
+            try await storeA.update(first); try await storeA.delete(id: user.id)
+            try await storeB.update(second)
+            try deliver(right, to: left, writer: b.writerID)
+            let model = SharedLibraryReviewState(); await model.refresh(using: a)
+            guard let item = model.items.first(where: { $0.snapshot.state.kind == .template }),
+                  let field = item.fields.first(where: { $0.id == "$lifecycle" }) else { throw Failure(message: "Template lifecycle conflict must have a row") }
+            try expect(field.choices.count == 2, "Template delete-versus-edit must offer explicit Keep/Delete decisions")
+            try expect(field.choices.allSatisfy { $0.detail.contains("Retained prompt A") && $0.detail.contains("Retained prompt B") }, "Template lifecycle choices must preview both retained prompts")
+            guard let choice = field.choices.first(where: { $0.value == .flag(keep) }) else { throw Failure(message: "Missing template decision") }
+            // A new field write changes the reviewed lifecycle context too.
+            let changed = try await a.read(.init(id: item.id, kind: .template))
+            _ = try await a.resolve(.init(base: changed, changes: [.restore, .assign(field: "description", value: .text("New retained description"))]))
+            try expect(!(await model.apply(item: item, selections: [field.id: choice.id], using: a)), "An unseen template edit must invalidate the old lifecycle choice")
+            // Recreate delete-vs-edit concurrently after the controlled stale attempt.
+            _ = try await a.edit(.init(base: try await a.read(.init(id: item.id, kind: .template)), changes: [.delete]))
+            var third = second; third.description = "Offline description"
+            try await storeB.update(third); try deliver(right, to: left, writer: b.writerID)
+            await model.refresh(using: a)
+            guard let current = model.items.first(where: { $0.id == item.id }), let lifecycle = current.fields.first(where: { $0.id == "$lifecycle" }),
+                  let selected = lifecycle.choices.first(where: { $0.value == .flag(keep) }) else { throw Failure(message: "Reloaded template lifecycle choice missing") }
+            try expect(await model.apply(item: current, selections: [lifecycle.id: selected.id], using: a), "Template lifecycle choice saves through actual review model")
+            guard let retained = model.items.first(where: { $0.id == item.id }), let prompts = retained.fields.first(where: { $0.id == "prompt" }),
+                  let promptB = prompts.choices.first(where: { $0.value == .text("Retained prompt B") }) else { throw Failure(message: "Retained prompt conflict remains actionable for both Keep and Delete") }
+            var decisions = [prompts.id: promptB.id]
+            for field in retained.visibleFields(selections: decisions) where !field.choices.isEmpty && field.id != prompts.id {
+                guard let selected = field.choices.first(where: { $0.value == .text("Offline description") }) ?? field.choices.first else { throw Failure(message: "Missing retained field decision") }
+                decisions[field.id] = selected.id
+            }
+            try expect(await model.apply(item: retained, selections: decisions, using: a), "Retained template content resolves without changing chosen lifecycle")
+            let accepted = try await a.read(.init(id: item.id, kind: .template))
+            try expect(accepted.state.lifecycle == (keep ? .alive : .deleted) && accepted.state.conflicts.isEmpty, "Template review preserves chosen lifecycle and resolves the retained edits")
+            try expect(accepted.state.value(for: "prompt") == .text("Retained prompt B"), "Selected template prompt remains stored even after Delete")
+            try await storeA.load()
+            try expect(await storeA.template(forID: other.id) == other, "Unrelated template remains usable")
+            try expect((await storeA.template(forID: user.id) != nil) == keep, "Catalog reflects explicit Keep/Delete choice")
+            try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+            let converged = try await b.read(.init(id: item.id, kind: .template))
+            try expect(converged.state == accepted.state, "Replica converges on lifecycle and retained content")
+        }
+        print("Actual template lifecycle passed: readable Keep/Delete, stale refusal, retained content after Delete, catalog and replica convergence.")
+    }
+
     @MainActor static func lifecycleReviewChecks(parent: URL) async throws {
         for keep in [true, false] { try await lifecycleReviewCase(parent: parent.appendingPathComponent(keep ? "keep" : "delete"), keep: keep) }
         try await lifecycleReviewCase(parent: parent.appendingPathComponent("delete-with-content"), keep: false, competing: true)
@@ -600,6 +664,7 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--template-lifecycle-only") { try await templateLifecycleChecks(parent: parent); return }
         if arguments.contains("--folder-requests-only") { try await folderRequestConflictChecks(parent: parent); return }
         if arguments.contains("--folder-rejection-only") { try await rejectedFolderRenameChecks(parent: parent); return }
         if arguments.contains("--folder-feedback-only") { try await folderFeedbackChecks(parent: parent); return }
@@ -610,6 +675,7 @@ import HiDockKit
             return
         }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
+        try await templateLifecycleChecks(parent: parent.appendingPathComponent("template-lifecycle"))
         try await folderRequestConflictChecks(parent: parent.appendingPathComponent("folder-requests"))
         try await pendingFolderChecks(parent: parent.appendingPathComponent("folders"))
         try await pendingFolderChecks(parent: parent.appendingPathComponent("folders-interrupted"), interruptBeforeOwnerApproval: true)

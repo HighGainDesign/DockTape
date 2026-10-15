@@ -15,6 +15,126 @@ final class SharedTemplateStoreTests: XCTestCase {
         _ = try await coordinator.enable()
         return (root, coordinator, user)
     }
+    private func conflictedLifecycleFixture(unconfirmed: Bool = false, conflictingName: Bool = false) async throws -> (URL, SharedLibraryCoordinator, Template, Template) {
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString); roots.append(parent)
+        let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right")
+        try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
+        var user = Template.makeUserTemplate(name: "Contested", description: "Original description", promptText: "Original prompt")
+        let other = Template.makeUserTemplate(name: "Unrelated", description: "Keep", promptText: "Other prompt")
+        let legacy = TemplateStore(baseDirectory: left); try await legacy.addUserTemplate(user); try await legacy.addUserTemplate(other)
+        let a = SharedLibraryCoordinator(root: left, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("a-local"))
+        _ = try await a.enable(); _ = try await a.projectOutputs()
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("b-local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Template peer")
+        func deliver(_ source: URL, _ destination: URL, _ writer: UUID) throws {
+            let tree = source.appendingPathComponent(".docktape").resolvingSymlinksInPath()
+            guard let files = FileManager.default.enumerator(at: tree, includingPropertiesForKeys: nil) else { return }
+            for case let file as URL in files where file.pathExtension == "json" {
+                let bytes = try Data(contentsOf: file)
+                let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] ?? [:]
+                let payload = object["payload"] as? [String: Any]
+                let owner = (object["writerID"] as? String) ?? (payload?["writer"] as? String) ?? (object["founder"] as? String)
+                guard owner.flatMap(UUID.init(uuidString:)) == writer else { continue }
+                let target = destination.appendingPathComponent(".docktape/" + String(file.resolvingSymlinksInPath().path.dropFirst(tree.path.count + 1)))
+                try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try bytes.write(to: target, options: .atomic)
+            }
+        }
+        for _ in 0..<3 {
+            try deliver(right, left, b.writerID); try await a.refresh()
+            try deliver(left, right, a.writerID); try await b.refresh()
+        }
+        let sa = TemplateStore(baseDirectory: left, shared: SharedTemplateAdapter(coordinator: a)), sb = TemplateStore(baseDirectory: right, shared: SharedTemplateAdapter(coordinator: b))
+        try await sa.load(); try await sb.load()
+        if unconfirmed {
+            user = Template.makeUserTemplate(name: "New contested", description: "New description", promptText: "New original")
+            try await sa.addUserTemplate(user)
+            try deliver(left, right, a.writerID); try await sb.load()
+            var first = user
+            if conflictingName { first.name = "New name A" } else { first.promptText = "New version A" }
+            try await sa.update(first)
+        }
+        try await sa.delete(id: user.id)
+        var edited = user
+        if conflictingName { edited.name = "Offline name" } else { edited.promptText = "Offline edit" }
+        try await sb.update(edited); try deliver(right, left, b.writerID)
+        let views = try await a.snapshots(kinds: [.template])
+        let view = try XCTUnwrap(views.first { $0.state.value(for: "templateID") == .text(user.id) })
+        XCTAssertEqual(view.state.lifecycle, .conflicted)
+        if unconfirmed { XCTAssertNil(view.confirmedState, "New template has no common projection; do not invent a fallback") }
+        else { XCTAssertEqual(view.confirmedState?.value(for: "prompt"), .text("Original prompt"), "Fixture has a proven common template, not an arrival-order winner") }
+        return (left, a, user, other)
+    }
+    private func assertMalformedFieldRefusesCatalogAndProjection(conflictingName: Bool) async throws {
+        let (root, a, user, _) = try await conflictedLifecycleFixture(unconfirmed: true, conflictingName: conflictingName)
+        let views = try await a.snapshots(kinds: [.template])
+        let conflicted = try XCTUnwrap(views.first { $0.state.value(for: "templateID") == .text(user.id) })
+        let malformedField = conflictingName ? "prompt" : "name"
+        let restored = try await a.resolve(.init(base: conflicted, changes: [
+            .restore, .assign(field: malformedField, value: .flag(true))]))
+        XCTAssertTrue(restored.state.fields[conflictingName ? "name" : "prompt"]?.isConflicted == true)
+        XCTAssertNil(restored.confirmedState)
+        let canonical = root.appendingPathComponent(".templates.json")
+        let before = try Data(contentsOf: canonical)
+        let store = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: a))
+        do { try await store.load(); XCTFail("An unrelated conflict must not suppress malformed content") }
+        catch SharedSidecarError.invalidContent { }
+        do { _ = try await a.projectOutputs(); XCTFail("Malformed template must not be silently removed from published JSON") }
+        catch SharedSidecarError.invalidContent { }
+        XCTAssertEqual(try Data(contentsOf: canonical), before)
+    }
+    func testMalformedNameIsNotHiddenByUnconfirmedPromptConflict() async throws {
+        try await assertMalformedFieldRefusesCatalogAndProjection(conflictingName: false)
+    }
+    func testUnavailableNameConflictDoesNotHideMalformedLaterPrompt() async throws {
+        try await assertMalformedFieldRefusesCatalogAndProjection(conflictingName: true)
+    }
+
+    func testUnconfirmedTemplateConflictNeverInventsWinnerOrBlocksOtherTemplates() async throws {
+        let (root, a, user, other) = try await conflictedLifecycleFixture(unconfirmed: true)
+        let views = try await a.snapshots(kinds: [.template])
+        let conflicted = try XCTUnwrap(views.first { $0.state.value(for: "templateID") == .text(user.id) })
+        let restored = try await a.resolve(.init(base: conflicted, changes: [.restore]))
+        XCTAssertTrue(restored.state.fields["prompt"]?.isConflicted == true)
+        XCTAssertNil(restored.confirmedState)
+        let store = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: a))
+        try await store.load()
+        let contested = await store.template(forID: user.id), unrelated = await store.template(forID: other.id)
+        XCTAssertNil(contested, "Conflicting instructions without a confirmed common template cannot be offered as a resolved value")
+        XCTAssertEqual(unrelated, other)
+        _ = try await a.projectOutputs()
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent(".templates.json"))) as! [String: Any]
+        let users = object["userTemplates"] as! [[String: Any]]
+        XCTAssertFalse(users.contains { $0["id"] as? String == user.id })
+        XCTAssertTrue(users.contains { $0["id"] as? String == other.id })
+    }
+
+    func testTemplateLifecycleConflictKeepsConfirmedCatalogAndUnrelatedEditingUsable() async throws {
+        let (root, a, user, other) = try await conflictedLifecycleFixture()
+        let store = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: a))
+        try await store.load()
+        let contested = await store.template(forID: user.id), unrelated = await store.template(forID: other.id)
+        XCTAssertEqual(contested, user); XCTAssertEqual(unrelated, other)
+        var changed = user; changed.promptText = "Must refuse"
+        do { try await store.update(changed); XCTFail("Ordinary editing cannot resolve a contested lifecycle") }
+        catch SharedSidecarError.conflictedContent { }
+        var independent = other; independent.promptText = "Independent new prompt"
+        try await store.update(independent); try await store.load()
+        let saved = await store.template(forID: other.id), stillConfirmed = await store.template(forID: user.id)
+        XCTAssertEqual(saved, independent); XCTAssertEqual(stillConfirmed, user)
+    }
+    func testTemplateLifecycleConflictPublishesConfirmedJSONRatherThanDroppingTemplate() async throws {
+        let (root, a, user, other) = try await conflictedLifecycleFixture()
+        _ = try await a.projectOutputs()
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent(".templates.json"))) as! [String: Any]
+        let users = object["userTemplates"] as! [[String: Any]]
+        let original = try XCTUnwrap(users.first { $0["id"] as? String == user.id })
+        XCTAssertEqual(original["name"] as? String, "Contested")
+        XCTAssertEqual(original["promptText"] as? String, "Original prompt")
+        XCTAssertTrue(users.contains { $0["id"] as? String == other.id })
+    }
+
     func testActualTemplateStoresCombineIndependentFieldsAndReloadExternalState() async throws {
         let (root, coordinator, user) = try await fixture()
         let a = TemplateStore(baseDirectory: root, shared: SharedTemplateAdapter(coordinator: coordinator))

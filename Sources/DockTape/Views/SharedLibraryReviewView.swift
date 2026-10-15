@@ -36,7 +36,9 @@ struct SharedLibraryReviewView: View {
                         VStack(alignment: .leading, spacing: 16) {
                             Text(item.title).font(.headline)
                             Text(item.snapshot.state.lifecycle == .deleted
-                                ? "This recording is marked for deletion. Resolve its competing content before cleanup can continue."
+                                ? (item.snapshot.state.kind == .template
+                                    ? "This template is marked for deletion. Its competing content is retained for review."
+                                    : "This recording is marked for deletion. Resolve its competing content before cleanup can continue.")
                                 : "Choose the values to keep. Independent changes have already been combined.")
                                 .foregroundStyle(.secondary)
                             ForEach(item.visibleFields(selections: selections)) { field in

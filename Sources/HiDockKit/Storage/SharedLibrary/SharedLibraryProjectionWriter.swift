@@ -279,8 +279,7 @@ struct SharedLibraryProjectionWriter {
                         files[name] = bytes
                     }
                 }
-            } else if view.state.kind == .template, view.state.lifecycle == .alive {
-                let template = try SharedTemplateAdapter.render(view)
+            } else if view.state.kind == .template, let template = try SharedTemplateAdapter.visibleTemplate(view) {
                 let raw = try JSONSerialization.jsonObject(with: JSONEncoder().encode(template)) as! [String: Any]
                 if template.isBuiltIn { overrides.append(raw) } else { users.append(raw) }
             }
