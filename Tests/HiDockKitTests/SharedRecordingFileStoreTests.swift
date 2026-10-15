@@ -557,6 +557,63 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         }
     }
 
+    func testRepairAfterCompletedRenameRecoversCurrentAudioIntent() async throws {
+        let (root, coordinator, store) = try await fixture()
+        let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+        let entry = FileEntry(filename: "Repair.hda", size: UInt32(bytes.count))
+        _ = try await store.importRecording(hdaData: bytes, entry: entry)
+        _ = try await store.renameRecording(filename: "Repair.mp3", to: "Renamed repair")
+        let before = try await coordinator.recording(at: "Renamed repair.mp3")
+        try Data("corrupt".utf8).write(to: root.appendingPathComponent("Renamed repair.mp3"))
+        let local = root.deletingLastPathComponent().appendingPathComponent("local")
+        let interrupted = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: local,
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let repairStore = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: interrupted))
+        try await repairStore.setup()
+        let task = Task { try await repairStore.importRecording(hdaData: bytes, entry: entry) }
+        do { _ = try await task.value; XCTFail() } catch is CancellationError {}
+        let receipt = local.appendingPathComponent("Operations").appendingPathComponent(before.libraryID.uuidString)
+            .appendingPathComponent(coordinator.writerID.uuidString).appendingPathComponent(before.state.id.uuidString + ".json")
+        try FileManager.default.removeItem(at: receipt)
+        let outcome = try await coordinator.resumeRecordingOperation(id: before.state.id)
+        XCTAssertEqual(outcome.result, .complete)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Renamed repair.mp3")), bytes)
+    }
+
+    func testMissingFileReceiptRetainsOriginalLifecycleAndSemanticGuard() async throws {
+        for change in ["maintenance", "metadata", "renameABA", "deleteABA"] {
+            let (root, coordinator, _) = try await fixture()
+            let original = try await coordinator.recording(at: "Meeting.mp3")
+            let local = root.deletingLastPathComponent().appendingPathComponent("local")
+            let interrupted = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: local,
+                afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+            let task = Task {
+                if change == "deleteABA" { return try await interrupted.deleteSharedRecording(filename: "Meeting.mp3") }
+                return try await interrupted.relocateRecording(filename: "Meeting.mp3", title: "Renamed")
+            }
+            do { _ = try await task.value; XCTFail() } catch is CancellationError {}
+            let accepted = try await coordinator.read(.init(id: original.state.id, kind: .recording))
+            let entity = SharedEntityIdentity(id: accepted.state.id, kind: .recording)
+            let receipt = local.appendingPathComponent("Operations").appendingPathComponent(accepted.libraryID.uuidString)
+                .appendingPathComponent(coordinator.writerID.uuidString).appendingPathComponent(entity.id.uuidString + ".json")
+            try FileManager.default.removeItem(at: receipt)
+            switch change {
+            case "metadata": _ = try await coordinator.edit(.init(base: accepted, changes: [.assign(field: "metadata.mode", value: .text("\"Call\""))]))
+            case "renameABA":
+                _ = try await coordinator.edit(.init(base: accepted, changes: [.delete]))
+                _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.restore]))
+            case "deleteABA":
+                _ = try await coordinator.edit(.init(base: accepted, changes: [.restore]))
+                _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.delete]))
+            default: try await coordinator.refresh()
+            }
+            let result = try await coordinator.resumeRecordingOperation(id: entity.id)
+            XCTAssertEqual(result.result, change == "maintenance" ? .complete : .needsReplanning, change)
+            let path = change == "maintenance" ? "Renamed.mp3" : "Meeting.mp3"
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(path)), Data("single synthetic original".utf8))
+        }
+    }
+
     func testVerifiedSourceImportIdentityIsDeterministicAndChecksumSkipDetectsCorruption() async throws {
         let (root, coordinator, store) = try await fixture()
         let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])

@@ -60,6 +60,36 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
         }
     }
 
+    static func fileIntentField(writer: UUID) -> String { "materialization.files." + writer.uuidString.lowercased() }
+    func fileIntentGuardRevision(writer: UUID) throws -> String {
+        var semantic = self
+        semantic.fields.removeValue(forKey: Self.fileIntentField(writer: writer))
+        return try SharedLibraryOperation.revision(for: semantic)
+    }
+    mutating func recordFileIntent(_ plan: SharedPreparedFileOperation, writer: UUID) throws {
+        guard plan.entity == SharedEntityIdentity(id: id, kind: kind) else { throw SharedLibraryOperationError.differentBinding }
+        guard value(for: "materialization.audio." + writer.uuidString.lowercased()) == nil else { throw SharedLibraryOperationError.unfinishedOperation }
+        guard lifecycle == .alive || lifecycle == .deleted else { throw SharedLibraryOperationError.invalidOperation }
+        let lifecycleValue = SharedFieldValue.flag(lifecycle == .alive)
+        // Predict the exact two field writes while still inside the owner
+        // transaction. No placeholder is published or causal dot reused.
+        var bound = self
+        try bound.write(field: Self.fileIntentField(writer: writer), value: .unset, writer: writer)
+        try bound.write(field: Self.lifecycleField, value: lifecycleValue, writer: writer)
+        let revision = try bound.fileIntentGuardRevision(writer: writer)
+        _ = try SharedLibraryOperation(libraryID: plan.libraryID, entity: plan.entity, inputRevision: plan.inputRevision,
+            outputRevision: revision, steps: plan.steps)
+        guard plan.steps.allSatisfy({ step in
+            switch step { case .move, .moveDirectory, .trash, .createDirectory, .removeEmptyDirectory: return true; default: return false }
+        }) else { throw SharedLibraryOperationError.invalidOperation }
+        let intent = SharedAcceptedFileIntent(schema: 1, libraryID: plan.libraryID, entity: plan.entity,
+            inputRevision: plan.inputRevision, guardRevision: revision, steps: plan.steps)
+        try write(field: Self.fileIntentField(writer: writer), value: .document(try SharedDocument(id: UUID(), json: JSONEncoder().encode(intent))), writer: writer)
+        // Preserve lifecycle value and its established last-write causal bound.
+        try write(field: Self.lifecycleField, value: lifecycleValue, writer: writer)
+        guard try fileIntentGuardRevision(writer: writer) == revision else { throw SharedLibraryOperationError.invalidOperation }
+    }
+
     public mutating func assign(field: String, value: SharedFieldValue, writer: UUID) throws {
         guard !field.isEmpty, !field.contains("\0"), !field.hasPrefix("$"),
             !field.hasPrefix("transcript."), !field.hasPrefix("summary.")

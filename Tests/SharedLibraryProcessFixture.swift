@@ -10,6 +10,10 @@ struct SharedLibraryProcessFixture {
     let folder: String?
     let sequence: UInt64
   }
+  private actor CommitCounter {
+    var count = 0
+    func next() -> Int { count += 1; return count }
+  }
   private enum FixtureError: Error { case arguments, gateTimedOut }
 
   static func main() async throws {
@@ -17,6 +21,45 @@ struct SharedLibraryProcessFixture {
     guard args.count >= 5, let writer = UUID(uuidString: args[3]),
       let id = UUID(uuidString: args[4])
     else {
+      throw FixtureError.arguments
+    }
+    if args[1].hasPrefix("path-") {
+      guard args.count == 6 else { throw FixtureError.arguments }
+      let root = URL(fileURLWithPath: args[2]), local = URL(fileURLWithPath: args[5])
+      let counter = CommitCounter()
+      let coordinator = SharedLibraryCoordinator(root: root, writerID: writer, witnessDirectory: local, afterCommit: {
+        let count = await counter.next()
+        let target = args[1] == "path-folder-delete-child-crash" ? 2 : args[1] == "path-folder-delete-final-crash" ? 3 : 1
+        if args[1].hasSuffix("-crash"), count == target { Darwin._exit(74) }
+      }, trash: { source in
+        let disposal = root.deletingLastPathComponent().appendingPathComponent("disposed")
+        try FileManager.default.createDirectory(at: disposal, withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: source, to: disposal.appendingPathComponent(source.lastPathComponent))
+      })
+      if args[1] == "path-seed" {
+        _ = try await coordinator.enable(); _ = try await coordinator.projectOutputs(); print("seeded"); return
+      }
+      switch args[1] {
+      case "path-rename-crash": _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Renamed")
+      case "path-move-crash": _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", toFolder: "Folder", changeFolder: true)
+      case "path-delete-crash": _ = try await coordinator.deleteSharedRecording(filename: "Meeting.mp3")
+      case "path-create-crash": try await coordinator.createSharedFolder(named: "New")
+      case "path-folder-rename-crash": _ = try await coordinator.renameFolder(from: "Folder", to: "Renamed folder")
+      case "path-folder-delete-crash", "path-folder-delete-child-crash", "path-folder-delete-final-crash": _ = try await coordinator.deleteFolder(named: "Folder")
+      case "path-record-resume":
+        let result = try await coordinator.resumeRecordingOperation(id: id)
+        print(result.result == .complete ? "complete" : "pending"); return
+      case "path-folder-resume":
+        let result = try await coordinator.resumeFolderOperation(id: id)
+        print(result.result == .complete ? "complete" : "pending"); return
+      case "path-folder-delete-resume":
+        let result = try await coordinator.resumeFolderDeletion(id: id)
+        print(result.result == .complete ? "complete" : "pending"); return
+      case "path-ids":
+        let views = try await coordinator.snapshots(kinds: [.recording, .folder])
+        print(String(decoding: try JSONEncoder().encode(views.map { ["id": $0.state.id.uuidString, "kind": $0.state.kind.rawValue, "path": $0.state.value(for: "initialPath").flatMap { if case .text(let path) = $0 { return path }; return nil } ?? ""] }), as: UTF8.self)); return
+      default: throw FixtureError.arguments
+      }
       throw FixtureError.arguments
     }
     if args[1].hasPrefix("accept-") {

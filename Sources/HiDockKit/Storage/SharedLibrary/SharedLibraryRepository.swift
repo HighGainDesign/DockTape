@@ -49,6 +49,7 @@ public struct SharedLibraryEdit: Sendable {
   public let changes: [SharedLibraryMutation]
   public let validation: (@Sendable (SharedEntityState) throws -> Void)?
   public let bindings: [SharedMaterializationBinding]
+  var preparedFileOperation: SharedPreparedFileOperation?
   public init(base: SharedLibrarySnapshot, changes: [SharedLibraryMutation],
               validation: (@Sendable (SharedEntityState) throws -> Void)? = nil,
               bindings: [SharedMaterializationBinding] = []) {
@@ -322,6 +323,10 @@ public actor SharedLibraryRepository {
           try edit.validation?(current)
           try Self.validateBase(edit, against: current)
           for mutation in edit.changes { try Self.apply(mutation, to: &current, writer: writer) }
+          if let plan = edit.preparedFileOperation {
+            guard let foundation, plan.libraryID == foundation.libraryID else { throw SharedLibraryRepositoryError.invalidEnvelope }
+            try current.recordFileIntent(plan, writer: writer)
+          }
         case .vote(let proposal):
           guard let foundation else { throw SharedLibraryRepositoryError.invalidEnvelope }
           _ = try foundation.merged(with: proposal.membership)

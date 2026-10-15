@@ -130,6 +130,23 @@ public struct SharedMaterializationAuthority: Sendable {
   }
 }
 
+/// Prepared before acceptance; the repository binds its guard AFTER all user
+/// mutations, inside the same coordinated owner transaction.
+struct SharedPreparedFileOperation: Sendable {
+  let libraryID: UUID
+  let entity: SharedEntityIdentity
+  let inputRevision: String
+  let steps: [SharedLibraryOperation.Step]
+}
+struct SharedAcceptedFileIntent: Codable, Sendable {
+  let schema: Int
+  let libraryID: UUID
+  let entity: SharedEntityIdentity
+  let inputRevision: String
+  let guardRevision: String
+  let steps: [SharedLibraryOperation.Step]
+}
+
 /// One writer's current prepared audio intent. Committed with selected content,
 /// so a process exit cannot leave the sole replay description in local memory.
 /// Clearing it leaves a causal unset marker, not historical audio or receipts.

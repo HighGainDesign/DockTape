@@ -615,6 +615,7 @@ public actor SharedLibraryCoordinator {
     let step: SharedLibraryOperation.Step = !hasPublishedAudio
       ? .publishAudio(path: filename, staged: staged, selectedFingerprint: selected)
       : .replaceAudio(path: filename, staged: staged, expectedFingerprint: actualHash, selectedFingerprint: selected, repair: repair)
+    if case .document = base.state.value(for: fileIntentField) { changes.append(.assign(field: fileIntentField, value: .unset)) }
     changes.append(.assign(field: audioIntentField, value: .document(try preparedAudioDocument(
       library: base.libraryID, entity: entity, inputRevision: base.fingerprint, step: step, inputAudioFingerprint: priorHash))))
     let accepted: SharedLibraryViewSnapshot
@@ -775,6 +776,25 @@ public actor SharedLibraryCoordinator {
     return .init(filename: filename, result: result, projectionError: projectionError, view: view)
   }
 
+  private var fileIntentField: String { SharedEntityState.fileIntentField(writer: writerID) }
+  private func preparedFileOperation(base: SharedLibraryViewSnapshot, steps: [SharedLibraryOperation.Step]) -> SharedPreparedFileOperation {
+    .init(libraryID: base.libraryID, entity: .init(id: base.state.id, kind: base.state.kind), inputRevision: base.fingerprint, steps: steps)
+  }
+  private func recoverFileIntent(view: SharedLibraryViewSnapshot, reader: SharedLibraryMaterializer) async throws -> Bool {
+    guard case .document(let document)? = view.state.value(for: fileIntentField) else { return true }
+    guard let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json), intent.schema == 1 else { throw SharedLibraryOperationError.invalidReceipt }
+    guard intent.libraryID == view.libraryID, intent.entity == SharedEntityIdentity(id: view.state.id, kind: view.state.kind) else { throw SharedLibraryOperationError.differentBinding }
+    guard view.state.conflicts.isEmpty, try view.state.fileIntentGuardRevision(writer: writerID) == intent.guardRevision else { return false }
+    guard intent.steps.allSatisfy({ step in
+      switch step { case .move, .moveDirectory, .trash, .createDirectory, .removeEmptyDirectory: return true; default: return false }
+    }) else { throw SharedLibraryOperationError.invalidOperation }
+    let previous = try await reader.progress(entity: intent.entity, libraryID: intent.libraryID)
+    if previous?.operation.steps == intent.steps && previous?.operation.inputRevision == intent.inputRevision { return true }
+    let operation = try SharedLibraryOperation(libraryID: intent.libraryID, entity: intent.entity,
+      inputRevision: intent.inputRevision, outputRevision: SharedLibraryOperation.revision(for: view.state), steps: intent.steps)
+    try await Task.detached { try await reader.recordIntent(operation) }.value
+    return true
+  }
   private struct FolderMoveMember: Codable, Sendable {
     let id: UUID
     let kind: SharedEntityKind
@@ -834,7 +854,8 @@ public actor SharedLibraryCoordinator {
       }.sorted { $0.id.uuidString < $1.id.uuidString })
     let document = try SharedDocument(id: UUID(), json: JSONEncoder().encode(scope))
     let accepted = try await commit(.init(base: base, changes: [.assign(field: "name", value: .text(destination)),
-      .assign(field: "physicalPath", value: .text(source)), .assign(field: "moveScope", value: .document(document))]), review: false, exact: true)
+      .assign(field: "physicalPath", value: .text(source)), .assign(field: "moveScope", value: .document(document))]), review: false, exact: true,
+      preparedFileOperation: preparedFileOperation(base: base, steps: [.moveDirectory(source: source, destination: destination, inventory: inventory)]))
     let operation = try SharedLibraryOperation(libraryID: base.libraryID, entity: entity,
       inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state),
       steps: [.moveDirectory(source: source, destination: destination, inventory: inventory)])
@@ -850,6 +871,15 @@ public actor SharedLibraryCoordinator {
     let view = try await read(entity)
     let receipts = try operationReceipts(library: view.libraryID)
     let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
+    let oldProgress = try await reader.progress(entity: entity, libraryID: view.libraryID)
+    let alreadyMoved: Bool
+    if let oldProgress, oldProgress.completedSteps == oldProgress.operation.steps.count,
+       case .moveDirectory(_, let destination, _) = oldProgress.operation.steps.first {
+      alreadyMoved = view.state.lifecycle == .alive && view.state.conflicts.isEmpty && view.state.value(for: "physicalPath") == .text(destination) && view.state.value(for: "name") == .text(destination)
+    } else { alreadyMoved = false }
+    if !alreadyMoved, try await !recoverFileIntent(view: view, reader: reader) {
+      return .init(id: id, name: view.state.value(for: "name").flatMap { if case .text(let name) = $0 { return name }; return nil } ?? "", result: .needsReplanning, projectionError: nil)
+    }
     guard let progress = try await reader.progress(entity: entity, libraryID: view.libraryID) else { throw SharedLibraryOperationError.invalidOperation }
     if case .createDirectory(let path) = progress.operation.steps.first, progress.operation.steps.count == 1 {
       let materializer = try await makeMaterializer(entity: entity, paths: [path], receipts: receipts, afterMutation: afterMutation)
@@ -1033,8 +1063,9 @@ public actor SharedLibraryCoordinator {
     let entity = SharedEntityIdentity(id: UUID(), kind: .folder)
     let base = try await read(entity)
     let materializer = try await makeMaterializer(entity: entity, paths: [name], receipts: operationReceipts(library: base.libraryID))
-    let accepted = try await edit(.init(base: base, changes: [
-      .assign(field: "initialPath", value: .text(name)), .assign(field: "name", value: .text(name)), .assign(field: "parent", value: .unset)]))
+    let accepted = try await commit(.init(base: base, changes: [
+      .assign(field: "initialPath", value: .text(name)), .assign(field: "name", value: .text(name)), .assign(field: "parent", value: .unset)]), review: false, exact: true,
+      preparedFileOperation: preparedFileOperation(base: base, steps: [.createDirectory(path: name)]))
     let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
       inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: [.createDirectory(path: name)])
     try await Task.detached { try await materializer.recordIntent(operation) }.value
@@ -1123,7 +1154,7 @@ public actor SharedLibraryCoordinator {
     let materializer = try await makeMaterializer(entity: entity, paths: paths,
       receipts: receipts, afterMutation: afterMutation)
     let accepted: SharedLibraryViewSnapshot
-    do { accepted = try await commit(.init(base: base, changes: changes), review: false, exact: true, bindings: sourceBindings) }
+    do { accepted = try await commit(.init(base: base, changes: changes), review: false, exact: true, bindings: sourceBindings, preparedFileOperation: preparedFileOperation(base: base, steps: steps)) }
     catch {
       let changed = error as? SharedLibraryRepositoryError == .staleRevision || error as? SharedLibraryCoordinatorError == .staleReview || error as? SharedLibraryOperationError == .staleAuthority
       guard retries > 0, changed, !Task.isCancelled else { throw error }
@@ -1150,6 +1181,9 @@ public actor SharedLibraryCoordinator {
     if let reference, reference.libraryID != base.libraryID || reference.entityID != base.state.id { throw SharedLibraryCoordinatorError.differentBinding }
     let entity = SharedEntityIdentity(id: base.state.id, kind: .recording)
     guard base.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
+    if base.state.lifecycle == .deleted, case .document = base.state.value(for: fileIntentField) {
+      return try await resumeRecordingOperation(id: entity.id)
+    }
     let receipts = try operationReceipts(library: base.libraryID)
     let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
     if let progress = try await reader.progress(entity: entity, libraryID: base.libraryID),
@@ -1179,7 +1213,8 @@ public actor SharedLibraryCoordinator {
       return nil
     }
     let materializer = try await makeMaterializer(entity: entity, paths: paths, receipts: receipts)
-    let accepted = base.state.lifecycle == .deleted ? base : try await edit(.init(base: base, changes: [.delete]))
+    let accepted = base.state.lifecycle == .deleted ? base : try await commit(.init(base: base, changes: [.delete]), review: false, exact: true,
+      preparedFileOperation: preparedFileOperation(base: base, steps: steps))
     let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
       inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: steps)
     try await Task.detached { try await materializer.recordIntent(operation) }.value
@@ -1207,6 +1242,9 @@ public actor SharedLibraryCoordinator {
     var view = try await read(entity)
     let receipts = try operationReceipts(library: view.libraryID)
     let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
+    if try await !recoverFileIntent(view: view, reader: reader) {
+      return .init(filename: "", result: .needsReplanning, projectionError: nil, view: view)
+    }
     let previous = try await reader.progress(entity: entity, libraryID: view.libraryID)
     if case .document = view.state.value(for: audioIntentField) {
       let intent = try preparedAudioIntent(view: view)
@@ -1507,7 +1545,7 @@ public actor SharedLibraryCoordinator {
     try await commit(edit, review: true)
   }
   private func commit(_ edit: SharedCoordinatorEdit, review: Bool, exact: Bool = false,
-                      bindings: [SharedMaterializationBinding] = []) async throws
+                      bindings: [SharedMaterializationBinding] = [], preparedFileOperation: SharedPreparedFileOperation? = nil) async throws
     -> SharedLibraryViewSnapshot
   {
     beginTransition(); defer { endTransition() }
@@ -1535,7 +1573,9 @@ public actor SharedLibraryCoordinator {
         guard try SharedStateFingerprint.of(state) == expected else { throw SharedLibraryCoordinatorError.staleReview }
       }
     } else { validation = nil }
-    let accepted = try await repository.commit(.init(base: fresh, changes: edit.changes, validation: validation, bindings: bindings))
+    var transaction = SharedLibraryEdit(base: fresh, changes: edit.changes, validation: validation, bindings: bindings)
+    transaction.preparedFileOperation = preparedFileOperation
+    let accepted = try await repository.commit(transaction)
     let view = SharedLibraryViewSnapshot(libraryID: manifest.libraryID, repository: accepted)
     publish(view, entity: entity, request: beginRead(entity))
     await afterCommit()
