@@ -175,7 +175,15 @@ struct SidebarView: View {
     }
 
     private var libraryHeader: some View {
-        Text("Library")
+        HStack {
+            Text("Library")
+            Spacer()
+            if state.sharedLibrary.coordinator != nil {
+                Button { state.sharedLibrary.showsReview = true } label: { Image(systemName: "arrow.triangle.branch") }
+                    .buttonStyle(.borderless).help("Review Shared Library")
+                    .accessibilityLabel("Review Shared Library")
+            }
+        }
     }
 
     private func commitRename(oldName: String) {

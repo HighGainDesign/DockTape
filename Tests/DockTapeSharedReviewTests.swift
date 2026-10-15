@@ -1,0 +1,197 @@
+// © 2026 High Gain Design. All rights reserved.
+import AppKit
+import HiDockKit
+
+@main struct DockTapeSharedReviewTests {
+    struct Failure: Error { let message: String }
+    static func expect(_ condition: Bool, _ message: String) throws { if !condition { throw Failure(message: message) } }
+    static func deliver(_ source: URL, to destination: URL, writer: UUID) throws {
+        let tree = source.appendingPathComponent(".docktape").resolvingSymlinksInPath()
+        guard let files = FileManager.default.enumerator(at: tree, includingPropertiesForKeys: [.isDirectoryKey]) else { throw Failure(message: "No metadata") }
+        for case let file as URL in files where file.pathExtension == "json" {
+            let bytes = try Data(contentsOf: file)
+            let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] ?? [:]
+            let payload = object["payload"] as? [String: Any]
+            let owner = (object["writerID"] as? String) ?? (payload?["writer"] as? String) ?? (object["founder"] as? String)
+            guard owner.flatMap(UUID.init(uuidString:)) == writer else { continue }
+            let relative = String(file.resolvingSymlinksInPath().path.dropFirst(tree.path.count + 1))
+            let target = destination.appendingPathComponent(".docktape/" + relative)
+            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try bytes.write(to: target, options: .atomic)
+        }
+    }
+    @MainActor private static var qaWindow: MainWindowController?
+    @MainActor static func main() {
+        _ = NSApplication.shared
+        let ui = CommandLine.arguments.contains("--ui")
+        Task { @MainActor in
+            do {
+                try await run()
+                if !ui { exit(0) }
+            } catch {
+                fputs("Review QA failed: \(error)\n", stderr)
+                exit(1)
+            }
+        }
+        NSApp.run()
+    }
+    @MainActor static func run() async throws {
+        _ = NSApplication.shared
+        let arguments = CommandLine.arguments
+        let ui = arguments.contains("--ui")
+        let requestedParent: URL
+        if let index = arguments.firstIndex(of: "--ui-root"), arguments.indices.contains(index + 1) { requestedParent = URL(fileURLWithPath: arguments[index + 1]) }
+        else { requestedParent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeReview-" + UUID().uuidString) }
+        guard !FileManager.default.fileExists(atPath: requestedParent.path) else {
+            throw Failure(message: "QA fixture root must be new; existing folders are never reused or removed.")
+        }
+        try FileManager.default.createDirectory(at: requestedParent, withIntermediateDirectories: true)
+        // Resolve aliases only after the directory exists; macOS may spell a
+        // missing /private/tmp descendant differently from its existing parent.
+        let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
+        defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right")
+        try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
+        try Data("synthetic audio".utf8).write(to: left.appendingPathComponent("Meeting.mp3"))
+        try await TranscriptStore(baseDirectory: left).save(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture", hasSpeakerLabels: true,
+            segments: [.init(startTime: 0, endTime: 1, text: "Synthetic conversation", speakerID: "s")]), mp3Filename: "Meeting.mp3")
+        let identityFile = parent.appendingPathComponent("identity.json")
+        let identity = try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "synthetic review installation").load()
+        let a = SharedLibraryCoordinator(root: left, writerID: identity.writer, witnessDirectory: parent.appendingPathComponent("a-local"))
+        _ = try await a.enable()
+        _ = try await a.projectOutputs()
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("b-local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Second test Mac")
+        for _ in 0..<3 {
+            try deliver(right, to: left, writer: b.writerID); try await a.refresh()
+            try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+        }
+        try expect(try await b.mayEdit(), "Second writer must enroll")
+        let first = try await a.recording(at: "Meeting.mp3")
+        let entity = SharedEntityIdentity(id: first.state.id, kind: .recording)
+        guard let generation = first.state.currentDocument(for: .transcript) else { throw Failure(message: "No generation") }
+        let oldB = try await b.read(entity)
+        _ = try await a.edit(.init(base: first, changes: [.generationEdit(component: .transcript, generation: generation.id, key: "s", value: .text("Alice"))]))
+        _ = try await b.edit(.init(base: oldB, changes: [.generationEdit(component: .transcript, generation: generation.id, key: "s", value: .text("Bob"))]))
+        try deliver(right, to: left, writer: b.writerID)
+        let model = SharedLibraryReviewState()
+        await model.refresh(using: a)
+        try expect(model.items.count == 1, "Review must show the real competing speaker edits")
+        let item = model.items[0]
+        guard let field = item.fields.first, let alice = field.choices.first(where: { $0.value == .text("Alice") }) else { throw Failure(message: "Missing readable choices") }
+        try expect(field.title == "Speaker name", "Do not show internal field keys")
+        try expect(alice.detail.contains("Alice"), "Show the actual alternative")
+        _ = try await a.edit(.init(base: try await a.read(entity), changes: [.assign(field: "metadata.mode", value: .text("\"Mee\""))]))
+        await model.refresh(using: a)
+        try expect(model.items[0].reviewSignature == item.reviewSignature, "Unrelated metadata must not reset reviewed choices")
+        // A newly reviewed remote resolution must not be consumed by the old UI.
+        try deliver(left, to: right, writer: a.writerID)
+        _ = try await b.resolve(.init(base: try await b.read(entity), changes: [.generationEdit(component: .transcript, generation: generation.id, key: "s", value: .text("Charlie"))]))
+        try deliver(right, to: left, writer: b.writerID)
+        let stale = await model.apply(item: item, selections: [field.id: alice.id], using: a)
+        try expect(!stale && model.message?.contains("changed") == true, "Old choice must request a fresh review")
+        let current = try await a.read(entity)
+        try expect(current.state.generationEdits(for: .transcript)["s"] == .text("Charlie"), "Unseen choice survives")
+        // Create another true offline conflict, then resolve it from the review.
+        let aBase = try await a.read(entity), bBase = try await b.read(entity)
+        _ = try await a.edit(.init(base: aBase, changes: [.generationEdit(component: .transcript, generation: generation.id, key: "s", value: .text("Dana"))]))
+        _ = try await b.edit(.init(base: bBase, changes: [.generationEdit(component: .transcript, generation: generation.id, key: "s", value: .text("Eli"))]))
+        try deliver(right, to: left, writer: b.writerID)
+        await model.refresh(using: a)
+        let fresh = model.items[0], name = fresh.fields[0]
+        guard let dana = name.choices.first(where: { $0.value == .text("Dana") }) else { throw Failure(message: "No Dana") }
+        try expect(await model.apply(item: fresh, selections: [name.id: dana.id], using: a), "Reviewed choice must persist")
+        let published = try Data(contentsOf: left.appendingPathComponent("Meeting.transcript.json"))
+        try expect(String(decoding: published, as: UTF8.self).contains("Dana"), "Actual sidecar must reflect review")
+        // Competing full generations render content rather than JSON/IDs.
+        try deliver(left, to: right, writer: a.writerID)
+        let generationBaseA = try await a.read(entity), generationBaseB = try await b.read(entity)
+        let textA = Transcript(recordingFilename: "Meeting.mp3", createdAt: Date(timeIntervalSince1970: 100), transcriptionModel: "Model A", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Version A content")])
+        let textB = Transcript(recordingFilename: "Meeting.mp3", createdAt: Date(timeIntervalSince1970: 200), transcriptionModel: "Model B", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Version B content")])
+        let documentA = try SharedDocument(id: UUID(), json: JSONEncoder().encode(textA))
+        let documentB = try SharedDocument(id: UUID(), json: JSONEncoder().encode(textB))
+        _ = try await a.edit(.init(base: generationBaseA, changes: [.generation(documentA, component: .transcript)]))
+        _ = try await b.edit(.init(base: generationBaseB, changes: [.generation(documentB, component: .transcript)]))
+        try deliver(right, to: left, writer: b.writerID)
+        await model.refresh(using: a)
+        let versions = model.items.first { $0.id == entity.id }!
+        let content = versions.fields.first { $0.id == "transcript.content" }!
+        let optionA = content.choices.first { $0.value == .document(documentA) }!
+        try expect(optionA.detail.contains("Version A content") && optionA.isAvailable, "Typed transcript preview must show actual content")
+        try expect(await model.apply(item: versions, selections: [content.id: optionA.id], using: a), "Generation review must resolve")
+        // Older edits have an explicit discard decision; never apply them to a new version.
+        let currentA = try await a.read(entity)
+        _ = try await b.resolve(.init(base: try await b.read(entity), changes: [.generationEdit(component: .transcript, generation: documentB.id, key: "s", value: .text("Older speaker edit"))]))
+        try deliver(right, to: left, writer: b.writerID)
+        await model.refresh(using: a)
+        let older = model.items.first { $0.id == entity.id }!
+        let oldField = older.fields.first { $0.isOlderEdits }!
+        try expect(oldField.choices.first?.detail.contains("Older speaker edit") == true, "Show exactly which old edits are discarded")
+        try expect(await model.apply(item: older, selections: [oldField.id: oldField.choices[0].id], using: a), "Discard older-generation edits explicitly")
+        try expect((try await a.read(entity)).state.currentDocument(for: .transcript)?.id == currentA.state.currentDocument(for: .transcript)?.id, "Discard must retain current generation")
+        // Summary checkboxes show their task text and resolve through generation IDs.
+        try deliver(left, to: right, writer: a.writerID)
+        let taskID = UUID()
+        let summary = Summary(recordingFilename: "Meeting.mp3", model: "Synthetic", provider: "fixture", templateUsed: "meeting",
+            sections: [.init(heading: "Tasks", content: "Summary", items: [.init(id: taskID, text: "Send meeting notes", isCompleted: false)])])
+        let summaryDocument = try SharedDocument(id: UUID(), json: JSONEncoder().encode(summary))
+        _ = try await a.edit(.init(base: try await a.read(entity), changes: [.generation(summaryDocument, component: .summary)]))
+        try deliver(left, to: right, writer: a.writerID)
+        let checkA = try await a.read(entity), checkB = try await b.read(entity)
+        _ = try await a.edit(.init(base: checkA, changes: [.generationEdit(component: .summary, generation: summaryDocument.id, key: taskID.uuidString.lowercased(), value: .flag(true))]))
+        _ = try await b.edit(.init(base: checkB, changes: [.generationEdit(component: .summary, generation: summaryDocument.id, key: taskID.uuidString.lowercased(), value: .flag(false))]))
+        try deliver(right, to: left, writer: b.writerID)
+        await model.refresh(using: a)
+        let checks = model.items.first { $0.id == entity.id }!, check = model.items.first { $0.id == entity.id }!.fields[0]
+        try expect(check.title.contains("Send meeting notes"), "Checklist conflict must identify its task")
+        let completed = check.choices.first { $0.value == .flag(true) }!
+        try expect(await model.apply(item: checks, selections: [check.id: completed.id], using: a), "Reviewed checklist status must persist")
+        // Template prompts use the same captured-context transaction.
+        let templates = TemplateStore(baseDirectory: left, shared: SharedTemplateAdapter(coordinator: a))
+        try await templates.load()
+        try await templates.addUserTemplate(.init(id: "review-template", name: "Review template", description: "Fixture", promptText: "Initial prompt", isBuiltIn: false))
+        _ = try await a.projectOutputs()
+        try deliver(left, to: right, writer: a.writerID)
+        let templateView = try await a.snapshots(kinds: [.template]).first { $0.state.value(for: "templateID") == .text("review-template") }!
+        let templateEntity = SharedEntityIdentity(id: templateView.state.id, kind: .template)
+        let templateB = try await b.read(templateEntity)
+        _ = try await a.edit(.init(base: templateView, changes: [.assign(field: "prompt", value: .text("Prompt A"))]))
+        _ = try await b.edit(.init(base: templateB, changes: [.assign(field: "prompt", value: .text("Prompt B"))]))
+        try deliver(right, to: left, writer: b.writerID)
+        await model.refresh(using: a)
+        let templateItem = model.items.first { $0.id == templateEntity.id }!, prompt = model.items.first { $0.id == templateEntity.id }!.fields[0]
+        let selectedPrompt = prompt.choices.first { $0.value == .text("Prompt B") }!
+        try expect(await model.apply(item: templateItem, selections: [prompt.id: selectedPrompt.id], using: a), "Template review must persist")
+        try await templates.load()
+        try expect(await templates.template(forID: "review-template")?.promptText == "Prompt B", "Actual template adapter must reload the reviewed prompt")
+        model.clear()
+        try expect(model.items.isEmpty && model.message == nil, "Library switching clears old review")
+        if ui {
+            try deliver(left, to: right, writer: a.writerID)
+            let nativeTranscript = Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "Synthetic", hasSpeakerLabels: true,
+                segments: [.init(startTime: 0, endTime: 1, text: "Synthetic review conversation", speakerID: "s")])
+            let nativeDocument = try SharedDocument(id: UUID(), json: JSONEncoder().encode(nativeTranscript))
+            _ = try await a.edit(.init(base: try await a.read(entity), changes: [.generation(nativeDocument, component: .transcript)]))
+            try deliver(left, to: right, writer: a.writerID)
+            let firstNative = try await a.read(entity), secondNative = try await b.read(entity)
+            _ = try await a.edit(.init(base: firstNative, changes: [.generationEdit(component: .transcript, generation: nativeDocument.id, key: "s", value: .text("Native Alice"))]))
+            _ = try await b.edit(.init(base: secondNative, changes: [.generationEdit(component: .transcript, generation: nativeDocument.id, key: "s", value: .text("Native Bob"))]))
+            try deliver(right, to: left, writer: b.writerID)
+            UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+            let state = AppState(baseDirectory: left, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "synthetic review installation").load()
+            }, sharedWitnessDirectory: parent.appendingPathComponent("a-local"))
+            try await state.setup()
+            NSApp.setActivationPolicy(.regular)
+            NSApp.mainMenu = MainMenu.build(appState: state)
+            let host = MainWindowController(appState: state)
+            host.showWindow(nil); host.showSharedLibraryReview(nil)
+            NSApp.activate()
+            qaWindow = host
+        }
+        print("Actual shared review passed: real two-root speaker/generation/older-edit/checklist/template conflicts, readable alternatives, stale refusal, explicit publication and binding reset.")
+    }
+}

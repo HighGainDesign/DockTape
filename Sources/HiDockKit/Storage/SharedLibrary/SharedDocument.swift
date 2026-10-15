@@ -13,6 +13,11 @@ public struct SharedDocument: Codable, Hashable, Sendable {
         self.id = id
     }
 
+    /// Decode content with the ISO and numeric dates used by existing recordings.
+    public func decode<T: Decodable>(_ type: T.Type) throws -> T {
+        try SharedContentCoding.decoder().decode(type, from: json)
+    }
+
     private enum CodingKeys: String, CodingKey { case id, json }
 
     public init(from decoder: Decoder) throws {

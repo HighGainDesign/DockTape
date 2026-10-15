@@ -110,6 +110,9 @@ struct SettingsView: View {
                 }
             }.disabled(isProcessing)
         }
+        if state.sharedLibrary.coordinator != nil {
+            Button("Review Shared Library…") { state.sharedLibrary.showsReview = true }
+        }
         if let message = state.sharedLibrary.message { Text(message).font(.caption).foregroundStyle(.red) }
         Text("For Dropbox, choose a folder managed by its desktop app. Readable transcripts and summaries stay alongside the recordings.")
             .font(.caption).foregroundStyle(.secondary)

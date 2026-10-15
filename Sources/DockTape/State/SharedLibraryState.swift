@@ -12,6 +12,8 @@ final class SharedLibraryState {
     private(set) var coordinator: SharedLibraryCoordinator?
     private(set) var root: URL?
     private(set) var phase: Phase = .legacy
+    let review = SharedLibraryReviewState()
+    var showsReview = false
     var revision: UInt64 = 0
     var message: String?
     var isBusy: Bool { phase == .connecting }
@@ -85,6 +87,7 @@ final class SharedLibraryState {
         }
     }
     func close() async {
+        review.clear(); showsReview = false
         request = UUID()
         eventsTask?.cancel(); eventsTask = nil
         refreshTask?.cancel(); refreshTask = nil
