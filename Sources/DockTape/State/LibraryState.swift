@@ -200,17 +200,26 @@ final class LibraryState {
 
     @discardableResult
     func deleteRecording(_ rec: RecordingMetadata) async throws -> SharedRecordingFileOutcome? {
+        try await deleteRecording(selection: recordingSelection(rec))
+    }
+    @discardableResult
+    func deleteRecording(selection: RecordingSelection) async throws -> SharedRecordingFileOutcome? {
+        guard selection.libraryBinding == binding else { throw SharedLibraryCoordinatorError.differentBinding }
+        _ = try SharedLibraryIdentity.normalized(selection.filename)
+        // Shared deletion follows the displayed ID even after a same-library rename.
+        // A legacy filename has no identity and must still belong to this catalog.
+        if sharedCoordinator == nil { try validate(selection) }
         let outcome: SharedRecordingFileOutcome?
         if let coordinator = sharedCoordinator {
             guard store.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() == coordinator.root else {
                 throw SharedLibraryCoordinatorError.differentBinding
             }
-            guard let reference = rec.reference else { throw SharedLibraryCoordinatorError.staleJob }
-            outcome = try await coordinator.deleteSharedRecording(filename: rec.filename, reference: reference)
+            guard let reference = selection.reference else { throw SharedLibraryCoordinatorError.staleJob }
+            outcome = try await coordinator.deleteSharedRecording(filename: selection.filename, reference: reference)
         } else {
-            guard rec.reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
-            try await store.deleteRecording(filename: rec.filename)
-            try await transcriptStore.delete(for: rec.filename)
+            guard selection.reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
+            try await store.deleteRecording(filename: selection.filename)
+            try await transcriptStore.delete(for: selection.filename)
             outcome = nil
         }
         await refresh()

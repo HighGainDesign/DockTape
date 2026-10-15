@@ -453,21 +453,42 @@ final class AppState {
     }
 
     func deleteLocalRecording(_ rec: RecordingMetadata) async {
+        await deleteLocalRecording(selection: library.recordingSelection(rec))
+    }
+
+    func deleteLocalRecordings(selections: [RecordingSelection]) async {
+        let captured = library, coordinator = sharedLibrary.coordinator
+        guard selections.allSatisfy({ $0.libraryBinding == captured.binding }) else {
+            errorMessage = "The library changed. Select the recordings again."; return
+        }
+        for selection in selections {
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            await deleteLocalRecording(selection: selection)
+        }
+        guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+        captured.selectedRecordings.removeAll()
+    }
+
+    func deleteLocalRecording(selection: RecordingSelection) async {
+        guard selection.libraryBinding == library.binding else {
+            errorMessage = "The library changed. Select the recording again."; return
+        }
+        guard requireWritableLibrary() else { return }
         let currentLibrary = library, currentSummary = summarization
         let coordinator = currentLibrary.sharedCoordinator
         func stillBound() -> Bool { library === currentLibrary && sharedLibrary.coordinator === coordinator }
         do {
             let filename: String
             if let coordinator {
-                guard let reference = rec.reference else { throw SharedLibraryCoordinatorError.staleJob }
+                guard let reference = selection.reference else { throw SharedLibraryCoordinatorError.staleJob }
                 filename = try await coordinator.resolve(reference)
             } else {
-                guard rec.reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
-                filename = rec.filename
+                guard selection.reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
+                filename = selection.filename
             }
             guard stillBound() else { return }
             if playback.playingFile == filename { playback.stop() }
-            let outcome = try await currentLibrary.deleteRecording(rec)
+            let outcome = try await currentLibrary.deleteRecording(selection: selection)
             guard stillBound() else { return }
             if let outcome {
                 currentSummary.hasSummary.remove(outcome.filename)

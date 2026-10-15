@@ -257,11 +257,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
                 appState.device.selectedDeviceFiles.removeAll()
             }
         } else {
-            let recs = selectedLibraryRecordings
-            Task {
-                for rec in recs { await appState.deleteLocalRecording(rec) }
-                appState.library.selectedRecordings.removeAll()
-            }
+            let selections = selectedLibraryRecordings.map { appState.library.recordingSelection($0) }
+            Task { await appState.deleteLocalRecordings(selections: selections) }
         }
     }
 

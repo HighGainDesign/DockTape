@@ -122,14 +122,9 @@ struct RecordingListPane: View {
         }
         .onKeyPress(.delete) {
             guard !state.library.selectedRecordings.isEmpty else { return .ignored }
-            Task {
-                for filename in state.library.selectedRecordings {
-                    if let rec = state.library.recordings.first(where: { $0.filename == filename }) {
-                        await state.deleteLocalRecording(rec)
-                    }
-                }
-                state.library.selectedRecordings.removeAll()
-            }
+            let library = state.library
+            let selections = library.recordings.filter { library.selectedRecordings.contains($0.filename) }.map { library.recordingSelection($0) }
+            Task { await state.deleteLocalRecordings(selections: selections) }
             return .handled
         }
         .onKeyPress(.return) {
@@ -337,7 +332,7 @@ struct RecordingListPane: View {
         Divider()
 
         Button(role: .destructive) {
-            Task { await state.deleteLocalRecording(rec) }
+            Task { await state.deleteLocalRecording(selection: recordingSelection) }
         } label: {
             Label("Delete", systemImage: "trash")
         }

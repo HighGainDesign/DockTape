@@ -28,7 +28,15 @@ struct DockTapeSharedLibraryTests {
     }
     @MainActor static func main() async {
         do {
-            if CommandLine.arguments.contains("--recording-relocation-only") {
+            if CommandLine.arguments.contains("--delete-dispatch-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeDeleteDispatch-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await capturedDeleteChecks(parent: parent)
+                try await batchDeleteChecks(parent: parent.appendingPathComponent("normal-batch"), switchLibrary: false)
+                try await batchDeleteChecks(parent: parent.appendingPathComponent("late-batch"), switchLibrary: true)
+            } else if CommandLine.arguments.contains("--recording-relocation-only") {
                 _ = NSApplication.shared
                 UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
                 let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeRecordingRelocation-" + UUID().uuidString)
@@ -264,6 +272,9 @@ struct DockTapeSharedLibraryTests {
         try await refreshStatusChecks(parent: parent)
         try await retainedDeletionVisibilityChecks(parent: parent, identity: identity)
         try await deleteSelectionChecks(parent: parent.appendingPathComponent("delete-selection"))
+        try await capturedDeleteChecks(parent: parent.appendingPathComponent("delete-dispatch"))
+        try await batchDeleteChecks(parent: parent.appendingPathComponent("normal-batch"), switchLibrary: false)
+        try await batchDeleteChecks(parent: parent.appendingPathComponent("late-batch"), switchLibrary: true)
         try await publicationOverlapChecks(parent: parent.appendingPathComponent("publication-overlap"))
         try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-metadata"))
         try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-stop"), action: .stop)
@@ -574,6 +585,124 @@ struct DockTapeSharedLibraryTests {
         print("Actual retained-deletion visibility passed: refresh and fresh launch hide pending original; audio unchanged.")
     }
 
+    actor ArmedDeleteRefreshGate {
+        var armed = false
+        var waiting = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        func arm() { armed = true }
+        func pauseIfArmed() async {
+            guard armed else { return }
+            armed = false; waiting = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+        func release() { continuation?.resume(); continuation = nil }
+    }
+    @MainActor static func batchDeleteChecks(parent: URL, switchLibrary: Bool) async throws {
+        let root = parent.appendingPathComponent("library"), next = parent.appendingPathComponent("next")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let original = Data("batch deletion original".utf8)
+        for name in ["A.mp3", "B.mp3"] { try original.write(to: root.appendingPathComponent(name)) }
+        let identity = parent.appendingPathComponent("identity.json")
+        let state = AppState(baseDirectory: root, sharedIdentity: {
+            try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "batch delete fixture").load()
+        }, sharedWitnessDirectory: parent.appendingPathComponent("local"), sharedTrash: { _ in throw Failure(description: "Pinned batch must retain synthetic audio") })
+        try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable batch Delete fixture")
+        guard let coordinator = state.sharedLibrary.coordinator else { throw Failure(description: "Missing batch coordinator") }
+        await coordinator.stopMonitoring()
+        let gate = ArmedDeleteRefreshGate()
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator, beforeLoadReturn: { await gate.pauseIfArmed() }))
+        let captured = LibraryState(store: store, transcriptStore: state.library.transcriptStore, sharedCoordinator: coordinator)
+        try await captured.setup(); state.library = captured
+        let selections = captured.recordings.sorted { $0.filename < $1.filename }.map { captured.recordingSelection($0) }
+        try expect(selections.count == 2, "Capture exactly two displayed batch items")
+        captured.selectedRecordings = ["A.mp3", "B.mp3"]
+        var jobs: [SharedLibraryJobToken] = []
+        for selection in selections {
+            guard let reference = selection.reference else { throw Failure(description: "Missing batch identity") }
+            jobs.append(try await coordinator.pinJob(.init(id: reference.entityID, kind: .recording)))
+        }
+        if switchLibrary { await gate.arm() }
+        let work = Task { @MainActor in await state.deleteLocalRecordings(selections: selections) }
+        if switchLibrary {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(12))
+            while !(await gate.waiting) {
+                guard ContinuousClock.now < deadline else { work.cancel(); await gate.release(); await work.value; throw Failure(description: "Batch did not reach first deletion metadata refresh") }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try FileManager.default.createDirectory(at: next, withIntermediateDirectories: true)
+            for name in ["A.mp3", "B.mp3"] { try Data("unrelated next original".utf8).write(to: next.appendingPathComponent(name)) }
+            let switched = await state.switchStorageLocation(to: .custom, customURL: next)
+            if !switched { await gate.release(); await work.value; throw Failure(description: "Batch root switch failed") }
+            state.library.selectedRecordings = ["B.mp3"]; state.library.selectedRecording = "B.mp3"
+            state.playback.playingFile = "B.mp3"; state.statusMessage = "Current library status"; state.errorMessage = "Current library error"
+            await gate.release()
+        }
+        await work.value
+        for selection in selections {
+            guard let reference = selection.reference else { throw Failure(description: "Lost batch identity") }
+            let view = try await coordinator.read(.init(id: reference.entityID, kind: .recording))
+            let shouldStayAlive = switchLibrary && selection.filename == "B.mp3"
+            try expect(shouldStayAlive ? view.state.lifecycle == .alive : view.state.lifecycle == .deleted, "Batch must delete only items started before its library switch: " + selection.filename)
+            try expect(try Data(contentsOf: root.appendingPathComponent(selection.filename)) == original, "Pinned original bytes remain intact")
+        }
+        if switchLibrary {
+            try expect(state.library.selectedRecordings == ["B.mp3"] && state.library.selectedRecording == "B.mp3", "Old batch must not clear new-library selection")
+            try expect(state.statusMessage == "Current library status" && state.errorMessage == "Current library error", "Old batch must not overwrite new feedback")
+            try expect(state.playback.playingFile == "B.mp3", "Old batch must not stop the new player")
+            for name in ["A.mp3", "B.mp3"] { try expect(try Data(contentsOf: next.appendingPathComponent(name)) == Data("unrelated next original".utf8), "New library bytes are unchanged") }
+        } else { try expect(captured.recordings.isEmpty && captured.selectedRecordings.isEmpty, "Normal batch deletes both selected items and clears its selection") }
+        for job in jobs { await coordinator.finishJob(job) }
+        await state.sharedLibrary.close()
+        print("Actual batch Delete passed: " + (switchLibrary ? "root switch stops remaining work and preserves new state." : "same-library batch deletes both selected IDs."))
+    }
+
+    @MainActor static func capturedDeleteChecks(parent: URL) async throws {
+        for scenario in ["shared-copy", "shared-to-legacy", "legacy-to-legacy"] {
+            let directory = parent.appendingPathComponent(scenario), root = directory.appendingPathComponent("library"), next = directory.appendingPathComponent("next")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let original = Data("captured deletion original".utf8)
+            try original.write(to: root.appendingPathComponent("Meeting.mp3"))
+            let identity = directory.appendingPathComponent("identity.json")
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "captured delete fixture").load()
+            }, sharedWitnessDirectory: directory.appendingPathComponent("local"), sharedTrash: { _ in
+                throw Failure(description: "Deletion binding fixture must retain synthetic audio")
+            })
+            try await state.setup()
+            if scenario != "legacy-to-legacy" { try expect(await state.enableSharedLibrary(), "Enable captured Delete fixture") }
+            guard let recording = state.library.recordings.first else { throw Failure(description: "Missing captured Delete source") }
+            let selection = state.library.recordingSelection(recording)
+            await state.sharedLibrary.coordinator?.stopMonitoring()
+            if scenario == "shared-copy" { try FileManager.default.copyItem(at: root, to: next) }
+            else {
+                try FileManager.default.createDirectory(at: next, withIntermediateDirectories: true)
+                try original.write(to: next.appendingPathComponent("Meeting.mp3"))
+            }
+            try expect(await state.switchStorageLocation(to: .custom, customURL: next), "Switch actual Delete library")
+            let coordinator = state.sharedLibrary.coordinator
+            await coordinator?.stopMonitoring()
+            var job: SharedLibraryJobToken?
+            if let coordinator, let reference = recording.reference { job = try await coordinator.pinJob(.init(id: reference.entityID, kind: .recording)) }
+            state.library.selectedRecordings = ["Meeting.mp3"]
+            await state.deleteLocalRecording(selection: selection)
+            try expect(state.errorMessage?.contains("library changed") == true, "Queued single Delete must refuse changed library instance")
+            state.errorMessage = nil
+            await state.deleteLocalRecordings(selections: [selection])
+            try expect(state.errorMessage?.contains("library changed") == true, "Queued batch Delete must refuse changed library instance")
+            do { _ = try await state.library.deleteRecording(selection: selection); throw Failure(description: "Direct LibraryState accepted a foreign-instance Delete") }
+            catch SharedLibraryCoordinatorError.differentBinding { }
+            if let coordinator, let reference = recording.reference {
+                let preserved = try await coordinator.read(.init(id: reference.entityID, kind: .recording))
+                try expect(preserved.state.lifecycle == .alive, "Queued Delete must not delete the same stable ID in a copied library")
+            }
+            try expect(state.library.selectedRecordings == ["Meeting.mp3"], "Refused batch cannot clear current selection")
+            for location in [root, next] { try expect(try Data(contentsOf: location.appendingPathComponent("Meeting.mp3")) == original, "Refused Delete leaves both originals intact") }
+            if let coordinator, let job { await coordinator.finishJob(job) }
+            await state.sharedLibrary.close()
+        }
+        print("Actual queued Delete passed: single/batch/model refuse copied shared and shared/legacy instance switches, preserving identities, bytes and current selection.")
+    }
+
     @MainActor static func deleteSelectionChecks(parent: URL) async throws {
         let root = parent.appendingPathComponent("library")
         let legacy = RecordingStore(baseDirectory: root)
@@ -590,6 +719,7 @@ struct DockTapeSharedLibraryTests {
         try expect(await state.enableSharedLibrary(), "Enable selected-deletion fixture")
         guard let coordinator = state.sharedLibrary.coordinator, let stale = state.library.recordings.first,
               let selected = stale.reference else { throw Failure(description: "Missing selected deletion identity") }
+        let displayedDelete = state.library.recordingSelection(stale)
         await coordinator.stopMonitoring()
         _ = try await state.library.store.renameRecording(filename: "A.mp3", to: "Renamed")
         _ = try await state.library.store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Unrelated.hda", size: UInt32(bytes.count)))
@@ -597,7 +727,7 @@ struct DockTapeSharedLibraryTests {
         let other = try await coordinator.reference(to: "A.mp3")
         let selectedJob = try await coordinator.pinJob(.init(id: selected.entityID, kind: .recording))
         let otherJob = try await coordinator.pinJob(.init(id: other.entityID, kind: .recording))
-        await state.deleteLocalRecording(stale)
+        await state.deleteLocalRecording(selection: displayedDelete)
         let selectedAfter = try await coordinator.read(.init(id: selected.entityID, kind: .recording))
         let otherAfter = try await coordinator.read(.init(id: other.entityID, kind: .recording))
         try expect(selectedAfter.state.lifecycle == .deleted && otherAfter.state.lifecycle == .alive,
