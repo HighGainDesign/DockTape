@@ -33,6 +33,7 @@ struct PendingFolderFilesView: View {
                             if item.purpose == .retain { Text("Keep this folder by reviewing its current files. The previous deletion will not restart.") }
                             if item.purpose == .delete { Text("Continue deletion of this folder after related recordings and folders have the required approvals. Unknown files are preserved for review.") }
                             if item.canReviewDeletionScope { Text("The child list changed. Review the updated list before preparing deletions.").foregroundStyle(.secondary) }
+                            else if item.canReviewCleanupPlan { Text("This Mac completed a rename before receiving the deletion. Review a separate cleanup plan after pending child files are removed.").foregroundStyle(.secondary) }
                             else if item.needsReplanning { Text("Competing changes prevent this plan from continuing. Review the competing edits before trying again.").foregroundStyle(.secondary) }
                             if !item.waitingForMacs.isEmpty { Text("Waiting for: " + item.waitingForMacs.joined(separator: ", ")).foregroundStyle(.secondary) }
                             Text("Paths involved").font(.headline)
@@ -53,6 +54,13 @@ struct PendingFolderFilesView: View {
                                     Button("Prepare Child Deletions") { perform(.prepareChildren, item) }
                                         .disabled(disabled)
                                         .accessibilityLabel("Prepare child deletions in " + item.name)
+                                }
+                                if item.canReviewCleanupPlan {
+                                    Button("Review Folder Cleanup Plan…") {
+                                        guard let coordinator = state.sharedLibrary.coordinator else { return }
+                                        Task { await model.prepareCleanupPlan(item, using: coordinator) }
+                                    }.disabled(disabled)
+                                        .accessibilityLabel("Review cleanup plan for " + item.name)
                                 }
                                 if item.canReplan {
                                     Button("Review Updated Plan…") {
@@ -126,6 +134,31 @@ struct PendingFolderFilesView: View {
                         Task { if await model.applyDeletionScope(using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
                     }.keyboardShortcut(.defaultAction).disabled(model.isWorking || model.isLoading)
                         .accessibilityLabel("Save reviewed child list for " + scope.path)
+                }
+            }.padding(24).frame(width: 520).interactiveDismissDisabled(model.isWorking)
+        }
+        .sheet(item: Binding(get: { model.cleanupPlan }, set: { if $0 == nil { model.dismissCleanupPlan() } })) { plan in
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Review Folder Cleanup Plan").font(.title2)
+                Text(plan.path).font(.headline).textSelection(.enabled)
+                Text("This Mac completed its earlier rename. Save a separate plan for removing the now-empty folder. Saving removes nothing, preserves the rename progress and grants no deletion approval.")
+                if !plan.retainedPaths.isEmpty {
+                    Text("Earlier locations remain protected").font(.headline)
+                    ScrollView { VStack(alignment: .leading, spacing: 4) {
+                        ForEach(plan.retainedPaths, id: \.self) { Text($0).textSelection(.enabled) }
+                    }.frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 160)
+                    Text("If files reappear at an earlier location, cleanup stops for review. Unknown files are preserved.").font(.caption).foregroundStyle(.secondary)
+                }
+                if let message = model.message { Text(message).foregroundStyle(.secondary) }
+                HStack {
+                    Button("Cancel") { model.dismissCleanupPlan() }.keyboardShortcut(.cancelAction).disabled(model.isWorking)
+                    Spacer()
+                    if model.isWorking { ProgressView().controlSize(.small) }
+                    Button("Save Cleanup Plan") {
+                        guard let coordinator = state.sharedLibrary.coordinator else { return }
+                        Task { if await model.applyCleanupPlan(using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
+                    }.keyboardShortcut(.defaultAction).disabled(model.isWorking || model.isLoading)
+                        .accessibilityLabel("Save reviewed cleanup plan for " + plan.path)
                 }
             }.padding(24).frame(width: 520).interactiveDismissDisabled(model.isWorking)
         }

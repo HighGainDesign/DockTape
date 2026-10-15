@@ -12,6 +12,7 @@ import HiDockKit
     private(set) var message: String?
     private(set) var updatedPlan: SharedFolderReplanReview?
     private(set) var deletionScope: SharedFolderDeletionScopeReview?
+    private(set) var cleanupPlan: SharedFolderCleanupReview?
     private var binding: SharedLibraryCoordinator?
     private var request = UUID()
     private var action: Task<Bool, Never>?
@@ -19,7 +20,7 @@ import HiDockKit
 
     func clear() {
         request = UUID(); workID = UUID(); action?.cancel(); action = nil
-        binding = nil; items = []; message = nil; updatedPlan = nil; deletionScope = nil; isLoading = false; isWorking = false; inspectionFailed = false
+        binding = nil; items = []; message = nil; updatedPlan = nil; deletionScope = nil; cleanupPlan = nil; isLoading = false; isWorking = false; inspectionFailed = false
     }
     func refresh(using coordinator: SharedLibraryCoordinator) async {
         if binding !== coordinator { clear(); binding = coordinator }
@@ -52,7 +53,7 @@ import HiDockKit
         do {
             let prepared = try await coordinator.prepareFolderReplan(review)
             guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
-            deletionScope = nil; updatedPlan = prepared
+            deletionScope = nil; cleanupPlan = nil; updatedPlan = prepared
         } catch {
             if binding === coordinator, request == ticket, !(error is CancellationError) { message = "The directory plan could not be prepared. Reload after sync finishes; existing folders and files are preserved." }
         }
@@ -92,7 +93,7 @@ import HiDockKit
         do {
             let prepared = try await coordinator.prepareFolderDeletionScope(review)
             guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
-            updatedPlan = nil; deletionScope = prepared
+            updatedPlan = nil; cleanupPlan = nil; deletionScope = prepared
         } catch {
             if binding === coordinator, request == ticket, !(error is CancellationError) { message = "The child list could not be prepared. Reload after sync finishes; existing files are preserved." }
         }
@@ -116,6 +117,45 @@ import HiDockKit
                 await self.refresh(using: coordinator)
                 guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return false }
                 if !(error is CancellationError) { self.message = "The folder, child list, receipt or participating Macs changed. Reload before reviewing it again; existing files are preserved." }
+                return false
+            }
+        }
+        action = task; let result = await task.value
+        if binding === coordinator, workID == work { isWorking = false; action = nil }
+        return result
+    }
+    func dismissCleanupPlan() { guard !isWorking else { return }; cleanupPlan = nil }
+    func prepareCleanupPlan(_ review: SharedFolderOperationReview, using coordinator: SharedLibraryCoordinator) async {
+        guard binding === coordinator, !isLoading, !isWorking, review.canReviewCleanupPlan else { return }
+        let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
+        defer { if binding === coordinator, workID == work { isWorking = false } }
+        do {
+            let prepared = try await coordinator.prepareFolderCleanupPlan(review)
+            guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
+            updatedPlan = nil; deletionScope = nil; cleanupPlan = prepared
+        } catch {
+            if binding === coordinator, request == ticket, !(error is CancellationError) { message = "The cleanup plan is not ready. Finish related pending files and reload; existing directories and rename progress are preserved." }
+        }
+    }
+    @discardableResult func applyCleanupPlan(using coordinator: SharedLibraryCoordinator) async -> Bool {
+        guard binding === coordinator, !isLoading, !isWorking, let prepared = cleanupPlan else { return false }
+        let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
+        let task = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                _ = try await coordinator.applyFolderCleanupPlan(prepared)
+                guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
+                self.cleanupPlan = nil
+                await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
+                self.message = "Cleanup plan saved. Approve folder deletion separately on each participating Mac."
+                return true
+            } catch {
+                guard let self, self.binding === coordinator, self.request == ticket else { return false }
+                self.cleanupPlan = nil
+                await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return false }
+                if !(error is CancellationError) { self.message = "The directory, rename progress or participating Macs changed. Reload before reviewing cleanup again; existing files are preserved." }
                 return false
             }
         }

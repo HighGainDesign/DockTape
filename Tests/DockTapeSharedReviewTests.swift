@@ -10,8 +10,11 @@ import HiDockKit
     actor SavePause {
         private(set) var entered = false
         private var continuation: CheckedContinuation<Void, Never>?
+        private var armed: Bool
+        init(armed: Bool = true) { self.armed = armed }
+        func arm() { armed = true }
         func pauseOnce() async {
-            guard !entered else { return }
+            guard armed, !entered else { return }
             entered = true
             await withCheckedContinuation { continuation = $0 }
         }
@@ -501,10 +504,10 @@ import HiDockKit
         print("Actual unprepared deletion passed: retry, explicit Keep, native external-file restoration and deletion again complete without fixture repair writes.")
     }
 
-    @MainActor static func folderDeletionScopeChecks(parent: URL) async throws {
+    @MainActor static func folderDeletionScopeChecks(parent: URL, peerCleanup: Bool = false) async throws {
         let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right"), trash = parent.appendingPathComponent("synthetic-trash")
         try FileManager.default.createDirectory(at: left.appendingPathComponent("Empty"), withIntermediateDirectories: true)
-        let owner = FolderFileReviewState(), pause = SavePause()
+        let owner = FolderFileReviewState(), pause = SavePause(), cleanupPause = SavePause(armed: false)
         let identityFile = parent.appendingPathComponent("qa-writer.json")
         let identity = try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "synthetic folder scope installation").load()
         let a = SharedLibraryCoordinator(root: left, writerID: identity.writer, witnessDirectory: parent.appendingPathComponent("a-local"), afterPublishedLibraryRead: {
@@ -518,7 +521,12 @@ import HiDockKit
         guard let folder = folders.first(where: { $0.state.value(for: "name") == .text("Empty") }) else { throw Failure(message: "Missing scope fixture folder") }
         let entity = SharedEntityIdentity(id: folder.state.id, kind: .folder)
         try FileManager.default.copyItem(at: left, to: right)
-        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("b-local"))
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("b-local"), afterPublishedLibraryRead: {
+            if await MainActor.run(body: { owner.isWorking && owner.isLoading }) { await cleanupPause.pauseOnce() }
+        }, trash: { file in
+            try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: file, to: trash.appendingPathComponent(UUID().uuidString + "-" + file.lastPathComponent))
+        })
         try await b.requestEnrollment(requestID: UUID(), label: "Late child peer")
         for _ in 0..<3 { try deliver(right, to: left, writer: b.writerID); try await a.refresh(); try deliver(left, to: right, writer: a.writerID); try await b.refresh() }
         _ = try await a.deleteFolder(named: "Empty")
@@ -535,6 +543,44 @@ import HiDockKit
         guard let item = choices.items.first(where: { $0.id == entity.id }), let field = item.fields.first(where: { $0.id == "$lifecycle" }),
               let choice = field.choices.first(where: { $0.value == .flag(false) }) else { throw Failure(message: "Missing root Delete choice") }
         try expect(await choices.apply(item: item, selections: [field.id: choice.id], using: a), "Root Delete choice saves separately from child cleanup")
+        if peerCleanup {
+            try deliver(left, to: right, writer: a.writerID)
+            await owner.refresh(using: b)
+            guard let row = owner.items.first(where: { $0.id == entity.id }) else { throw Failure(message: "Missing peer scope row") }
+            await owner.prepareDeletionScope(row, using: b)
+            try expect(owner.deletionScope != nil, "Peer scope preview opens without retiring rename receipt")
+            try expect(await owner.applyDeletionScope(using: b), "Peer scope acceptance is usable")
+            guard let children = owner.items.first(where: { $0.id == entity.id }), children.canPrepareChildren else { throw Failure(message: "Peer child preparation blocked by completed root rename") }
+            try expect(await owner.perform(.prepareChildren, review: children, using: b), "Peer child action is usable")
+            try deliver(right, to: left, writer: b.writerID)
+            guard let approval = try await a.reviewRecordingOperation(id: child.id) else { throw Failure(message: "Missing peer child approval") }
+            try await a.acknowledgeReviewedRecordingOperation(approval)
+            try deliver(left, to: right, writer: a.writerID)
+            _ = try await b.resumeRecordingOperation(id: child.id)
+            await owner.refresh(using: b)
+            guard let row = owner.items.first(where: { $0.id == entity.id }), row.canReviewCleanupPlan else { throw Failure(message: "Peer empty root needs distinct cleanup review") }
+            await owner.prepareCleanupPlan(row, using: b)
+            guard let cleanup = owner.cleanupPlan else { throw Failure(message: "Missing actual cleanup-plan preview") }
+            try expect(cleanup.path == "Empty" && cleanup.retainedPaths.contains("Away"), "Cleanup preview explains old path protection")
+            let receipt = parent.appendingPathComponent("b-local/Operations/" + (try await b.read(entity)).libraryID.uuidString + "/" + b.writerID.uuidString + "/" + entity.id.uuidString + ".json")
+            let bytes = try Data(contentsOf: receipt)
+            await cleanupPause.arm()
+            let action = Task { await owner.applyCleanupPlan(using: b) }
+            for _ in 0..<500 { if await cleanupPause.entered { break }; try await Task.sleep(for: .milliseconds(20)) }
+            guard await cleanupPause.entered else { action.cancel(); await cleanupPause.release(); _ = await action.value; throw Failure(message: "Cleanup save did not reach real held-refresh boundary") }
+            owner.clear()
+            let otherRoot = parent.appendingPathComponent("other-library"); try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
+            let other = SharedLibraryCoordinator(root: otherRoot, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("other-local"))
+            _ = try await other.enable(); await owner.refresh(using: other)
+            await cleanupPause.release()
+            try expect(await action.value, "Accepted cleanup plan stays accepted across feedback cancellation")
+            try expect(owner.message == nil && owner.items.isEmpty && !owner.isWorking && !owner.isLoading && owner.cleanupPlan == nil, "Old cleanup feedback cannot affect another library")
+            try expect(try Data(contentsOf: receipt) == bytes, "Cleanup save cannot replace actual completed rename receipt")
+            let final = try await b.reviewFolderOperation(id: entity.id)
+            try expect(final?.canAcknowledge == true && final?.waitingForMacs.count == 2, "Reviewed cleanup still requires fresh root approvals")
+            print("Actual peer cleanup passed: scope/child action, separate root preview/save, preserved rename receipt, fresh approvals and held-refresh library switch.")
+            return
+        }
         await owner.refresh(using: a)
         guard let row = owner.items.first(where: { $0.id == entity.id }), row.canReviewDeletionScope else { throw Failure(message: "Late child must offer an updated child-list review") }
         await owner.prepareDeletionScope(row, using: a)
@@ -1081,6 +1127,7 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--folder-peer-cleanup-only") { try await folderDeletionScopeChecks(parent: parent, peerCleanup: true); return }
         if arguments.contains("--folder-scopes-only") || arguments.contains("--folder-scopes-ui") { try await folderDeletionScopeChecks(parent: parent); return }
         if arguments.contains("--folder-lifecycle-only") || arguments.contains("--folder-lifecycle-keep-only") || arguments.contains("--folder-lifecycle-delete-only") { try await folderLifecycleChecks(parent: parent); return }
         if arguments.contains("--folder-paths-only") { try await folderPathChecks(parent: parent); return }
@@ -1098,6 +1145,7 @@ import HiDockKit
         }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
         try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-scopes"))
+        try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-peer-cleanup"), peerCleanup: true)
         try await folderLifecycleChecks(parent: parent.appendingPathComponent("folder-lifecycle"))
         try await folderPathChecks(parent: parent.appendingPathComponent("folder-paths"))
         try await recordingPathChecks(parent: parent.appendingPathComponent("recording-paths"))

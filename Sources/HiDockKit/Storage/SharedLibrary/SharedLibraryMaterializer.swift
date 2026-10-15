@@ -719,6 +719,7 @@ public actor SharedLibraryMaterializer {
         if !authority.unplannedDeletionPaths.isEmpty { return .needsReplanning }
         guard authority.mayDestroy(.delete) else { return .waitingForAcknowledgments }
       case .removeEmptyDirectory:
+        if !authority.unplannedDeletionPaths.isEmpty { return .needsReplanning }
         if authority.hasLiveDescendants { return .needsReplanning }
         if authority.state.lifecycle == .deleted {
           guard authority.mayDestroy(.delete) else { return .waitingForAcknowledgments }
