@@ -84,7 +84,8 @@ import HiDockKit
         object["segments"] = segments
         try JSONSerialization.data(withJSONObject: object, options: .sortedKeys).write(to: file, options: .atomic)
         await state.refreshAll()
-        try expect(state.sharedLibrary.message?.contains("External Files") == true, "Actual app explains where recovery lives")
+        try expect(state.sharedLibrary.message?.contains("External Files") == true,
+            "Actual app explains where recovery lives; message=" + (state.sharedLibrary.message ?? "<nil>"))
         await model.refresh(using: coordinator)
         try expect(model.items.count == 1 && model.items[0].review?.changedText?.contains("another computer") == true, "Comparison shows actual external content")
         let stale = model.items[0]

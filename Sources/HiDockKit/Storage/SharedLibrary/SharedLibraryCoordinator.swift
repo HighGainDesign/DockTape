@@ -408,6 +408,10 @@ public actor SharedLibraryCoordinator {
     return path
   }
   private func currentPath(_ view: SharedLibraryViewSnapshot) async throws -> String {
+    try await currentPathProof(view).path
+  }
+  private func currentPathProof(_ view: SharedLibraryViewSnapshot) async throws -> (path: String, ancestors: [SharedLibrarySnapshot]) {
+    var ancestors: [SharedLibrarySnapshot] = []
     guard case .text(let title)? = view.state.value(for: "title"), !title.contains("/") else {
       throw SharedSidecarError.ambiguousPath
     }
@@ -418,14 +422,16 @@ public actor SharedLibraryCoordinator {
       guard case .text(let text) = value, let id = UUID(uuidString: text), visited.insert(id).inserted else {
         throw SharedSidecarError.ambiguousPath
       }
-      let folder = try await read(.init(id: id, kind: .folder)).state
+      let parentView = try await read(.init(id: id, kind: .folder))
+      ancestors.append(parentView.repository)
+      let folder = parentView.state
       guard folder.lifecycle == .alive, case .text(let name)? = folder.value(for: "name"), !name.contains("/") else {
         throw SharedSidecarError.ambiguousPath
       }
       parts.insert(name, at: 0)
       parent = folder.value(for: "parent")
     }
-    return try SharedLibraryIdentity.normalized(parts.joined(separator: "/"))
+    return (try SharedLibraryIdentity.normalized(parts.joined(separator: "/")), ancestors)
   }
 
   public func refresh() async throws {
@@ -2066,11 +2072,18 @@ public actor SharedLibraryCoordinator {
                      audioURL: URL? = nil) async throws
     -> SharedLibraryJobToken
   {
+    try await pinJob(entity, input: input, output: output, audioURL: audioURL, beforeLease: {})
+  }
+  func pinJob(_ entity: SharedEntityIdentity, input: SharedComponent? = nil, output: SharedComponent? = nil,
+              audioURL: URL? = nil, afterPathValidation: @escaping @Sendable () async throws -> Void = {},
+              beforeLease: @escaping @Sendable () async throws -> Void) async throws -> SharedLibraryJobToken {
     beginTransition(); defer { endTransition() }
     let snapshot = try await read(entity)
     guard snapshot.state.lifecycle == .alive else { throw SharedLibraryCoordinatorError.staleJob }
     if output != nil, !(try await mayEdit()) { throw SharedLibraryCoordinatorError.enrollmentPending }
     try Self.validateProcessingState(snapshot.state, input: input, output: output)
+    // Input bytes and prompt context belong to the first selected snapshot.
+    // Rebuilding a lease proof must never select different physical audio.
     let metadata = try SharedRecordingMetadataAdapter.render(snapshot)
     var inputFile: SharedMaterializationBinding?
     if let audioURL {
@@ -2083,37 +2096,72 @@ public actor SharedLibraryCoordinator {
       if let selected, selected != fingerprint { throw SharedLibraryOperationError.contentChanged(audioURL.lastPathComponent) }
       inputFile = .init(file: audioURL) { SharedLibraryOperation.fingerprint($0) == fingerprint }
     }
-    let current = try await read(entity)
-    guard current.libraryID == snapshot.libraryID, current.state.lifecycle == .alive,
-          try Self.lifecycleRevision(current.state) == Self.lifecycleRevision(snapshot.state),
-          try Self.inputRevision(current.state, component: input) == Self.inputRevision(snapshot.state, component: input) else { throw SharedLibraryCoordinatorError.staleJob }
-    try Task.checkCancellation()
     let title: String
     if case .text(let value)? = snapshot.state.value(for: "title") { title = value } else { title = "" }
     let parsed = FilenameParsing.parse(title + ".mp3").mode
     let mode = metadata.mode ?? (parsed == .unknown ? "" : parsed.rawValue)
+    let delays: [Duration] = [.milliseconds(25), .milliseconds(100)]
+    for attempt in 0...delays.count {
+      do { return try await prepareJob(entity, snapshot: snapshot, input: input, output: output, inputFile: inputFile, recordingMode: mode, afterPathValidation: afterPathValidation, beforeLease: beforeLease) }
+      catch JobPreparationError.changedProof {
+        guard attempt < delays.count else { throw SharedLibraryCoordinatorError.staleJob }
+        try await Task.sleep(for: delays[attempt])
+      }
+    }
+    throw SharedLibraryCoordinatorError.staleJob
+  }
+  private enum JobPreparationError: Error { case changedProof }
+  private func prepareJob(_ entity: SharedEntityIdentity, snapshot: SharedLibraryViewSnapshot,
+                          input: SharedComponent?, output: SharedComponent?, inputFile: SharedMaterializationBinding?, recordingMode: String,
+                          afterPathValidation: @escaping @Sendable () async throws -> Void,
+                          beforeLease: @escaping @Sendable () async throws -> Void) async throws -> SharedLibraryJobToken {
+    try Task.checkCancellation()
+    if output != nil, !(try await mayEdit()) { throw SharedLibraryCoordinatorError.enrollmentPending }
+    let current = try await read(entity)
+    guard current.libraryID == snapshot.libraryID, current.state.lifecycle == .alive,
+          try Self.lifecycleRevision(current.state) == Self.lifecycleRevision(snapshot.state),
+          try Self.inputRevision(current.state, component: input) == Self.inputRevision(snapshot.state, component: input) else { throw SharedLibraryCoordinatorError.staleJob }
+    var pathSnapshots = [current.repository]
+    if let inputFile {
+      let pathProof = try await currentPathProof(current)
+      pathSnapshots += pathProof.ancestors
+      let expected = root.appendingPathComponent(pathProof.path).standardizedFileURL.resolvingSymlinksInPath()
+      guard inputFile.file.standardizedFileURL.resolvingSymlinksInPath() == expected else { throw SharedLibraryCoordinatorError.staleJob }
+    }
+    try await afterPathValidation()
+    try Task.checkCancellation()
     let token = SharedLibraryJobToken(
       id: UUID(), library: snapshot.libraryID, entity: entity,
       lifecycle: try Self.lifecycleRevision(snapshot.state),
       component: input, input: try Self.inputRevision(snapshot.state, component: input), output: output,
-      snapshot: snapshot, inputFile: inputFile, recordingMode: mode)
+      snapshot: snapshot, inputFile: inputFile, recordingMode: recordingMode)
     if let jobGate = try localJobGate(library: snapshot.libraryID, entity: entity.id) {
       guard let gate, let directory = witnessDirectory else { throw SharedLibraryOperationError.invalidOperation }
       let witness = SharedOwnerWitness(directory: directory, libraryID: snapshot.libraryID, writerID: writerID)
       let checkpoint = try witness.checkpointFingerprint()
       let manifest = try await bind(force: true)
-      let bindings = try repository.readBindings(current.repository) + [SharedMaterializationBinding(file: root.appendingPathComponent(".docktape/format.json")) { bytes in
+      var bindings = try pathSnapshots.flatMap { try repository.readBindings($0, validateSourceSet: true) }
+      bindings.append(SharedMaterializationBinding(file: root.appendingPathComponent(".docktape/format.json")) { bytes in
         guard let value = try? JSONDecoder().decode(SharedBootstrapManifest.self, from: bytes) else { return false }
         return value.complete && value.libraryID == manifest.libraryID && value.fingerprint == manifest.fingerprint
-      }]
+      })
+      // Ancestors share the format anchor for their source-set checks.
+      // Coordinate it once while retaining every independent predicate.
+      let proofs = Dictionary(grouping: bindings, by: \.file).map { file, predicates in
+        SharedMaterializationBinding(file: file) { data in
+          for predicate in predicates where try !predicate.validate(data) { return false }
+          return true
+        }
+      }.sorted { $0.file.path < $1.file.path }
       let items = try gate.items(outside: root)
       let root = self.root
-      let descriptor = try await CoordinatedFileAccess().withWrites(items, reading: bindings.map(\.file)) { scopes in
+      try await beforeLease()
+      let descriptor = try await CoordinatedFileAccess().withWrites(items, reading: proofs.map(\.file)) { scopes in
         try gate.validate(scopes[0], outside: root)
-        guard try witness.checkpointFingerprint() == checkpoint else { throw SharedLibraryCoordinatorError.staleJob }
-        for (binding, scope) in zip(bindings, scopes.dropFirst(items.count)) {
+        guard try witness.checkpointFingerprint() == checkpoint else { throw JobPreparationError.changedProof }
+        for (binding, scope) in zip(proofs, scopes.dropFirst(items.count)) {
           guard scope.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
-                try binding.validate(Data(contentsOf: scope.url)) else { throw SharedLibraryCoordinatorError.staleJob }
+                try binding.validate(Data(contentsOf: scope.url)) else { throw JobPreparationError.changedProof }
           try scope.checkCancellation()
         }
         try scopes[0].checkCancellation()
