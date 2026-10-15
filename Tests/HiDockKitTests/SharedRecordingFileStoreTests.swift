@@ -889,4 +889,60 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: root.deletingLastPathComponent().appendingPathComponent("recycled/Meeting.mp3")), Data("single synthetic original".utf8))
     }
 
+    func testPartialMoveRetainsIntermediateIdentityAfterAnotherSemanticRename() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        do { _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Intermediate", afterMutation: { _ in throw ReviewStop.interrupted }); XCTFail() }
+        catch ReviewStop.interrupted {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Intermediate.mp3").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.transcript.json").path))
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.assign(field: "title", value: .text("Final"))]))
+        let permission = try await coordinator.operationAuthority(entity: entity, paths: ["Intermediate.mp3", "Meeting.transcript.json", "Final.mp3"])
+        XCTAssertEqual(permission.pathOwners["Intermediate.mp3"], [entity.id], "Accepted recipe reserves intermediate paths even after another title edit")
+        do { _ = try await coordinator.projectOutputs(); XCTFail("Do not publish over surviving intermediate audio") }
+        catch SharedLibraryOperationError.unfinishedOperation {}
+    }
+
+    func testConfirmedCompletedMoveDoesNotHydrateAudioForMetadataPublication() async throws {
+        let (root, coordinator, store) = try await fixture()
+        _ = try await store.renameRecording(filename: "Meeting.mp3", to: "Moved")
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Moved.mp3").entityID, kind: .recording)
+        let changedBytes = Data("external audio change; metadata publication is not an integrity scan".utf8)
+        try changedBytes.write(to: root.appendingPathComponent("Moved.mp3"), options: .atomic)
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.assign(field: "metadata.mode", value: .text("\"Wip\""))]))
+        _ = try await coordinator.projectOutputs()
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Moved.mp3")), changedBytes)
+    }
+    private func completedUnpublishedMove() async throws -> (URL, SharedLibraryCoordinator) {
+        let (root, coordinator, _) = try await fixture()
+        let reference = try await coordinator.reference(to: "Meeting.mp3")
+        do { _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Moved", afterMutation: { _ in throw ReviewStop.interrupted }); XCTFail() }
+        catch ReviewStop.interrupted {}
+        let entity = SharedEntityIdentity(id: reference.entityID, kind: .recording)
+        let library = try await coordinator.read(entity).libraryID
+        let receipts = root.deletingLastPathComponent().appendingPathComponent("local/Operations/\(library.uuidString)/\(coordinator.writerID.uuidString)")
+        let reader = try await coordinator.makeMaterializer(entity: entity, paths: [], receipts: receipts)
+        let value = try await reader.progress(entity: entity, libraryID: library)
+        let progress = try XCTUnwrap(value)
+        let materializer = try await coordinator.makeMaterializer(entity: entity, paths: Array(progress.operation.canonicalPaths), receipts: receipts)
+        let outcome = try await materializer.replay(progress.operation)
+        XCTAssertEqual(outcome, .complete)
+        return (root, coordinator)
+    }
+    func testCompletionPublicationRechecksLateSurvivingAlias() async throws {
+        let (root, coordinator) = try await completedUnpublishedMove()
+        let late = Data("late original-path arrival".utf8)
+        do { _ = try await coordinator.projectOutputs(beforeWrite: { try? late.write(to: root.appendingPathComponent("Meeting.mp3"), options: .atomic) }); XCTFail("Publication must recheck physical aliases inside coordination") }
+        catch SharedLibraryOperationError.unfinishedOperation {}
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), late)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Moved.mp3")), Data("single synthetic original".utf8))
+    }
+    func testCompletionPublicationRechecksChangedAudio() async throws {
+        let (root, coordinator) = try await completedUnpublishedMove()
+        let changed = Data("audio changed while waiting for publication".utf8)
+        do { _ = try await coordinator.projectOutputs(beforeWrite: { try? changed.write(to: root.appendingPathComponent("Moved.mp3"), options: .atomic) }); XCTFail("Do not publish a completion proof for changed bytes") }
+        catch SharedLibraryOperationError.contentChanged(let path) { XCTAssertEqual(path, "Moved.mp3") }
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Moved.mp3")), changed)
+    }
+
 }

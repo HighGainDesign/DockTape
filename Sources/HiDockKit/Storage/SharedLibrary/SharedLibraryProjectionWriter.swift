@@ -14,6 +14,10 @@ struct SharedLibraryProjectionContext: Sendable {
     let lease: SharedMaterializationLease
     let validate: @Sendable () throws -> Bool
     let membership: SharedLibraryMembership
+    var reservations: [UUID: Set<String>] = [:]
+    var completedFileIntents: [UUID: [String: String]] = [:]
+    var absentPaths: [String] = []
+    var physicalInputs: [URL: String] = [:]
 }
 
 struct SharedProjectionRegistry: Codable, Sendable {
@@ -91,12 +95,25 @@ struct SharedLibraryProjectionWriter {
         await beforeWrite()
         let gateItems = try context.gate.items(outside: root)
         let reads = context.sources.keys.sorted { $0.path < $1.path } + registries.filter { $0 != registryFile }
+        let physicalReads = [root] + context.physicalInputs.keys.sorted { $0.path < $1.path }
+        for url in context.physicalInputs.keys { _ = try await RecordingFileAccess().waitUntilAvailable(at: url, knownToExist: true) }
         let writes = [.init(registryFile) as CoordinatedFileAccess.WriteItem] + paths.map { CoordinatedFileAccess.WriteItem(root.appendingPathComponent($0), mode: .replacing) } + gateItems
-        return try await CoordinatedFileAccess().withWrites(writes, reading: reads) { scopes in
+        return try await CoordinatedFileAccess().withWrites(writes, reading: reads + physicalReads) { scopes in
             guard !context.lease.isRevoked, try context.validate() else { throw SharedProjectionWriteError.stale }
             try context.gate.validate(scopes[paths.count + 1], outside: root)
             try SharedLibraryMaterializer.checkRoot(root)
-            let readScopes = Array(scopes.dropFirst(writes.count))
+            let readScopes = Array(scopes.dropFirst(writes.count).prefix(reads.count))
+            let physicalScopes = Array(scopes.dropFirst(writes.count + reads.count))
+            guard physicalScopes[0].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath() else { throw SharedLibraryOperationError.unsafePath }
+            for path in context.absentPaths {
+                let url = root.appendingPathComponent(path)
+                let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+                guard !FileManager.default.fileExists(atPath: url.path), !FileManager.default.fileExists(atPath: placeholder.path) else { throw SharedLibraryOperationError.unfinishedOperation }
+            }
+            for (url, scope) in zip(physicalReads.dropFirst(), physicalScopes.dropFirst()) {
+                guard scope.url.standardizedFileURL.resolvingSymlinksInPath() == url.standardizedFileURL.resolvingSymlinksInPath(),
+                      context.physicalInputs[url] == SharedLibraryOperation.fingerprint(try Data(contentsOf: scope.url)) else { throw SharedLibraryOperationError.contentChanged(url.lastPathComponent) }
+            }
             for (requested, scope) in zip(reads, readScopes) {
                 guard SharedLibraryMaterializer.contained(scope.url, in: root),
                       scope.url.standardizedFileURL.resolvingSymlinksInPath() == requested.standardizedFileURL.resolvingSymlinksInPath() else {
@@ -197,7 +214,7 @@ struct SharedLibraryProjectionWriter {
             return fields.contains(where: { view.state.fields[$0]?.isConflicted == true }) ? (view.confirmedState ?? view.state) : view.state
         }
         let sensitivity = (try? context.root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
-        let index = try SharedLibraryPathIndex(states: pathStates, caseSensitive: sensitivity)
+        let index = try SharedLibraryPathIndex(states: pathStates, caseSensitive: sensitivity, retainedLocations: context.reservations)
         var files: [String: Data] = [:]
         var library: [String: Any] = [:]
         var overrides: [[String: Any]] = [], users: [[String: Any]] = []
@@ -207,6 +224,9 @@ struct SharedLibraryProjectionWriter {
                 var metadata = try SharedRecordingMetadataAdapter.renderObject(view)
                 metadata["_docktape_entity"] = view.state.id.uuidString
                 metadata["_docktape_lifecycle"] = String(describing: view.state.lifecycle)
+                if let completed = context.completedFileIntents[view.state.id], !completed.isEmpty {
+                    metadata[SharedPublishedLocations.completedIntentsKey] = completed
+                }
                 library[path] = metadata
                 if view.state.lifecycle == .alive {
                     for (name, bytes) in try SharedLibraryReadableExport.files(view: view, recordingPath: path) {

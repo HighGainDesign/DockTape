@@ -4,6 +4,8 @@ import Foundation
 struct SharedPublishedLocations: Sendable {
     var recordings: [UUID: Set<String>] = [:]
     var proofs: [URL: String] = [:]
+    var completedFileIntents: [UUID: [String: String]] = [:]
+    static let completedIntentsKey = "_docktape_completed_file_intents"
     private var initial: [String: String] = [:]
     private var markers: [SharedProjectionMarker] = []
     func validateCompanion(path: String, bytes: Data, entity: UUID, library: UUID, kind: String) throws {
@@ -11,6 +13,53 @@ struct SharedPublishedLocations: Sendable {
         guard let marker = try? SharedProjectionDocument.marker(in: bytes),
               marker.libraryID == library, marker.entities == [entity], marker.kind == kind,
               markers.contains(marker) else { throw SharedProjectionWriteError.untracked(path) }
+    }
+    /// Reservations come from accepted entity recipes, never filename/byte
+    /// similarity. A registered publication releases a completed recipe.
+    func reservations(states: [SharedEntityState], library: UUID) throws -> [UUID: Set<String>] {
+        let recordings = states.filter { $0.kind == .recording }
+        let known = Set(recordings.map(\.id))
+        var result = self.recordings.filter { known.contains($0.key) }
+        for state in recordings {
+            for (writer, document, intent) in try Self.fileIntents(state: state, library: library) {
+                guard completedFileIntents[state.id]?[writer] != SharedLibraryOperation.fingerprint(document.json) else { continue }
+                for step in intent.steps {
+                    let paths: [String]
+                    switch step {
+                    case .move(let source, let destination, _): paths = [source, destination]
+                    case .trash(let path, _): paths = [path]
+                    default: throw SharedLibraryOperationError.invalidOperation
+                    }
+                    for path in paths {
+                        let suffixes = [".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".mp3", ".txt"]
+                        guard let suffix = suffixes.first(where: { path.hasSuffix($0) }) else { throw SharedLibraryOperationError.invalidOperation }
+                        let audio = String(path.dropLast(suffix.count)) + ".mp3"
+                        _ = try SharedLibraryIdentity.normalized(audio)
+                        result[state.id, default: []].insert(audio)
+                    }
+                }
+            }
+        }
+        return result
+    }
+    static func fileIntents(state: SharedEntityState, library: UUID) throws -> [(String, SharedDocument, SharedAcceptedFileIntent)] {
+        var result: [(String, SharedDocument, SharedAcceptedFileIntent)] = []
+        let prefix = "materialization.files."
+        for (field, register) in state.fields where field.hasPrefix(prefix) {
+            let writer = String(field.dropFirst(prefix.count))
+            guard UUID(uuidString: writer) != nil else { throw SharedLibraryOperationError.invalidReceipt }
+            for value in register.values {
+                if value == .unset { continue }
+                guard case .document(let document) = value else { throw SharedLibraryOperationError.invalidReceipt }
+                let intent = try JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json)
+                guard intent.schema == 1, intent.libraryID == library,
+                      intent.entity == SharedEntityIdentity(id: state.id, kind: state.kind) else { throw SharedLibraryOperationError.differentBinding }
+                _ = try SharedLibraryOperation(libraryID: library, entity: intent.entity, inputRevision: intent.inputRevision,
+                    outputRevision: intent.guardRevision, steps: intent.steps)
+                result.append((writer, document, intent))
+            }
+        }
+        return result
     }
     static func load(root: URL, manifest: SharedBootstrapManifest, membership: SharedLibraryMembership) async throws -> Self {
         var result = Self()
@@ -49,6 +98,12 @@ struct SharedPublishedLocations: Sendable {
                     // through a partial move, including phases after its MP3
                     // already moved but some owned companions remain behind.
                     result.recordings[id, default: []].insert(path)
+                    if let raw = entry[Self.completedIntentsKey] {
+                        guard let completed = raw as? [String: String], completed.allSatisfy({ key, hash in
+                            UUID(uuidString: key) != nil && SharedLibraryOperation.validHash(hash)
+                        }) else { throw SharedProjectionWriteError.untracked("library.json") }
+                        result.completedFileIntents[id] = completed
+                    }
                 }
                 return result
             }

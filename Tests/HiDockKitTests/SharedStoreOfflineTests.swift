@@ -83,4 +83,36 @@ final class SharedStoreOfflineTests: XCTestCase {
         let state = try await a.read(.init(id: id, kind: .template)).state
         XCTAssertEqual(state.conflicts.first { $0.field == "prompt" }?.values, [.text("Left prompt"), .text("Right prompt")])
     }
+    func testMetadataFirstPartialMoveReservesIntermediatePathOnOtherRoot() async throws {
+        let left = try root(), right = try root()
+        let localA = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let localB = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots += [localA, localB]
+        let a = SharedLibraryCoordinator(root: left, writerID: UUID(), witnessDirectory: localA)
+        _ = try await a.enable(); _ = try await a.projectOutputs()
+        let entity = SharedEntityIdentity(id: try await a.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        try deliver(left, right, writer: a.writerID)
+        try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: localB)
+        try await b.requestEnrollment(requestID: UUID(), label: "Other Mac")
+        for _ in 0..<3 {
+            try deliver(right, left, writer: b.writerID); try await a.refresh()
+            try deliver(left, right, writer: a.writerID); try await b.refresh()
+        }
+        enum Stop: Error { case afterAudio }
+        do { _ = try await a.relocateRecording(filename: "Meeting.mp3", title: "Intermediate", afterMutation: { _ in throw Stop.afterAudio }); XCTFail() }
+        catch Stop.afterAudio {}
+        _ = try await a.edit(.init(base: try await a.read(entity), changes: [.assign(field: "title", value: .text("Final"))]))
+        try deliver(left, right, writer: a.writerID) // No physical move on B yet.
+        let permission = try await b.operationAuthority(entity: entity, paths: ["Intermediate.mp3", "Meeting.mp3", "Final.mp3"])
+        XCTAssertEqual(permission.pathOwners["Intermediate.mp3"], [entity.id])
+        let store = RecordingStore(baseDirectory: right, shared: SharedRecordingMetadataAdapter(coordinator: b))
+        try await store.setup()
+        let data = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+        do { _ = try await store.importRecording(hdaData: data, entry: FileEntry(filename: "Intermediate.hda", size: UInt32(data.count))); XCTFail("Metadata delivery must reserve the late physical path before another import claims it") }
+        catch SharedLibraryOperationError.pathConflict(let path) { XCTAssertEqual(path, "Intermediate.mp3") }
+        XCTAssertEqual(try Data(contentsOf: right.appendingPathComponent("Meeting.mp3")), Data("synthetic".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: right.appendingPathComponent("Intermediate.mp3").path))
+    }
+
 }

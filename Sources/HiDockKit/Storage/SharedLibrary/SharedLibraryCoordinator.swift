@@ -298,6 +298,13 @@ public actor SharedLibraryCoordinator {
     }
     return matches[0]
   }
+  private func pathIndex(for views: [SharedLibraryViewSnapshot], caseSensitive: Bool = false) async throws -> SharedLibraryPathIndex {
+    let manifest = try await bind(force: true)
+    let membership = try await memberRepository().load().membership
+    let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+    return try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: caseSensitive,
+      retainedLocations: locations.reservations(states: views.map(\.state), library: manifest.libraryID))
+  }
   public func reference(to filename: String) async throws -> SharedRecordingReference {
     let view = try await recording(at: filename)
     return .init(libraryID: view.libraryID, entityID: view.state.id)
@@ -502,7 +509,7 @@ public actor SharedLibraryCoordinator {
     }
     guard view.state.value(for: "audioFingerprint") == .text(selected) else { throw SharedLibraryOperationError.unfinishedOperation }
     let views = try await snapshots(kinds: [.recording, .folder])
-    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    let index = try await pathIndex(for: views)
     guard index.resolvedPaths[view.state.id] == path, index.owners(of: path) == [view.state.id] else { throw SharedLibraryOperationError.pathConflict(path) }
     let operation = try SharedLibraryOperation(libraryID: view.libraryID, entity: intent.entity,
       inputRevision: intent.inputRevision, outputRevision: SharedLibraryOperation.revision(for: view.state), steps: [intent.step], inputAudioFingerprint: intent.inputAudioFingerprint)
@@ -518,7 +525,7 @@ public actor SharedLibraryCoordinator {
     guard !source.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
     let defaultPath = (source as NSString).deletingPathExtension + ".mp3"
     let views = try await snapshots(kinds: [.recording, .folder])
-    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    let index = try await pathIndex(for: views)
     var matches: [SharedLibraryViewSnapshot] = []
     for view in views where view.state.kind == .recording {
       let metadata = try SharedRecordingMetadataAdapter.render(view)
@@ -707,7 +714,7 @@ public actor SharedLibraryCoordinator {
                                   tokens: [SharedLibraryJobToken], beforeSourceProof: @Sendable (SharedEntityIdentity) async throws -> Void,
                                   beforeCommit: @Sendable () async throws -> Void) async throws -> SharedRecordingFileOutcome {
     let views = try await snapshots(kinds: [.recording, .folder])
-    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    let index = try await pathIndex(for: views)
     let stem = (filename as NSString).deletingPathExtension
     guard index.owners(of: filename).isEmpty else { throw SharedLibraryOperationError.pathConflict(filename) }
     for suffix in [".mp3", ".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".txt"] {
@@ -834,7 +841,7 @@ public actor SharedLibraryCoordinator {
     _ = try SharedLibraryIdentity.normalized(source); _ = try SharedLibraryIdentity.normalized(destination)
     guard !source.contains("/"), !destination.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
     let views = try await snapshots(kinds: [.recording, .folder])
-    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    let index = try await pathIndex(for: views)
     let matches = views.filter { view in
       view.state.kind == .folder && (index.resolvedPaths[view.state.id] == source || view.state.value(for: "physicalPath") == .text(source))
     }
@@ -948,7 +955,7 @@ public actor SharedLibraryCoordinator {
     _ = try SharedLibraryIdentity.normalized(name)
     guard !name.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
     let views = try await snapshots(kinds: [.recording, .folder])
-    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    let index = try await pathIndex(for: views)
     let matches = views.filter { $0.state.kind == .folder && index.resolvedPaths[$0.state.id] == name }
     guard matches.count == 1, let base = matches.first else { throw SharedLibraryPathError.ambiguousPath }
     if case .document = base.state.value(for: "deletionRequest") {
@@ -971,7 +978,7 @@ public actor SharedLibraryCoordinator {
           Set(request.members.map(\.id)).count == request.members.count,
           request.members.allSatisfy({ $0.path.hasPrefix(request.path + "/") }) else { throw SharedLibraryOperationError.differentBinding }
     let views = try await snapshots(kinds: [.recording, .folder])
-    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    let index = try await pathIndex(for: views)
     let expected = Set(request.members.map(\.id))
     let actual = Set(views.filter { $0.state.id != id && index.resolvedPaths[$0.state.id]?.hasPrefix(request.path + "/") == true }.map { $0.state.id })
     guard actual == expected, index.resolvedPaths[id] == request.path else { return .init(id: id, name: request.path, result: .needsReplanning, projectionError: nil) }
@@ -1105,7 +1112,7 @@ public actor SharedLibraryCoordinator {
     _ = try SharedLibraryIdentity.normalized(name)
     guard !name.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
     let views = try await snapshots(kinds: [.recording, .folder])
-    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    let index = try await pathIndex(for: views)
     guard index.owners(of: name).isEmpty, !FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path) else {
       throw SharedLibraryOperationError.pathConflict(name)
     }
@@ -1157,7 +1164,7 @@ public actor SharedLibraryCoordinator {
       folder = toFolder ?? ""
       if let toFolder {
         let views = try await snapshots(kinds: [.folder])
-        let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+        let index = try await pathIndex(for: views)
         guard let id = index.resolvedPaths.first(where: { $0.value == toFolder })?.key else { throw SharedLibraryPathError.unknownPath }
         changes.append(.assign(field: "folder", value: .text(id.uuidString)))
       } else { changes.append(.assign(field: "folder", value: .unset)) }
@@ -1165,7 +1172,7 @@ public actor SharedLibraryCoordinator {
     let destination = folder.isEmpty ? basename + ".mp3" : folder + "/" + basename + ".mp3"
     if source == destination { return .init(filename: source, result: .complete, projectionError: nil, view: base) }
     let all = try await snapshots(kinds: [.recording, .folder])
-    let index = try SharedLibraryPathIndex(states: all.map(\.state), caseSensitive: false)
+    let index = try await pathIndex(for: all)
     guard index.owners(of: destination).isEmpty else { throw SharedLibraryOperationError.pathConflict(destination) }
     let sourceStem = (source as NSString).deletingPathExtension
     let destinationStem = (destination as NSString).deletingPathExtension
@@ -1466,7 +1473,11 @@ public actor SharedLibraryCoordinator {
       let fields = view.state.kind == .folder ? ["name", "parent"] : ["title", "folder"]
       return fields.contains(where: { view.state.fields[$0]?.isConflicted == true }) ? (view.confirmedState ?? view.state) : view.state
     }
-    let index = try SharedLibraryPathIndex(states: pathStates, caseSensitive: false)
+    let reservations = try published.reservations(states: pathStates, library: manifest.libraryID)
+    let index = try SharedLibraryPathIndex(states: pathStates, caseSensitive: false, retainedLocations: reservations)
+    var absentPaths: [String] = []
+    var physicalInputs: [URL: String] = [:]
+    var completedIntents = published.completedFileIntents
     for view in views where view.state.kind == .folder && view.state.lifecycle == .alive {
       if let physical = view.state.fields["physicalPath"],
          physical.isConflicted || physical.resolvedValue != index.resolvedPaths[view.state.id].map(SharedFieldValue.text) { throw SharedLibraryOperationError.unfinishedOperation }
@@ -1475,15 +1486,35 @@ public actor SharedLibraryCoordinator {
       if let published = view.state.fields["audioPublished"],
          published.isConflicted || published.resolvedValue != view.state.value(for: "audioFingerprint") { throw SharedLibraryOperationError.unfinishedOperation }
       guard let destination = index.resolvedPaths[view.state.id] else { continue }
-      for source in published.recordings[view.state.id] ?? [] where source != destination {
+      for source in reservations[view.state.id] ?? [] where source != destination {
         let stem = (source as NSString).deletingPathExtension
         for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
           let url = root.appendingPathComponent(stem + suffix)
+          absentPaths.append(stem + suffix)
           let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
           guard !FileManager.default.fileExists(atPath: url.path), !FileManager.default.fileExists(atPath: placeholder.path) else {
             throw SharedLibraryOperationError.unfinishedOperation
           }
         }
+      }
+    }
+    for view in views where view.state.kind == .recording && view.state.lifecycle == .alive && view.state.conflicts.isEmpty {
+      let intents = try SharedPublishedLocations.fileIntents(state: view.state, library: manifest.libraryID).filter { owner, document, _ in
+        owner == writerID.uuidString.lowercased() && completedIntents[view.state.id]?[owner] != SharedLibraryOperation.fingerprint(document.json)
+      }
+      guard !intents.isEmpty else { continue }
+      let entity = SharedEntityIdentity(id: view.state.id, kind: .recording)
+      let reader = try await makeMaterializer(entity: entity, paths: [], receipts: operationReceipts(library: manifest.libraryID))
+      guard let progress = try await reader.progress(entity: entity, libraryID: manifest.libraryID), progress.completedSteps == progress.operation.steps.count else { continue }
+      for (owner, document, intent) in intents {
+        guard progress.operation.steps == intent.steps, progress.operation.inputRevision == intent.inputRevision,
+              let destination = index.resolvedPaths[view.state.id],
+              let audio = intent.steps.first(where: { if case .move(_, let path, _) = $0 { return path.hasSuffix(".mp3") }; return false }),
+              case .move(_, let path, let hash) = audio, path == destination else { continue }
+        let file = root.appendingPathComponent(path)
+        guard let bytes = try await RecordingFileAccess().readDataIfPresent(at: file, knownToExist: true), SharedLibraryOperation.fingerprint(bytes) == hash else { throw SharedLibraryOperationError.contentChanged(path) }
+        physicalInputs[file] = hash
+        completedIntents[view.state.id, default: [:]][owner] = SharedLibraryOperation.fingerprint(document.json)
       }
     }
     guard transitions == 0, authorityEpoch == epoch, before == after,
@@ -1494,7 +1525,9 @@ public actor SharedLibraryCoordinator {
     authorityLease = lease
     leasedRevisions = Dictionary(uniqueKeysWithValues: views.map { (SharedEntityIdentity(id: $0.state.id, kind: $0.state.kind), $0.fingerprint) })
     return .init(root: root, manifest: manifest, views: views, sources: after, gate: gate, lease: lease,
-                 validate: { try witness.checkpointFingerprint() == checkpoint }, membership: membership)
+                 validate: { try witness.checkpointFingerprint() == checkpoint }, membership: membership,
+                 reservations: reservations, completedFileIntents: completedIntents,
+                 absentPaths: Array(Set(absentPaths)).sorted(), physicalInputs: physicalInputs)
   }
 
   public func makeMaterializer(
@@ -1569,7 +1602,7 @@ public actor SharedLibraryCoordinator {
     let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
     let knownIDs = Set(snapshots.filter { $0.state.kind == .recording }.map { $0.state.id })
     guard Set(locations.recordings.keys).isSubset(of: knownIDs) else { throw SharedProjectionWriteError.untracked("library.json") }
-    let index = try SharedLibraryPathIndex(states: snapshots.map(\.state), caseSensitive: sensitivity, retainedLocations: locations.recordings)
+    let index = try SharedLibraryPathIndex(states: snapshots.map(\.state), caseSensitive: sensitivity, retainedLocations: locations.reservations(states: snapshots.map(\.state), library: manifest.libraryID))
     let owners = index.operationOwners(for: paths)
     for path in paths {
       _ = try SharedLibraryIdentity.normalized(path)
