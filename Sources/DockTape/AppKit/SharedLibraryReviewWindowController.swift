@@ -10,13 +10,16 @@ import SwiftUI
         window.contentMinSize = NSSize(width: 640, height: 420)
         window.isReleasedWhenClosed = false
         window.contentViewController = NSHostingController(rootView:
-            TabView {
+            TabView(selection: Binding(get: { state.sharedLibrary.reviewTab }, set: { state.sharedLibrary.reviewTab = $0 })) {
                 SharedLibraryReviewView(state: state, onClose: { [weak window] in window?.close() })
                     .tabItem { Text("Competing Edits") }
+                    .tag(SharedLibraryState.ReviewTab.competingEdits)
                 PendingRecordingFilesView(state: state, onClose: { [weak window] in window?.close() })
                     .tabItem { Text("Pending Files") }
+                    .tag(SharedLibraryState.ReviewTab.pendingFiles)
                 ExternalSidecarReviewView(state: state, onClose: { [weak window] in window?.close() })
                     .tabItem { Text("External Files") }
+                    .tag(SharedLibraryState.ReviewTab.externalFiles)
             })
         window.setFrameAutosaveName("SharedLibraryReview")
         window.center()

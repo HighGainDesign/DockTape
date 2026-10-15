@@ -28,7 +28,23 @@ struct DockTapeSharedLibraryTests {
     }
     @MainActor static func main() async {
         do {
-            if CommandLine.arguments.contains("--publication-overlap-only") {
+            if CommandLine.arguments.contains("--delete-selection-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeDeleteSelection-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await deleteSelectionChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--pending-delete-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapePendingDelete-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = {
+                    try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "pending-delete fixture").load()
+                }
+                try await retainedDeletionVisibilityChecks(parent: parent, identity: identity)
+                try await deleteSelectionChecks(parent: parent.appendingPathComponent("delete-selection"))
+            } else if CommandLine.arguments.contains("--publication-overlap-only") {
                 _ = NSApplication.shared
                 UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
                 let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapePublication-" + UUID().uuidString)
@@ -192,6 +208,7 @@ struct DockTapeSharedLibraryTests {
         try await folderDeleteLibraryChecks(parent: parent)
         try await refreshStatusChecks(parent: parent)
         try await retainedDeletionVisibilityChecks(parent: parent, identity: identity)
+        try await deleteSelectionChecks(parent: parent.appendingPathComponent("delete-selection"))
         try await publicationOverlapChecks(parent: parent.appendingPathComponent("publication-overlap"))
         print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions, reconnect and ID-bound merge/original deletion and folder rename/delete.")
     }
@@ -248,10 +265,16 @@ struct DockTapeSharedLibraryTests {
         await coordinator.stopMonitoring()
         let original = try await coordinator.recording(at: "Meeting.mp3")
         let token = try await coordinator.pinJob(.init(id: original.state.id, kind: .recording))
-        let pending = try await coordinator.deleteSharedRecording(filename: "Meeting.mp3")
-        try expect(pending.result == .waitingForAcknowledgments, "An active job must retain the original after logical deletion")
-        await state.library.refresh()
-        try expect(state.library.recordings.isEmpty, "The actual library list must hide the accepted deletion while the original remains")
+        guard let recording = state.library.recordings.first else { throw Failure(description: "Missing selected app recording") }
+        await state.deleteLocalRecording(recording)
+        let pending = try await coordinator.reviewRecordingOperation(id: original.state.id)
+        let accepted = try await coordinator.read(.init(id: original.state.id, kind: .recording))
+        try expect(accepted.state.lifecycle == .deleted, "Delete action must accept the logical deletion")
+        try expect(pending?.purpose == .delete && pending?.hasActiveWork == true, "An active job must retain the original after logical deletion")
+        try expect(state.errorMessage == nil, "An accepted pending deletion must not be reported as failed: " + (state.errorMessage ?? ""))
+        try expect(state.statusMessage.contains("Pending Files"), "Explain where the user can finish pending cleanup")
+        try expect(state.sharedLibrary.showsReview && state.sharedLibrary.reviewTab == .pendingFiles, "Open Pending Files for the accepted pending deletion")
+        try expect(state.library.recordings.isEmpty, "The Delete action must hide the accepted deletion without another refresh")
         try expect(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")) == audio, "Visibility must never dispose or rewrite retained media")
         await state.sharedLibrary.close()
         let reopened = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: witnesses, sharedTrash: refuseTrash)
@@ -260,6 +283,63 @@ struct DockTapeSharedLibraryTests {
         await reopened.sharedLibrary.close()
         await coordinator.finishJob(token)
         print("Actual retained-deletion visibility passed: refresh and fresh launch hide pending original; audio unchanged.")
+    }
+
+    @MainActor static func deleteSelectionChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        let legacy = RecordingStore(baseDirectory: root)
+        try await legacy.setup()
+        var bytes = Data(repeating: 0, count: 417)
+        bytes.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+        _ = try await legacy.importRecording(hdaData: bytes, entry: FileEntry(filename: "A.hda", size: UInt32(bytes.count)))
+        let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "delete-selection fixture").load()
+        }
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: parent.appendingPathComponent("witnesses"),
+            sharedTrash: { _ in throw Failure(description: "Protected deletion fixture must never attempt disposal") })
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable selected-deletion fixture")
+        guard let coordinator = state.sharedLibrary.coordinator, let stale = state.library.recordings.first,
+              let selected = stale.reference else { throw Failure(description: "Missing selected deletion identity") }
+        await coordinator.stopMonitoring()
+        _ = try await state.library.store.renameRecording(filename: "A.mp3", to: "Renamed")
+        _ = try await state.library.store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Unrelated.hda", size: UInt32(bytes.count)))
+        _ = try await state.library.store.renameRecording(filename: "Unrelated.mp3", to: "A")
+        let other = try await coordinator.reference(to: "A.mp3")
+        let selectedJob = try await coordinator.pinJob(.init(id: selected.entityID, kind: .recording))
+        let otherJob = try await coordinator.pinJob(.init(id: other.entityID, kind: .recording))
+        await state.deleteLocalRecording(stale)
+        let selectedAfter = try await coordinator.read(.init(id: selected.entityID, kind: .recording))
+        let otherAfter = try await coordinator.read(.init(id: other.entityID, kind: .recording))
+        try expect(selectedAfter.state.lifecycle == .deleted && otherAfter.state.lifecycle == .alive,
+            "Delete must follow the selected identity after filename reuse; selected=\(selectedAfter.state.lifecycle), other=\(otherAfter.state.lifecycle)")
+        try expect(state.errorMessage == nil, "Accepted selected deletion must be explained as pending, not failed")
+        try expect(state.library.recordings.map(\.filename) == ["A.mp3"], "Only the unrelated replacement should remain visible")
+        for name in ["A.mp3", "Renamed.mp3"] { try expect(try Data(contentsOf: root.appendingPathComponent(name)) == bytes, "Both vetoed fixture originals must be byte-identical") }
+        let otherRoot = parent.appendingPathComponent("other-library")
+        try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
+        let otherAudio = Data("Different library original".utf8)
+        try otherAudio.write(to: otherRoot.appendingPathComponent("A.mp3"))
+        try expect(await state.switchStorageLocation(to: .custom, customURL: otherRoot), "Switch selected-deletion library")
+        state.errorMessage = nil
+        await state.deleteLocalRecording(stale)
+        try expect(state.errorMessage?.hasPrefix("Delete failed:") == true, "A stale shared selection must be refused in a legacy library")
+        try expect(!state.sharedLibrary.showsReview, "A refused deletion must not open pending-success review")
+        try expect(try Data(contentsOf: otherRoot.appendingPathComponent("A.mp3")) == otherAudio, "A stale selection must preserve the same filename in another library")
+        try expect(await state.enableSharedLibrary(), "Enable second selected-deletion library")
+        guard let otherCoordinator = state.sharedLibrary.coordinator else { throw Failure(description: "Missing second deletion binding") }
+        await otherCoordinator.stopMonitoring()
+        let otherReference = try await otherCoordinator.reference(to: "A.mp3")
+        state.errorMessage = nil
+        await state.deleteLocalRecording(stale)
+        try expect(state.errorMessage?.hasPrefix("Delete failed:") == true, "A stale selection must also be refused in a different shared library")
+        let preserved = try await otherCoordinator.read(.init(id: otherReference.entityID, kind: .recording))
+        try expect(preserved.state.lifecycle == .alive, "The other library recording must remain alive")
+        try expect(!state.sharedLibrary.showsReview, "A rejected cross-library deletion must not masquerade as pending success")
+        try expect(try Data(contentsOf: otherRoot.appendingPathComponent("A.mp3")) == otherAudio, "Cross-library refusal must preserve the original")
+        await state.sharedLibrary.close()
+        await coordinator.finishJob(selectedJob); await coordinator.finishJob(otherJob)
+        print("Actual selected deletion passed: stable identity survives rename/reused filename; legacy/shared library-switch refusal preserves unrelated originals.")
     }
 
     @MainActor static func mergeSelectionChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {

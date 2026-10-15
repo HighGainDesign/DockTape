@@ -394,15 +394,40 @@ final class AppState {
     }
 
     func deleteLocalRecording(_ rec: RecordingMetadata) async {
-        if playback.playingFile == rec.filename {
-            playback.stop()
-        }
+        let currentLibrary = library, currentSummary = summarization
+        let coordinator = currentLibrary.sharedCoordinator
+        func stillBound() -> Bool { library === currentLibrary && sharedLibrary.coordinator === coordinator }
         do {
-            try await library.deleteRecording(rec)
-            try? await summarization.summaryStore.delete(for: rec.filename)
-            summarization.hasSummary.remove(rec.filename)
+            let filename: String
+            if let coordinator {
+                guard let reference = rec.reference else { throw SharedLibraryCoordinatorError.staleJob }
+                filename = try await coordinator.resolve(reference)
+            } else {
+                guard rec.reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
+                filename = rec.filename
+            }
+            guard stillBound() else { return }
+            if playback.playingFile == filename { playback.stop() }
+            let outcome = try await currentLibrary.deleteRecording(rec)
+            guard stillBound() else { return }
+            if let outcome {
+                currentSummary.hasSummary.remove(outcome.filename)
+                if outcome.result == .complete {
+                    statusMessage = "Deleted \(outcome.filename)"
+                    if let message = outcome.projectionError { statusMessage += ". Library files need attention: " + message }
+                } else {
+                    statusMessage = "Deletion is pending. Open Shared Library Review → Pending Files to finish cleanup."
+                    sharedLibrary.reviewTab = .pendingFiles
+                    sharedLibrary.showsReview = true
+                }
+            } else {
+                try? await currentSummary.summaryStore.delete(for: filename)
+                guard stillBound() else { return }
+                currentSummary.hasSummary.remove(filename)
+                statusMessage = "Deleted \(filename)"
+            }
         } catch {
-            errorMessage = "Delete failed: \(error.localizedDescription)"
+            if stillBound() { errorMessage = "Delete failed: \(error.localizedDescription)" }
         }
     }
 

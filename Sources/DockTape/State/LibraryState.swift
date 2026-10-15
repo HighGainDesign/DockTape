@@ -101,10 +101,23 @@ final class LibraryState {
         return newFilename
     }
 
-    func deleteRecording(_ rec: RecordingMetadata) async throws {
-        try await store.deleteRecording(filename: rec.filename)
-        if sharedCoordinator == nil { try await transcriptStore.delete(for: rec.filename) }
+    @discardableResult
+    func deleteRecording(_ rec: RecordingMetadata) async throws -> SharedRecordingFileOutcome? {
+        let outcome: SharedRecordingFileOutcome?
+        if let coordinator = sharedCoordinator {
+            guard store.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() == coordinator.root else {
+                throw SharedLibraryCoordinatorError.differentBinding
+            }
+            guard let reference = rec.reference else { throw SharedLibraryCoordinatorError.staleJob }
+            outcome = try await coordinator.deleteSharedRecording(filename: rec.filename, reference: reference)
+        } else {
+            guard rec.reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
+            try await store.deleteRecording(filename: rec.filename)
+            try await transcriptStore.delete(for: rec.filename)
+            outcome = nil
+        }
         await refresh()
+        return outcome
     }
 
     func renameRecording(_ rec: RecordingMetadata, to name: String) async throws -> String {
