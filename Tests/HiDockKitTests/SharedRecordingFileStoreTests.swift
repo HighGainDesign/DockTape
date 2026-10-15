@@ -480,6 +480,54 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Interrupted.mp3")), bytes)
         XCTAssertTrue(LibraryFileDiscovery.files(in: root.appendingPathComponent(".docktape/staging"), suffix: ".mp3").isEmpty)
     }
+    func testMissingReceiptReconstructionRejectsChangedAndMalformedIntentWithoutConsumingInput() async throws {
+        for change in ["title", "fingerprint", "library", "entity", "unsafeStage", "nonAudio", "schema"] {
+            let (root, coordinator, _) = try await fixture()
+            let local = root.deletingLastPathComponent().appendingPathComponent("local")
+            let interrupted = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: local,
+                afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+            let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: interrupted))
+            try await store.setup()
+            let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+            let task = Task { try await store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Intent.hda", size: UInt32(bytes.count))) }
+            do { _ = try await task.value; XCTFail() } catch is CancellationError {}
+            let base = try await coordinator.recording(at: "Intent.mp3")
+            let entity = SharedEntityIdentity(id: base.state.id, kind: .recording)
+            let receipt = local.appendingPathComponent("Operations").appendingPathComponent(base.libraryID.uuidString)
+                .appendingPathComponent(coordinator.writerID.uuidString).appendingPathComponent(entity.id.uuidString + ".json")
+            try FileManager.default.removeItem(at: receipt)
+            let field = "materialization.audio." + coordinator.writerID.uuidString.lowercased()
+            guard case .document(let document)? = base.state.value(for: field) else { XCTFail("Missing accepted intent"); return }
+            let intent = try JSONDecoder().decode(SharedPreparedAudioIntent.self, from: document.json)
+            var mutation: SharedLibraryMutation
+            switch change {
+            case "title": mutation = .assign(field: "title", value: .text("Different"))
+            case "fingerprint": mutation = .assign(field: "audioFingerprint", value: .text(String(repeating: "f", count: 64)))
+            default:
+                let step: SharedLibraryOperation.Step
+                if change == "nonAudio" { step = .trash(path: "Intent.mp3", fingerprint: SharedLibraryOperation.fingerprint(bytes)) }
+                else if change == "unsafeStage" { step = .publishAudio(path: "Intent.mp3", staged: "../outside.mp3", selectedFingerprint: SharedLibraryOperation.fingerprint(bytes)) }
+                else { step = intent.step }
+                let modified = SharedPreparedAudioIntent(libraryID: change == "library" ? UUID() : intent.libraryID,
+                    entity: change == "entity" ? .init(id: UUID(), kind: .recording) : intent.entity,
+                    inputRevision: intent.inputRevision, step: step, inputAudioFingerprint: intent.inputAudioFingerprint)
+                var data = try JSONEncoder().encode(modified)
+                if change == "schema" {
+                    var json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any]); json["schema"] = 2
+                    data = try JSONSerialization.data(withJSONObject: json)
+                }
+                mutation = .assign(field: field, value: .document(try SharedDocument(id: UUID(), json: data)))
+            }
+            _ = try await coordinator.edit(.init(base: base, changes: [mutation]))
+            do { _ = try await coordinator.resumeRecordingOperation(id: entity.id); XCTFail("Changed intent must be reviewed: \(change)") }
+            catch { XCTAssertTrue(error is SharedLibraryOperationError, "\(change): \(error)") }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Intent.mp3").path))
+            let staged = LibraryFileDiscovery.files(in: root.appendingPathComponent(".docktape/staging"), suffix: ".mp3")
+            XCTAssertEqual(staged.count, 1)
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(".docktape/staging/" + staged[0].relativePath)), bytes)
+        }
+    }
+
     func testVerifiedSourceImportIdentityIsDeterministicAndChecksumSkipDetectsCorruption() async throws {
         let (root, coordinator, store) = try await fixture()
         let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])

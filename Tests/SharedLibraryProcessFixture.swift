@@ -19,6 +19,37 @@ struct SharedLibraryProcessFixture {
     else {
       throw FixtureError.arguments
     }
+    if args[1].hasPrefix("accept-") {
+      guard args.count == 6 else { throw FixtureError.arguments }
+      let root = URL(fileURLWithPath: args[2]), local = URL(fileURLWithPath: args[5])
+      let coordinator = SharedLibraryCoordinator(root: root, writerID: writer, witnessDirectory: local,
+        afterCommit: { if args[1].hasSuffix("-crash") { Darwin._exit(74) } })
+      if args[1] == "accept-seed" {
+        _ = try await coordinator.enable()
+        if FileManager.default.fileExists(atPath: root.appendingPathComponent("Accepted.mp3").path) {
+          let base = try await coordinator.recording(at: "Accepted.mp3")
+          let fingerprint = SharedLibraryOperation.fingerprint(try Data(contentsOf: root.appendingPathComponent("Accepted.mp3")))
+          _ = try await coordinator.edit(.init(base: base, changes: [.assign(field: "audioFingerprint", value: .text(fingerprint)), .assign(field: "audioPublished", value: .text(fingerprint))]))
+        }
+        _ = try await coordinator.projectOutputs()
+        print("seeded"); return
+      }
+      if args[1] == "accept-resume" {
+        let accepted = try await coordinator.recording(at: "Accepted.mp3")
+        let result = try await coordinator.resumeRecordingOperation(id: accepted.state.id)
+        print(result.result == .complete ? "complete" : "pending"); return
+      }
+      let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+      try await store.setup()
+      if args[1] == "accept-import-crash" {
+        var bytes = Data(repeating: 3, count: 417)
+        bytes.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+        _ = try await store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Accepted.hda", size: UInt32(bytes.count)))
+      } else if args[1] == "accept-merge-crash" {
+        _ = try await store.mergeRecordings(filenames: ["One.mp3", "Two.mp3"], as: "Accepted")
+      } else { throw FixtureError.arguments }
+      throw FixtureError.arguments
+    }
     if args[1].hasPrefix("job-") {
       guard args.count >= 6 else { throw FixtureError.arguments }
       let root = URL(fileURLWithPath: args[2]), local = URL(fileURLWithPath: args[5])

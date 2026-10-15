@@ -450,6 +450,40 @@ public actor SharedLibraryCoordinator {
     guard let directory = witnessDirectory else { throw SharedLibraryOperationError.invalidOperation }
     return directory.appendingPathComponent("Operations").appendingPathComponent(library.uuidString).appendingPathComponent(writerID.uuidString)
   }
+  private var audioIntentField: String { "materialization.audio." + writerID.uuidString.lowercased() }
+  private func preparedAudioDocument(library: UUID, entity: SharedEntityIdentity,
+      inputRevision: String, step: SharedLibraryOperation.Step, inputAudioFingerprint: String? = nil) throws -> SharedDocument {
+    try SharedDocument(id: UUID(), json: JSONEncoder().encode(SharedPreparedAudioIntent(
+      libraryID: library, entity: entity, inputRevision: inputRevision, step: step, inputAudioFingerprint: inputAudioFingerprint)))
+  }
+  private func markAudioPublished(entity: SharedEntityIdentity, selected: String) async throws -> SharedLibraryViewSnapshot {
+    let base = try await read(entity)
+    guard base.state.lifecycle == .alive, base.state.conflicts.isEmpty,
+          base.state.value(for: "audioFingerprint") == .text(selected) else { throw SharedLibraryCoordinatorError.staleReview }
+    var changes: [SharedLibraryMutation] = [.assign(field: "audioPublished", value: .text(selected))]
+    if case .document = base.state.value(for: audioIntentField) { changes.append(.assign(field: audioIntentField, value: .unset)) }
+    return try await commit(.init(base: base, changes: changes), review: false, exact: true)
+  }
+  private func reconstructAudioIntent(view: SharedLibraryViewSnapshot, materializer: SharedLibraryMaterializer) async throws {
+    guard view.state.lifecycle == .alive, view.state.conflicts.isEmpty,
+      case .document(let document)? = view.state.value(for: audioIntentField),
+      let intent = try? JSONDecoder().decode(SharedPreparedAudioIntent.self, from: document.json), intent.schema == 1,
+      intent.libraryID == view.libraryID, intent.entity == SharedEntityIdentity(id: view.state.id, kind: .recording) else {
+      throw SharedLibraryOperationError.invalidOperation
+    }
+    let path: String, selected: String
+    switch intent.step {
+    case .publishAudio(let value, _, let fingerprint), .replaceAudio(let value, _, _, let fingerprint, _): path = value; selected = fingerprint
+    default: throw SharedLibraryOperationError.invalidOperation
+    }
+    guard view.state.value(for: "audioFingerprint") == .text(selected) else { throw SharedLibraryOperationError.unfinishedOperation }
+    let views = try await snapshots(kinds: [.recording, .folder])
+    let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: false)
+    guard index.resolvedPaths[view.state.id] == path, index.owners(of: path) == [view.state.id] else { throw SharedLibraryOperationError.pathConflict(path) }
+    let operation = try SharedLibraryOperation(libraryID: view.libraryID, entity: intent.entity,
+      inputRevision: intent.inputRevision, outputRevision: SharedLibraryOperation.revision(for: view.state), steps: [intent.step], inputAudioFingerprint: intent.inputAudioFingerprint)
+    try await Task.detached { try await materializer.recordIntent(operation) }.value
+  }
   /// Compare actual audio, retain source identity across path changes, and stage
   /// only newly supplied bytes. Replacement permission remains cohort-bound.
   func importAudio(_ bytes: Data, entry: FileEntry, rawMD5: String,
@@ -573,18 +607,20 @@ public actor SharedLibraryCoordinator {
     let staged: String
     if let reusable { staged = reusable }
     else { staged = try await stager.stageNewAudio(bytes, entity: entity) }
+    let repair = priorHash == selected
+    let step: SharedLibraryOperation.Step = !hasPublishedAudio
+      ? .publishAudio(path: filename, staged: staged, selectedFingerprint: selected)
+      : .replaceAudio(path: filename, staged: staged, expectedFingerprint: actualHash, selectedFingerprint: selected, repair: repair)
+    changes.append(.assign(field: audioIntentField, value: .document(try preparedAudioDocument(
+      library: base.libraryID, entity: entity, inputRevision: base.fingerprint, step: step, inputAudioFingerprint: priorHash))))
     let accepted: SharedLibraryViewSnapshot
-    do { accepted = changes.isEmpty ? base : try await commit(.init(base: base, changes: changes), review: false, exact: true) }
+    do { accepted = try await commit(.init(base: base, changes: changes), review: false, exact: true) }
     catch {
       // Cleanup refuses any currently accepted matching input, including a
       // peer's concurrent acceptance. Never delete an accepted sole copy.
       try? await Task.detached { try await stager.discardStagedAudio(staged, entity: entity, fingerprint: selected) }.value
       throw error
     }
-    let repair = priorHash == selected
-    let step: SharedLibraryOperation.Step = !hasPublishedAudio
-      ? .publishAudio(path: filename, staged: staged, selectedFingerprint: selected)
-      : .replaceAudio(path: filename, staged: staged, expectedFingerprint: actualHash, selectedFingerprint: selected, repair: repair)
     let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
       inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: [step], inputAudioFingerprint: priorHash)
     try await Task.detached { try await materializer.recordIntent(operation) }.value
@@ -597,7 +633,7 @@ public actor SharedLibraryCoordinator {
     let result = try await materializer.replay(operation)
     var completed = accepted, projectionError: String?
     if result == .complete {
-      completed = try await edit(.init(base: try await read(entity), changes: [.assign(field: "audioPublished", value: .text(selected))]))
+      completed = try await markAudioPublished(entity: entity, selected: selected)
       do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription }
     }
     return (.init(filename: filename, result: result, projectionError: projectionError, view: completed), true)
@@ -687,7 +723,7 @@ public actor SharedLibraryCoordinator {
     }.sorted { $0.file.path < $1.file.path }
     let selected = SharedLibraryOperation.fingerprint(bytes)
     let provenance = tokens.map { token in ["library": token.library.uuidString, "entity": token.entity.id.uuidString, "inputRevision": token.input] }
-    let changes: [SharedLibraryMutation] = [
+    var changes: [SharedLibraryMutation] = [
       .assign(field: "initialPath", value: .text(filename)), .assign(field: "title", value: .text(stem)),
       .assign(field: "folder", value: .unset), .assign(field: "audioFingerprint", value: .text(selected)),
       .assign(field: "audioPublished", value: .unset),
@@ -696,6 +732,9 @@ public actor SharedLibraryCoordinator {
     let materializer = try await makeMaterializer(entity: entity, paths: [filename], receipts: operationReceipts(library: manifest.libraryID))
     let stager = try await makeInputStager(entity: entity, library: manifest.libraryID)
     let staged = try await stager.stageNewAudio(bytes, entity: entity)
+    let step = SharedLibraryOperation.Step.publishAudio(path: filename, staged: staged, selectedFingerprint: selected)
+    changes.append(.assign(field: audioIntentField, value: .document(try preparedAudioDocument(
+      library: manifest.libraryID, entity: entity, inputRevision: base.fingerprint, step: step))))
     do { try await beforeCommit(); try Task.checkCancellation() }
     catch {
       try? await Task.detached { try await stager.discardStagedAudio(staged, entity: entity, fingerprint: selected) }.value
@@ -720,13 +759,13 @@ public actor SharedLibraryCoordinator {
     await afterCommit()
     let operation = try SharedLibraryOperation(libraryID: manifest.libraryID, entity: entity,
       inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: view.state),
-      steps: [.publishAudio(path: filename, staged: staged, selectedFingerprint: selected)])
+      steps: [step])
     try await Task.detached { try await materializer.recordIntent(operation) }.value
     try Task.checkCancellation()
     let result = try await materializer.replay(operation)
     var projectionError: String?
     if result == .complete {
-      view = try await edit(.init(base: try await read(entity), changes: [.assign(field: "audioPublished", value: .text(selected))]))
+      view = try await markAudioPublished(entity: entity, selected: selected)
       do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription }
     }
     return .init(filename: filename, result: result, projectionError: projectionError, view: view)
@@ -1164,6 +1203,9 @@ public actor SharedLibraryCoordinator {
     var view = try await read(entity)
     let receipts = try operationReceipts(library: view.libraryID)
     let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
+    if try await reader.progress(entity: entity, libraryID: view.libraryID) == nil {
+      try await reconstructAudioIntent(view: view, materializer: reader)
+    }
     guard let progress = try await reader.progress(entity: entity, libraryID: view.libraryID),
           let audio = progress.operation.steps.first(where: {
             switch $0 {
@@ -1206,7 +1248,7 @@ public actor SharedLibraryCoordinator {
     var projectionError: String?
     if result == .complete {
       if let selected, view.state.value(for: "audioPublished") != .text(selected) {
-        view = try await edit(.init(base: try await read(entity), changes: [.assign(field: "audioPublished", value: .text(selected))]))
+        view = try await markAudioPublished(entity: entity, selected: selected)
       }
       do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription }
     }

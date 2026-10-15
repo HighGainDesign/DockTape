@@ -130,6 +130,23 @@ public struct SharedMaterializationAuthority: Sendable {
   }
 }
 
+/// One writer's current prepared audio intent. Committed with selected content,
+/// so a process exit cannot leave the sole replay description in local memory.
+/// Clearing it leaves a causal unset marker, not historical audio or receipts.
+struct SharedPreparedAudioIntent: Codable, Sendable {
+  let schema: Int
+  let libraryID: UUID
+  let entity: SharedEntityIdentity
+  let inputRevision: String
+  let step: SharedLibraryOperation.Step
+  let inputAudioFingerprint: String?
+  init(libraryID: UUID, entity: SharedEntityIdentity, inputRevision: String, step: SharedLibraryOperation.Step, inputAudioFingerprint: String? = nil) {
+    schema = 1; self.libraryID = libraryID; self.entity = entity
+    self.inputRevision = inputRevision; self.step = step
+    self.inputAudioFingerprint = inputAudioFingerprint
+  }
+}
+
 /// An immutable plan derived AFTER the semantic mutation was accepted. Receipt
 /// data contains no original media; staged paths refer only to newly supplied bytes.
 public struct SharedLibraryOperation: Codable, Equatable, Sendable {
