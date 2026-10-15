@@ -13,6 +13,7 @@ final class SharedLibraryState {
     private(set) var root: URL?
     private(set) var phase: Phase = .legacy
     let review = SharedLibraryReviewState()
+    let fileReview = RecordingFileReviewState()
     var showsReview = false
     var revision: UInt64 = 0
     var message: String?
@@ -87,7 +88,7 @@ final class SharedLibraryState {
         }
     }
     func close() async {
-        review.clear(); showsReview = false
+        review.clear(); fileReview.clear(); showsReview = false
         request = UUID()
         eventsTask?.cancel(); eventsTask = nil
         refreshTask?.cancel(); refreshTask = nil

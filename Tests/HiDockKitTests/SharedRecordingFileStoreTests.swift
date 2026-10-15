@@ -801,4 +801,92 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Wrong library.mp3").path))
     }
 
+    private enum ReviewStop: Error { case interrupted }
+    func testReviewedResumeCompletesActualPartialMove() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        do { _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Reviewed", afterMutation: { _ in throw ReviewStop.interrupted }); XCTFail() }
+        catch ReviewStop.interrupted {}
+        let value = try await coordinator.reviewRecordingOperation(id: entity.id)
+        let review = try XCTUnwrap(value)
+        XCTAssertTrue(review.canResume)
+        XCTAssertTrue(review.paths.contains("Meeting.mp3")); XCTAssertTrue(review.paths.contains("Reviewed.mp3"))
+        let result = try await coordinator.resumeReviewedRecordingOperation(review)
+        XCTAssertEqual(result.result, .complete)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Reviewed.mp3")), Data("single synthetic original".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.transcript.json").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Reviewed.transcript.json").path))
+        let finished = try await coordinator.reviewRecordingOperation(id: entity.id)
+        XCTAssertNil(finished, "Completed receipt is not pending work")
+    }
+    func testReviewedResumeCannotConsumeChangedMetadata() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        do { _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Reviewed", afterMutation: { _ in throw ReviewStop.interrupted }); XCTFail() }
+        catch ReviewStop.interrupted {}
+        let value = try await coordinator.reviewRecordingOperation(id: entity.id)
+        let review = try XCTUnwrap(value)
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.assign(field: "metadata.mode", value: .text("\"Wip\""))]))
+        do { _ = try await coordinator.resumeReviewedRecordingOperation(review); XCTFail("A click cannot consume changes arriving after review") }
+        catch SharedLibraryCoordinatorError.staleReview {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.transcript.json").path))
+        let newValue = try await coordinator.reviewRecordingOperation(id: entity.id)
+        let fresh = try XCTUnwrap(newValue)
+        XCTAssertTrue(fresh.needsReplanning); XCTAssertFalse(fresh.canResume)
+    }
+    func testReviewedAcknowledgmentPinsMembershipAndDoesNotApproveActiveWork() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        let job = try await coordinator.pinJob(entity)
+        _ = try await coordinator.deleteSharedRecording(filename: "Meeting.mp3")
+        let busyValue = try await coordinator.reviewRecordingOperation(id: entity.id)
+        let busy = try XCTUnwrap(busyValue)
+        XCTAssertFalse(busy.canAcknowledge)
+        await coordinator.finishJob(job)
+        let idleValue = try await coordinator.reviewRecordingOperation(id: entity.id)
+        let idle = try XCTUnwrap(idleValue)
+        XCTAssertTrue(idle.canAcknowledge)
+        let other = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("other-local"))
+        try await other.requestEnrollment(requestID: UUID(), label: "Joining Mac")
+        do { try await coordinator.acknowledgeReviewedRecordingOperation(idle); XCTFail("A reviewed cohort cannot silently include a new participating Mac") }
+        catch SharedLibraryOperationError.staleAuthority {}
+        let permission = try await coordinator.operationAuthority(entity: entity, paths: [])
+        XCTAssertTrue(permission.acknowledgments.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path))
+    }
+
+    func testLostReceiptAndChangedOriginalPlanStillAppearForReview() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        do { _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Reviewed", afterMutation: { _ in throw ReviewStop.interrupted }); XCTFail() }
+        catch ReviewStop.interrupted {}
+        let base = try await coordinator.read(entity)
+        let receipt = root.deletingLastPathComponent().appendingPathComponent("local/Operations/\(base.libraryID.uuidString)/\(coordinator.writerID.uuidString)/\(entity.id.uuidString).json")
+        try FileManager.default.removeItem(at: receipt)
+        _ = try await coordinator.edit(.init(base: base, changes: [.assign(field: "metadata.mode", value: .text("\"Wip\""))]))
+        let value = try await coordinator.reviewRecordingOperation(id: entity.id)
+        let review = try XCTUnwrap(value, "The accepted shared recipe remains visible even if its local receipt was lost")
+        XCTAssertTrue(review.needsReplanning); XCTAssertFalse(review.canResume)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Reviewed.mp3").path))
+    }
+
+    func testReviewedApprovalThenResumeCompletesDeletion() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        let job = try await coordinator.pinJob(entity)
+        _ = try await coordinator.deleteSharedRecording(filename: "Meeting.mp3")
+        await coordinator.finishJob(job)
+        let beforeValue = try await coordinator.reviewRecordingOperation(id: entity.id)
+        let before = try XCTUnwrap(beforeValue)
+        XCTAssertTrue(before.canAcknowledge); XCTAssertFalse(before.canResume)
+        try await coordinator.acknowledgeReviewedRecordingOperation(before)
+        let approvedValue = try await coordinator.reviewRecordingOperation(id: entity.id)
+        let approved = try XCTUnwrap(approvedValue)
+        XCTAssertTrue(approved.canResume); XCTAssertFalse(approved.canAcknowledge)
+        let outcome = try await coordinator.resumeReviewedRecordingOperation(approved)
+        XCTAssertEqual(outcome.result, .complete)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path))
+        XCTAssertEqual(try Data(contentsOf: root.deletingLastPathComponent().appendingPathComponent("recycled/Meeting.mp3")), Data("single synthetic original".utf8))
+    }
+
 }

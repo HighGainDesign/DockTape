@@ -251,6 +251,60 @@ import HiDockKit
         try expect(await typing.save(using: pausedStore), "Built-in draft override saves")
         try expect(await typing.reset(id: "meeting", using: pausedStore), "Native reset uses reviewed context")
         try expect(typing.template == TemplateStore.builtInDefaults[0] && !typing.hasChanges, "Native reset returns to a clean default baseline")
+        let recoveryRoot = parent.appendingPathComponent("recovery")
+        try FileManager.default.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        try Data("disposable recovery audio".utf8).write(to: recoveryRoot.appendingPathComponent("Recovery.mp3"))
+        let recovery = SharedLibraryCoordinator(root: recoveryRoot, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("recovery-local"), trash: { url in
+            let recycled = parent.appendingPathComponent("recovery-disposed")
+            try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: url, to: recycled.appendingPathComponent(url.lastPathComponent))
+        })
+        _ = try await recovery.enable(); _ = try await recovery.projectOutputs()
+        do { _ = try await recovery.relocateRecording(filename: "Recovery.mp3", title: "Recovered", afterMutation: { _ in throw Failure(message: "simulated interruption") }) }
+        catch let failure as Failure { try expect(failure.message == "simulated interruption", "Expected physical interruption") }
+        let files = RecordingFileReviewState()
+        await files.refresh(using: recovery)
+        try expect(files.items.count == 1 && files.items[0].canResume, "Actual pending file review shows resumable recording")
+        try expect(await files.perform(.resume, review: files.items[0], using: recovery), "Native action resumes the reviewed plan")
+        try expect(files.items.isEmpty && FileManager.default.fileExists(atPath: recoveryRoot.appendingPathComponent("Recovered.mp3").path), "Completion clears pending row")
+        let peerRoot = parent.appendingPathComponent("recovery-peer")
+        try FileManager.default.copyItem(at: recoveryRoot, to: peerRoot)
+        let peer = SharedLibraryCoordinator(root: peerRoot, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("recovery-peer-local"))
+        try await peer.requestEnrollment(requestID: UUID(), label: "Recovery peer")
+        for _ in 0..<3 {
+            try deliver(peerRoot, to: recoveryRoot, writer: peer.writerID); try await recovery.refresh()
+            try deliver(recoveryRoot, to: peerRoot, writer: recovery.writerID); try await peer.refresh()
+        }
+        _ = try await recovery.deleteSharedRecording(filename: "Recovered.mp3")
+        await files.refresh(using: recovery)
+        try expect(files.items.first?.waitingForMacs == ["Recovery peer"], "Show the actual participating Mac still needed")
+        try deliver(recoveryRoot, to: peerRoot, writer: recovery.writerID)
+        let peerFiles = RecordingFileReviewState()
+        await peerFiles.refresh(using: peer)
+        try expect(peerFiles.items.count == 1 && peerFiles.items[0].canAcknowledge, "Peer can review creator's deletion without a copied local receipt")
+        try expect(await peerFiles.perform(.acknowledge, review: peerFiles.items[0], using: peer), "Peer explicitly approves its reviewed revision")
+        try deliver(peerRoot, to: recoveryRoot, writer: peer.writerID)
+        await files.refresh(using: recovery)
+        try expect(files.items.first?.canResume == true, "Owner resumes after exact cohort acknowledgment arrives")
+        try expect(await files.perform(.resume, review: files.items[0], using: recovery), "Owner disposes only synthetic fixture")
+        try deliver(recoveryRoot, to: peerRoot, writer: recovery.writerID)
+        // Metadata arrives before the provider's physical deletion.
+        let libraryBytes = try Data(contentsOf: recoveryRoot.appendingPathComponent("library.json"))
+        try libraryBytes.write(to: peerRoot.appendingPathComponent("library.json"), options: .atomic)
+        await peerFiles.refresh(using: peer)
+        try expect(peerFiles.items.count == 1 && FileManager.default.fileExists(atPath: peerRoot.appendingPathComponent("Recovered.mp3").path), "Metadata arrival alone cannot claim local deletion completed")
+        try FileManager.default.removeItem(at: peerRoot.appendingPathComponent("Recovered.mp3")) // Simulated late provider removal, disposable data only.
+        await peerFiles.refresh(using: peer)
+        try expect(peerFiles.items.isEmpty, "Exact acknowledged absence clears the mirrored pending row")
+        let peerViews = try await peer.snapshots(kinds: [.recording])
+        guard let peerRecording = peerViews.first else { throw Failure(message: "Missing peer fixture") }
+        let brokenHead = peerRoot.appendingPathComponent(".docktape/records/" + peerRecording.state.id.uuidString.lowercased() + "/" + recovery.writerID.uuidString.lowercased() + ".json")
+        try Data("unreadable pending metadata fixture".utf8).write(to: brokenHead, options: .atomic)
+        await peerFiles.refresh(using: peer)
+        try expect(peerFiles.inspectionFailed && peerFiles.message != nil, "A failed inspection cannot claim an empty clean pending list")
+        peerFiles.clear()
+        files.clear()
+        try expect(files.items.isEmpty && files.message == nil, "Library switch clears operation review")
         model.clear()
         try expect(model.items.isEmpty && model.message == nil, "Library switching clears old review")
         if ui {
@@ -276,6 +330,6 @@ import HiDockKit
             NSApp.activate()
             qaWindow = host
         }
-        print("Actual shared review passed: real two-root speaker/generation/older-edit/checklist/template conflicts, readable alternatives, stale refusal, publication, retained drafts, explicit comparisons, accepted-save typing and binding reset.")
+        print("Actual shared review passed: real two-root speaker/generation/older-edit/checklist/template conflicts, readable alternatives, stale refusal, publication, retained drafts, explicit comparisons, accepted-save typing, reviewed Resume/approval, metadata-first peer deletion and binding reset.")
     }
 }

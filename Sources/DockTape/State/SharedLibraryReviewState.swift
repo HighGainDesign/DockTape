@@ -56,6 +56,7 @@ final class SharedLibraryReviewState {
     func refresh(using coordinator: SharedLibraryCoordinator) async {
         if binding !== coordinator { clear(); binding = coordinator }
         let ticket = UUID(); request = ticket; isLoading = true; message = nil
+        defer { if request == ticket { isLoading = false } }
         do {
             let views = try await coordinator.snapshots(kinds: [.recording, .folder, .template])
             guard request == ticket, binding === coordinator, !Task.isCancelled else { return }
@@ -64,7 +65,6 @@ final class SharedLibraryReviewState {
         } catch {
             if request == ticket, binding === coordinator { message = error.localizedDescription }
         }
-        if request == ticket { isLoading = false }
     }
     func apply(item: Item, selections: [String: String], using coordinator: SharedLibraryCoordinator) async -> Bool {
         guard binding === coordinator, !isApplying, !isLoading else { return false }

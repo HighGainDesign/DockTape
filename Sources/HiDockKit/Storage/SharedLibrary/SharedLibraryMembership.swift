@@ -103,6 +103,10 @@ public struct SharedLibraryMembership: Codable, Equatable, Sendable {
         }
         return result
     }
+    public func label(for writer: UUID) -> String {
+        if writer == founder { return "Original Mac" }
+        return requests.first(where: { $0.writer == writer })?.label ?? "Another Mac"
+    }
     public var cohort: Set<UUID> { heads.reduce(into: Set([founder])) { $0.formUnion(members(of: $1)) } }
     public var pendingWriters: Set<UUID> { Set(requests.map(\.writer)).subtracting(cohort) }
     public var hasConcurrentEnrollment: Bool { heads.count > 1 }
