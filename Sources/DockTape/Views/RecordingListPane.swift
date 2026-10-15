@@ -140,7 +140,8 @@ struct RecordingListPane: View {
                 state.clearMergeSelection()
             }
             Button("Delete Originals", role: .destructive) {
-                Task { await state.deleteMergeOriginals() }
+                guard let request = state.captureMergeOriginalsRequest() else { return }
+                Task { await state.deleteMergeOriginals(request: request) }
             }
         } message: {
             Text("The \(state.mergeFilenames.count) original recordings can be deleted now or kept for reference.")

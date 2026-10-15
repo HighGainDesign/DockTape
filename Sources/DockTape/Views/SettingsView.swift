@@ -80,35 +80,48 @@ struct SettingsView: View {
     }
 
     @ViewBuilder private var sharedLibrarySettings: some View {
-        switch state.sharedLibrary.phase {
-        case .legacy:
-            Button("Enable Shared Library") { Task { _ = await state.enableSharedLibrary() } }
+        if state.sharedLibrary.hasInterruptedSetup && state.sharedLibrary.phase != .connecting {
+            Button("Finish Enabling Shared Library") {
+                let library = state.library
+                Task { _ = await state.enableSharedLibrary(for: library) }
+            }
                 .disabled(isProcessing)
-            Text("Use a DockTape build with shared-library support on every Mac sharing this folder. Recordings stay in place.")
+            Text("Setup was interrupted on this Mac. Finish here before joining from another Mac. Recordings stay in place.")
                 .font(.caption).foregroundStyle(.secondary)
-        case .connecting:
-            HStack { ProgressView().controlSize(.small); Text("Opening shared library…") }
-        case .ready:
-            Label("Shared library enabled", systemImage: "checkmark.circle")
-            Text("Independent edits are combined. Audio deletion waits for all participating Macs.")
-                .font(.caption).foregroundStyle(.secondary)
-        case .readOnly:
-            Label("Read-only on this Mac", systemImage: "lock")
-            Button("Join Shared Library") {
-                Task {
-                    do { try await state.sharedLibrary.requestAccess(); await state.refreshAll() }
-                    catch { state.sharedLibrary.message = error.localizedDescription }
+        } else {
+            switch state.sharedLibrary.phase {
+            case .legacy:
+                Button("Enable Shared Library") {
+                    let library = state.library
+                    Task { _ = await state.enableSharedLibrary(for: library) }
                 }
-            }.disabled(isProcessing)
-            Text("Keep the other participating Macs running until this Mac is ready to make changes.")
-                .font(.caption).foregroundStyle(.secondary)
-        case .failed:
-            Button("Retry Shared Library") {
-                Task {
-                    do { try await state.setup() }
-                    catch { state.sharedLibrary.message = error.localizedDescription }
-                }
-            }.disabled(isProcessing)
+                    .disabled(isProcessing)
+                Text("Use a DockTape build with shared-library support on every Mac sharing this folder. Recordings stay in place.")
+                    .font(.caption).foregroundStyle(.secondary)
+            case .connecting:
+                HStack { ProgressView().controlSize(.small); Text("Opening shared library…") }
+            case .ready:
+                Label("Shared library enabled", systemImage: "checkmark.circle")
+                Text("Independent edits are combined. Audio deletion waits for all participating Macs.")
+                    .font(.caption).foregroundStyle(.secondary)
+            case .readOnly:
+                Label("Read-only on this Mac", systemImage: "lock")
+                Button("Join Shared Library") {
+                    Task {
+                        do { try await state.sharedLibrary.requestAccess(); await state.refreshAll() }
+                        catch { state.sharedLibrary.message = error.localizedDescription }
+                    }
+                }.disabled(isProcessing)
+                Text("Keep the other participating Macs running until this Mac is ready to make changes.")
+                    .font(.caption).foregroundStyle(.secondary)
+            case .failed:
+                Button("Retry Shared Library") {
+                    Task {
+                        do { try await state.setup() }
+                        catch { state.sharedLibrary.message = error.localizedDescription }
+                    }
+                }.disabled(isProcessing)
+            }
         }
         if state.sharedLibrary.coordinator != nil {
             Button("Review Shared Library…") { state.sharedLibrary.showsReview = true }

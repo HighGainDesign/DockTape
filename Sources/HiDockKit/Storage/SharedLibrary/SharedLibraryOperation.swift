@@ -75,6 +75,9 @@ public struct SharedMaterializationAuthority: Sendable {
   public var jobGate: SharedLibraryJobGate? = nil
   public var jobGates: [SharedLibraryJobGate] = []
   public var hasLiveDescendants: Bool = false
+  /// Local child cleanup gates physical removal, not a peer's approval of the
+  /// semantic deletion while that peer still retains its own original files.
+  public var descendantCleanupIsReady: Bool = true
   /// Known original aliases outside the accepted cleanup, including placeholders.
   public var unplannedDeletionPaths: [String] = []
   var recordingFileHistory: [String: Set<String>] = [:]
@@ -110,7 +113,7 @@ public struct SharedMaterializationAuthority: Sendable {
   public func mayDestroy(_ purpose: SharedDestructivePurpose) -> Bool {
     guard membership.libraryID == libraryID, state.conflicts.isEmpty, !hasPendingWork,
       purpose != .delete || unplannedDeletionPaths.isEmpty,
-      !(state.kind == .folder && hasLiveDescendants),
+      !(state.kind == .folder && (hasLiveDescendants || !descendantCleanupIsReady)),
       membership.pendingWriters.isEmpty, !membership.hasConcurrentEnrollment,
       purpose == .delete ? state.lifecycle == .deleted : state.lifecycle == .alive
     else { return false }

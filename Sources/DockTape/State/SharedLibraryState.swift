@@ -13,6 +13,7 @@ final class SharedLibraryState {
     private(set) var coordinator: SharedLibraryCoordinator?
     private(set) var root: URL?
     private(set) var phase: Phase = .legacy
+    private(set) var hasInterruptedSetup = false
     let review = SharedLibraryReviewState()
     let fileReview = RecordingFileReviewState()
     let folderReview = FolderFileReviewState()
@@ -47,9 +48,14 @@ final class SharedLibraryState {
             let writer = try await identity()
             guard request == token, !Task.isCancelled else { throw CancellationError() }
             let candidate = SharedLibraryCoordinator(root: target, writerID: writer.writer, witnessDirectory: witnessDirectory, trash: trash)
+            let interrupted = try await candidate.canResumeBootstrap()
+            guard request == token, !Task.isCancelled else { throw CancellationError() }
+            hasInterruptedSetup = interrupted
             if enable { _ = try await candidate.enable() }
             let writable = try await candidate.mayEdit()
+            let pending = writable ? false : try await candidate.canResumeBootstrap()
             guard request == token, !Task.isCancelled else { throw CancellationError() }
+            hasInterruptedSetup = pending
             installation = writer; coordinator = candidate
             phase = writable ? .ready : .readOnly
             revision &+= 1
@@ -62,7 +68,9 @@ final class SharedLibraryState {
     func refreshStatus() async throws {
         guard let coordinator else { return }
         let writable = try await coordinator.mayEdit()
+        let interrupted = writable ? false : try await coordinator.canResumeBootstrap()
         guard self.coordinator === coordinator else { return }
+        hasInterruptedSetup = interrupted
         phase = writable ? .ready : .readOnly
     }
     func requestAccess() async throws {
@@ -97,7 +105,7 @@ final class SharedLibraryState {
         eventsTask?.cancel(); eventsTask = nil
         refreshTask?.cancel(); refreshTask = nil
         let previous = coordinator
-        coordinator = nil; installation = nil; root = nil; phase = .legacy; message = nil
+        coordinator = nil; installation = nil; root = nil; phase = .legacy; message = nil; hasInterruptedSetup = false
         revision &+= 1
         await previous?.stopMonitoring()
     }

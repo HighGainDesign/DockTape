@@ -262,7 +262,7 @@ public actor SharedLibraryMaterializer {
     return try await access.withWrites([.init(receiptURL)] + gateItems, reading: [root] + bindings.map(\.file)) { scopes in
       if let gate { try gate.validate(scopes[1], outside: root) }
       try Self.checkRoot(root)
-      guard scopes[gateItems.count + 1].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath(),
+      guard scopes[gateItems.count + 1].url.standardizedFileURL.resolvingSymlinksInPath().path == root.standardizedFileURL.resolvingSymlinksInPath().path,
             !permission.revisionLease.isRevoked, try permission.validateLocalCommit() else { return .needsReplanning }
       let receipt = scopes[0]
       guard Self.contained(receipt.url, in: receipts), receipt.url.standardizedFileURL == receiptURL.standardizedFileURL else { throw SharedLibraryOperationError.unsafePath }
@@ -720,7 +720,7 @@ public actor SharedLibraryMaterializer {
         guard authority.mayDestroy(.delete) else { return .waitingForAcknowledgments }
       case .removeEmptyDirectory:
         if !authority.unplannedDeletionPaths.isEmpty { return .needsReplanning }
-        if authority.hasLiveDescendants { return .needsReplanning }
+        if authority.hasLiveDescendants || !authority.descendantCleanupIsReady { return .needsReplanning }
         if authority.state.lifecycle == .deleted {
           guard authority.mayDestroy(.delete) else { return .waitingForAcknowledgments }
         } else if authority.state.lifecycle != .alive {

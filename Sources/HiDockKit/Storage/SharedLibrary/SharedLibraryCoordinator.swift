@@ -193,8 +193,19 @@ public actor SharedLibraryCoordinator {
       root: root, writerID: writerID, witnessDirectory: witnessDirectory)
     repository = SharedLibraryRepository(root: root, writerID: writerID)
   }
+  /// Only this installation may finish its own interrupted initial setup.
+  /// A completed manifest waiting for provider delivery must never be reseeded.
+  public func canResumeBootstrap() async throws -> Bool {
+    guard case .pending(let manifest) = try await bootstrap.publishedManifest() else { return false }
+    return !manifest.complete && manifest.founder == writerID
+  }
   public func enable() async throws -> SharedBootstrapManifest {
-    let manifest = try await bootstrap.enable()
+    let manifest: SharedBootstrapManifest
+    if try await canResumeBootstrap() {
+      manifest = try await bootstrap.resume()
+    } else {
+      manifest = try await bootstrap.enable()
+    }
     try await install(manifest)
     let members = try memberRepository()
     let initial = try await members.load()
@@ -1548,14 +1559,28 @@ public actor SharedLibraryCoordinator {
       }
     }
     guard sources.count == 1, let source = sources.first else { throw SharedLibraryOperationError.pathConflict(sources.first ?? destination) }
-    // Retaining an existing directory in place updates only its receipt. A
-    // deleted child's independent cleanup may remain pending inside it. Moving
-    // that directory still requires every child alive, because its saved cleanup
-    // paths cannot be silently relocated by this folder operation.
+    // In-place retention changes no physical files. Real relocation may carry
+    // a deleted recording's absent slot only under its exact current cleanup
+    // approvals; it cannot relocate pending original bytes or renew their hash.
     let retainingInPlace = review.purpose == .retain && source == destination
-    guard retainingInPlace || members.allSatisfy({ member in
-      views.first(where: { $0.state.id == member.id })?.state.lifecycle == .alive
-    }) else { throw SharedSidecarError.conflictedContent }
+    let permission = try await operationAuthority(entity: operation.entity, paths: [])
+    guard !permission.hasPendingWork, permission.membership.fingerprint == review.cohort,
+          permission.state == review.base.state, let directory = witnessDirectory else { throw SharedLibraryOperationError.staleAuthority }
+    let witness = SharedOwnerWitness(directory: directory, libraryID: manifest.libraryID, writerID: writerID)
+    var absentChildPaths: Set<String> = []
+    if !retainingInPlace {
+      for member in members {
+        guard let child = views.first(where: { $0.state.id == member.id }), child.state.lifecycle == .deleted else { continue }
+        let relative = String(member.path.dropFirst(destination.count + 1))
+        let stems = paths.map { ($0 + "/" + relative as NSString).deletingPathExtension }
+        let suffixes = [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"]
+        let aliases = Set(stems.flatMap { stem in suffixes.map { stem + $0 } })
+        guard let absent = try await acknowledgedAbsentRecordingPaths(child, additionalPaths: aliases,
+            membership: membership, completed: published.completedFileIntents[member.id] ?? [:], index: index,
+            witness: witness, hasPendingWork: permission.hasPendingWork) else { throw SharedSidecarError.conflictedContent }
+        absentChildPaths.formUnion(absent)
+      }
+    }
     let inventory = try await SharedDirectoryInventory.prepare(at: root.appendingPathComponent(source))
     var accepted: [String: String] = [:], sourceProofs: [URL: String] = [:]
     for member in members where member.kind == .recording {
@@ -1596,9 +1621,6 @@ public actor SharedLibraryCoordinator {
         return original[entry.path]?.fingerprint == entry.fingerprint || accepted[entry.path] == entry.fingerprint
       }
     }) else { throw SharedLibraryOperationError.contentChanged(source) }
-    let permission = try await operationAuthority(entity: operation.entity, paths: [])
-    guard !permission.hasPendingWork, permission.membership.fingerprint == review.cohort,
-          permission.state == review.base.state else { throw SharedLibraryOperationError.staleAuthority }
     // An existing old destination reuses the original recipe/phase evidence.
     // Keeping the original source instead accepts an explicit inventory-only
     // same-path phase, linked to the actual interrupted operation below.
@@ -1615,7 +1637,7 @@ public actor SharedLibraryCoordinator {
     try await validateFolderReview(review)
     return .init(source: source, destination: destination, files: inventory.entries.map(\.path), original: review,
       inventory: inventory, operation: operation, localOperation: progress?.operation, sourcePaths: paths.sorted(),
-      graph: try recordingPathContext(views), bindings: bindings, scope: document, reusesOperation: reuses)
+      graph: try recordingPathContext(views), bindings: bindings, absentChildPaths: absentChildPaths.sorted(), scope: document, reusesOperation: reuses)
   }
   public func applyFolderReplan(_ prepared: SharedFolderReplanReview,
       beforeCommit: @escaping @Sendable () async throws -> Void = {},
@@ -1638,6 +1660,9 @@ public actor SharedLibraryCoordinator {
     let validation: @Sendable () throws -> Void = {
       guard try SharedDirectoryInventory.capture(at: root.appendingPathComponent(prepared.source)) == prepared.inventory else { throw SharedLibraryOperationError.contentChanged(prepared.source) }
       for path in prepared.sourcePaths where path != prepared.source {
+        guard !Self.fileOrPlaceholderExists(path, root: root) else { throw SharedLibraryOperationError.pathConflict(path) }
+      }
+      for path in prepared.absentChildPaths {
         guard !Self.fileOrPlaceholderExists(path, root: root) else { throw SharedLibraryOperationError.pathConflict(path) }
       }
     }
@@ -1970,7 +1995,9 @@ public actor SharedLibraryCoordinator {
     guard base.state.lifecycle == .alive, base.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
     if let physical = base.state.value(for: "physicalPath"), physical != .text(name) { throw SharedLibraryOperationError.unfinishedOperation }
     let members = views.filter { $0.state.id != base.state.id && (index.resolvedPaths[$0.state.id]?.hasPrefix(name + "/") == true) }
-    guard members.allSatisfy({ $0.state.lifecycle == .alive && $0.state.conflicts.isEmpty }) else { throw SharedSidecarError.conflictedContent }
+    // Deleted members retain their identities in this request. The ordinary
+    // per-child cleanup and final empty-directory checks still run on Resume.
+    guard members.allSatisfy({ ($0.state.lifecycle == .alive || $0.state.lifecycle == .deleted) && $0.state.conflicts.isEmpty }) else { throw SharedSidecarError.conflictedContent }
     let request = FolderDeletionRequest(library: base.libraryID, folder: base.state.id, path: name,
       members: members.map { .init(id: $0.state.id, kind: $0.state.kind, path: index.resolvedPaths[$0.state.id]!, revision: $0.fingerprint) }.sorted { $0.path < $1.path })
     _ = try await commit(.init(base: base, changes: [.assign(field: "deletionRequest", value: .document(try SharedDocument(id: UUID(), json: JSONEncoder().encode(request))))]), review: false, exact: true)
@@ -2109,7 +2136,7 @@ public actor SharedLibraryCoordinator {
       return .init(id: id, name: path, result: .directoryNotEmpty(path), projectionError: nil)
     }
     let before = try await operationAuthority(entity: entity, paths: [path], reviewedFolder: reviewedFolder, expectedCohort: expectedCohort)
-    if before.hasLiveDescendants || !before.unplannedDeletionPaths.isEmpty { return .init(id: id, name: path, result: .needsReplanning, projectionError: nil) }
+    if before.hasLiveDescendants || !before.descendantCleanupIsReady || !before.unplannedDeletionPaths.isEmpty { return .init(id: id, name: path, result: .needsReplanning, projectionError: nil) }
     let steps: [SharedLibraryOperation.Step] = [.removeEmptyDirectory(path: path)]
     let materializer = try await makeMaterializer(entity: entity, paths: [path], receipts: operationReceipts(library: base.libraryID), expectedCohort: expectedCohort, reviewedFolder: reviewedFolder)
     let accepted: SharedLibraryViewSnapshot
@@ -2481,10 +2508,46 @@ public actor SharedLibraryCoordinator {
     }
     return files
   }
+  /// A parent may move an absent recording slot after its exact deletion is
+  /// acknowledged. This recognizes provider absence, never local Trash progress,
+  /// and does not rewrite the child's lifecycle, plan, receipt or approvals.
+  private func acknowledgedAbsentRecordingPaths(_ view: SharedLibraryViewSnapshot,
+      additionalPaths: Set<String>, membership: SharedLibraryMembership, completed: [String: String],
+      index: SharedLibraryPathIndex, witness: SharedOwnerWitness, hasPendingWork: Bool) async throws -> Set<String>? {
+    guard view.state.kind == .recording, !hasPendingWork,
+          try currentDeletionIntentOwner(in: view) != nil else { return nil }
+    let acknowledgments = try await SharedOperationAcknowledgmentStore(
+      root: root, libraryID: view.libraryID, writer: writerID, witness: witness, gate: gate).load(entity: view.state.id)
+    let permission = SharedMaterializationAuthority(libraryID: view.libraryID, state: view.state,
+      membership: membership, acknowledgments: acknowledgments, hasPendingWork: false, pathOwners: [:])
+    guard permission.mayDestroy(.delete) else { return nil }
+    var paths = Set(try knownRecordingFiles(view.state, library: view.libraryID, completed: completed).keys).union(additionalPaths)
+    for path in paths { _ = try SharedLibraryIdentity.normalized(path) }
+    paths = Set(paths.filter { path in
+      let owners = index.owners(of: path)
+      return owners.count != 1 || owners.contains(view.state.id)
+    })
+    guard !paths.isEmpty, paths.allSatisfy({ !Self.fileOrPlaceholderExists($0, root: root) }) else { return nil }
+    return paths
+  }
   private nonisolated static func fileOrPlaceholderExists(_ path: String, root: URL) -> Bool {
     let url = root.appendingPathComponent(path)
     let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
-    return FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path)
+    var entries = [url, placeholder]
+    // A cloud-only historical directory can hide every descendant slot.
+    // Check ancestor placeholders without asking the provider for file bytes.
+    var ancestor = url.deletingLastPathComponent()
+    while ancestor.path != root.path && ancestor.path.hasPrefix(root.path + "/") {
+      entries.append(ancestor.deletingLastPathComponent().appendingPathComponent("." + ancestor.lastPathComponent + ".icloud"))
+      ancestor.deleteLastPathComponent()
+    }
+    return entries.contains { file in
+      var information = stat()
+      if file.path.withCString({ Darwin.lstat($0, &information) }) == 0 { return true }
+      // A dangling symlink is an entry; permission/provider errors are not
+      // evidence of absence. Only a genuinely missing path may be cleared.
+      return errno != ENOENT && errno != ENOTDIR
+    }
   }
   public func reviewRecordingOperation(id: UUID) async throws -> SharedRecordingOperationReview? {
     let entity = SharedEntityIdentity(id: id, kind: .recording)
@@ -3192,12 +3255,13 @@ public actor SharedLibraryCoordinator {
             try selected.state.fileIntentGuardRevision(writer: owner) == intent.guardRevision else { return nil }
       return intent
     }
-    var excludedFolderPaths: Set<String> = []
+    var excludedFolderPaths: Set<String> = [], absentChildPaths: Set<String> = []
     result.resolvedFolderPath = entity.kind == .folder ? index.resolvedPaths[entity.id] : nil
     let retainingInPlace = !validFolderMoves.isEmpty && validFolderMoves.allSatisfy { intent in
       guard case .moveDirectory(let source, let destination, _) = intent.steps[0] else { return false }
       return source == destination && destination == result.resolvedFolderPath
     }
+    let scopeEpoch = authorityEpoch
     if entity.kind == .folder, selected.state.value(for: "physicalPath") != result.resolvedFolderPath.map(SharedFieldValue.text) || !validFolderMoves.isEmpty {
       result.directoryScopeMatches = false
       if case .document(let document)? = selected.state.value(for: "moveScope"),
@@ -3209,12 +3273,35 @@ public actor SharedLibraryCoordinator {
          scope.members.allSatisfy({ member in
            member.path.hasPrefix(scope.destination + "/") && snapshots.contains {
              $0.state.id == member.id && $0.state.kind == member.kind &&
-             ($0.state.lifecycle == .alive || (retainingInPlace && $0.state.lifecycle == .deleted)) &&
+             ($0.state.lifecycle == .alive || $0.state.lifecycle == .deleted) &&
              $0.state.conflicts.isEmpty && index.resolvedPaths[member.id] == member.path
            }
          }) {
         let physical = selected.state.value(for: "physicalPath").flatMap { if case .text(let value) = $0 { return value }; return nil }
-        result.directoryScopeMatches = (scope.retainedPaths ?? []).allSatisfy { path in
+        var membersMatch = true
+        if !retainingInPlace {
+          var placements = Set([scope.destination] + (physical.map { [$0] } ?? []) + (scope.retainedPaths ?? []))
+          for intent in validFolderMoves {
+            if case .moveDirectory(let source, let destination, _) = intent.steps[0] { placements.formUnion([source, destination]) }
+          }
+          for member in scope.members {
+            guard let child = snapshots.first(where: { $0.state.id == member.id }), child.state.lifecycle == .deleted else { continue }
+            let relative = String(member.path.dropFirst(scope.destination.count + 1))
+            let stems = placements.map { ($0 + "/" + relative as NSString).deletingPathExtension }
+            let suffixes = [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"]
+            let paths = Set(stems.flatMap { stem in suffixes.map { stem + $0 } })
+            guard !validFolderMoves.isEmpty,
+                  let absent = try await acknowledgedAbsentRecordingPaths(.init(libraryID: manifest.libraryID, repository: child),
+                    additionalPaths: paths, membership: membership, completed: locations.completedFileIntents[member.id] ?? [:],
+                    index: index, witness: witness, hasPendingWork: result.hasPendingWork) else {
+              membersMatch = false; break
+            }
+            absentChildPaths.formUnion(absent)
+          }
+        }
+        guard transitions == 0, authorityEpoch == scopeEpoch,
+              try witness.checkpointFingerprint() == localCheckpoint else { throw SharedLibraryOperationError.staleAuthority }
+        result.directoryScopeMatches = membersMatch && (scope.retainedPaths ?? []).allSatisfy { path in
           guard (try? SharedLibraryIdentity.normalized(path)) == path else { return false }
           if path == physical || path == scope.destination { return true }
           let owners = index.owners(of: path)
@@ -3223,6 +3310,23 @@ public actor SharedLibraryCoordinator {
           return !Self.fileOrPlaceholderExists(path, root: root)
         }
       }
+    }
+    if entity.kind == .folder, selected.state.lifecycle == .deleted {
+      // Parent removal must not skip a child's returned originals merely
+      // because that child already has a completed local Trash receipt.
+      for child in snapshots where child.state.kind == .recording && child.state.lifecycle == .deleted && affected.contains(child.state.id) {
+        guard let path = index.resolvedPaths[child.state.id] else { result.descendantCleanupIsReady = false; continue }
+        let stem = (path as NSString).deletingPathExtension
+        let aliases = Set([".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"].map { stem + $0 })
+        guard let absent = try await acknowledgedAbsentRecordingPaths(.init(libraryID: manifest.libraryID, repository: child),
+            additionalPaths: aliases, membership: membership, completed: locations.completedFileIntents[child.state.id] ?? [:],
+            index: index, witness: witness, hasPendingWork: result.hasPendingWork) else {
+          result.descendantCleanupIsReady = false; continue
+        }
+        absentChildPaths.formUnion(absent)
+      }
+      guard transitions == 0, authorityEpoch == scopeEpoch,
+            try witness.checkpointFingerprint() == localCheckpoint else { throw SharedLibraryOperationError.staleAuthority }
     }
     // Final metadata may precede a provider's directory move. Only an exact
     // still-bound accepted plan may claim its otherwise unowned source alias;
@@ -3281,7 +3385,7 @@ public actor SharedLibraryCoordinator {
         excludedFolderPaths.insert(path)
       }
     }
-    let excluded = excludedDeletionPaths.union(excludedFolderPaths).sorted()
+    let excluded = excludedDeletionPaths.union(excludedFolderPaths).union(absentChildPaths).sorted()
     result.unplannedDeletionPaths = excluded.filter { Self.fileOrPlaceholderExists($0, root: authorityRoot) }
     result.validateLocalCommit = {
       let actualSources = Set(LibraryFileDiscovery.files(in: authorityRoot.appendingPathComponent(".docktape"), suffix: ".json")

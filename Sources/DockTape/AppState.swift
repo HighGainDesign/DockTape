@@ -73,8 +73,15 @@ final class AppState {
     var triggerCustomPrompt: Bool = false
     var triggerMerge: Bool = false
     var mergeFilenames: [String] = []
-    private var mergeReferences: [String: SharedRecordingReference] = [:]
-    private var mergeLibraryRoot: URL?
+    struct MergeRequest {
+        fileprivate let id: UUID
+        fileprivate let library: LibraryState
+        fileprivate let coordinator: SharedLibraryCoordinator?
+        fileprivate let filenames: [String]
+        fileprivate let references: [String: SharedRecordingReference]
+    }
+    private var mergeSelection: MergeRequest?
+    private var completedMergeRequest: MergeRequest?
     var showMergeDeletePrompt: Bool = false
     var showMigrationPrompt: Bool = false
     var syncProgress: Double? = nil  // 0.0–1.0 during sync, nil when idle
@@ -159,25 +166,48 @@ final class AppState {
         if sharedLibrary.phase == .ready { return true }
         if sharedLibrary.phase == .legacy,
            !FileManager.default.fileExists(atPath: library.store.baseDirectory.appendingPathComponent(".docktape").path) { return true }
-        errorMessage = sharedLibrary.phase == .readOnly
-            ? "This library is read-only. Join it in Settings and wait for the other Macs to connect."
-            : "Wait for shared library setup to finish, or retry it in Settings."
+        if sharedLibrary.hasInterruptedSetup {
+            errorMessage = "Shared library setup was interrupted. Finish enabling it in Settings on this Mac."
+        } else {
+            errorMessage = sharedLibrary.phase == .readOnly
+                ? "This library is read-only. Join it in Settings and wait for the other Macs to connect."
+                : "Wait for shared library setup to finish, or retry it in Settings."
+        }
         return false
     }
 
-    func enableSharedLibrary() async -> Bool {
+    func enableSharedLibrary(for requestedLibrary: LibraryState? = nil) async -> Bool {
+        let requestedLibrary = requestedLibrary ?? library
+        guard library === requestedLibrary else { return false }
         guard !device.isDeviceBusy, !transcription.isTranscribing, !summarization.isSummarizing, !sharedLibrary.isBusy else {
             errorMessage = "Wait for the current operation to finish before enabling a shared library."
             return false
         }
+        let root = requestedLibrary.store.baseDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        var currentLibrary = requestedLibrary
+        var enabledCoordinator: SharedLibraryCoordinator?
+        func stillBound() -> Bool {
+            !Task.isCancelled && library === currentLibrary && sharedLibrary.root == root &&
+                (enabledCoordinator == nil || sharedLibrary.coordinator === enabledCoordinator)
+        }
         do {
-            if let coordinator = try await sharedLibrary.connect(root: library.store.baseDirectory, enable: true) {
+            let coordinator = try await sharedLibrary.connect(root: root, enable: true)
+            guard stillBound() else { return false }
+            enabledCoordinator = coordinator
+            if let coordinator {
                 attachSharedStores(coordinator)
+                currentLibrary = library
             }
             try await setup()
-            if let coordinator = sharedLibrary.coordinator { _ = try await coordinator.projectOutputs() }
+            guard stillBound() else { return false }
+            if let coordinator { _ = try await coordinator.projectOutputs() }
+            guard stillBound() else { return false }
             return true
-        } catch { errorMessage = "Shared library setup failed: \(error.localizedDescription)"; return false }
+        } catch {
+            guard stillBound(), !(error is CancellationError) else { return false }
+            errorMessage = "Shared library setup failed: \(error.localizedDescription)"
+            return false
+        }
     }
 
     private func attachSharedStores(_ coordinator: SharedLibraryCoordinator) {
@@ -335,6 +365,10 @@ final class AppState {
             errorMessage = "Wait for the current operation to finish before changing storage."
             return false
         }
+        // Cancel old sheets/prompts before the first suspension in switching.
+        // Already dispatched work retains its own stores, but cannot issue the
+        // next original deletion or update a newly selected library.
+        invalidateMergePresentation()
         librarySetupRequest = UUID()
         library.cancelMetadataLoad()
         // A pending cloud playback request belongs to the old library.
@@ -787,72 +821,108 @@ final class AppState {
             errorMessage = "Select at least 2 recordings to merge."
             return
         }
-        // Sort by recorded date (earliest first)
         let sorted = library.recordings
             .filter { selected.contains($0.filename) }
             .sorted { ($0.recordedAt ?? .distantFuture) < ($1.recordedAt ?? .distantFuture) }
         mergeFilenames = sorted.map(\.filename)
-        mergeReferences = Dictionary(uniqueKeysWithValues: sorted.compactMap { recording in
-            recording.reference.map { (recording.filename, $0) }
-        })
-        mergeLibraryRoot = library.store.baseDirectory
+        mergeSelection = MergeRequest(id: UUID(), library: library, coordinator: sharedLibrary.coordinator,
+            filenames: mergeFilenames, references: Dictionary(uniqueKeysWithValues: sorted.compactMap { recording in
+                recording.reference.map { (recording.filename, $0) }
+            }))
+        completedMergeRequest = nil
+        showMergeDeletePrompt = false
         triggerMerge = true
     }
 
-    /// Execute the merge with the given name. Called after the rename dialog.
-    func executeMerge(as name: String) async {
-        guard requireWritableLibrary() else { return }
-        guard mergeFilenames.count >= 2 else { return }
-        guard mergeLibraryRoot == library.store.baseDirectory else {
-            errorMessage = "The library changed. Select the recordings to merge again."
+    /// Capture the displayed ordering before a UI action schedules its Task.
+    func captureMergeRequest() -> MergeRequest? {
+        guard let source = mergeSelection, isCurrentMergeRequest(source), mergeFilenames.count >= 2,
+              mergeFilenames.count == source.filenames.count,
+              Set(mergeFilenames) == Set(source.filenames) else { return nil }
+        return MergeRequest(id: source.id, library: source.library, coordinator: source.coordinator,
+            filenames: mergeFilenames, references: source.references)
+    }
+
+    func captureMergeOriginalsRequest() -> MergeRequest? {
+        guard let request = completedMergeRequest, isCurrentMergeRequest(request) else { return nil }
+        return request
+    }
+
+    private func isCurrentMergeRequest(_ request: MergeRequest) -> Bool {
+        mergeSelection?.id == request.id && library === request.library && sharedLibrary.coordinator === request.coordinator
+    }
+
+    private func invalidateMergePresentation() {
+        mergeSelection = nil
+        completedMergeRequest = nil
+        triggerMerge = false
+        showMergeDeletePrompt = false
+    }
+
+    /// Execute the captured dialog request against its original library.
+    func executeMerge(as name: String, request captured: MergeRequest? = nil) async {
+        guard let request = captured ?? captureMergeRequest() else {
+            if mergeFilenames.count >= 2 { errorMessage = "The library changed. Select the recordings to merge again." }
             return
         }
-
-        statusMessage = "Merging \(mergeFilenames.count) recordings..."
+        guard isCurrentMergeRequest(request), requireWritableLibrary() else { return }
+        statusMessage = "Merging \(request.filenames.count) recordings..."
         do {
-            let merged = try await library.store.mergeRecordings(filenames: mergeFilenames, as: name, references: mergeReferences)
-            statusMessage = "Merged \(mergeFilenames.count) recordings into \(merged.filename)"
-            await library.refresh()
-            // Select the merged recording
-            library.selectedRecordings = [merged.filename]
-            // Prompt to delete originals
+            let merged = try await request.library.store.mergeRecordings(filenames: request.filenames, as: name, references: request.references)
+            guard isCurrentMergeRequest(request) else { return }
+            await request.library.refresh()
+            guard isCurrentMergeRequest(request) else { return }
+            statusMessage = "Merged \(request.filenames.count) recordings into \(merged.filename)"
+            request.library.selectedRecordings = [merged.filename]
+            completedMergeRequest = request
             showMergeDeletePrompt = true
         } catch {
+            guard isCurrentMergeRequest(request) else { return }
             errorMessage = "Merge failed: \(error.localizedDescription)"
         }
     }
 
     func clearMergeSelection() {
-        mergeFilenames = []; mergeReferences = [:]; mergeLibraryRoot = nil
+        invalidateMergePresentation()
+        mergeFilenames = []
     }
 
-    /// Delete the original identities after a merge, even if names changed.
-    func deleteMergeOriginals() async {
-        guard requireWritableLibrary() else { return }
-        guard mergeLibraryRoot == library.store.baseDirectory else {
-            errorMessage = "The library changed. The original recordings were left in place."
+    /// Delete the approved original identities, even after a same-library rename.
+    func deleteMergeOriginals(request captured: MergeRequest? = nil) async {
+        guard let request = captured ?? captureMergeOriginalsRequest() else {
+            if mergeFilenames.count >= 2 { errorMessage = "The library changed. The original recordings were left in place." }
             return
         }
-        for original in mergeFilenames {
+        func stillCurrent() -> Bool { isCurrentMergeRequest(request) && completedMergeRequest?.id == request.id }
+        guard stillCurrent(), requireWritableLibrary() else { return }
+        let transcriptStore = transcription.transcriptStore, summaryState = summarization
+        for original in request.filenames {
+            guard stillCurrent() else { return }
             do {
                 let filename: String
-                if let shared = sharedLibrary.coordinator {
-                    guard let reference = mergeReferences[original] else { throw SharedLibraryCoordinatorError.staleJob }
+                if let shared = request.coordinator {
+                    guard let reference = request.references[original] else { throw SharedLibraryCoordinatorError.staleJob }
                     filename = try await shared.resolve(reference)
                 } else { filename = original }
+                guard stillCurrent() else { return }
                 if playback.playingFile == filename { playback.stop() }
-                try await library.store.deleteRecordingAndSidecars(filename: filename, reference: mergeReferences[original])
-                if sharedLibrary.coordinator == nil {
-                    try await transcription.transcriptStore.delete(for: filename)
-                    try await summarization.summaryStore.delete(for: filename)
+                try await request.library.store.deleteRecordingAndSidecars(filename: filename, reference: request.references[original])
+                guard stillCurrent() else { return }
+                if request.coordinator == nil {
+                    try await transcriptStore.delete(for: filename)
+                    guard stillCurrent() else { return }
+                    try await summaryState.summaryStore.delete(for: filename)
+                    guard stillCurrent() else { return }
                 }
-                summarization.hasSummary.remove(filename)
+                summaryState.hasSummary.remove(filename)
             } catch {
+                guard stillCurrent() else { return }
                 errorMessage = "Failed to delete \(original): \(error.localizedDescription)"
             }
         }
+        await request.library.refresh()
+        guard stillCurrent() else { return }
         clearMergeSelection()
-        await library.refresh()
     }
 
     func updateSpeakerNames(for filename: String, names: [String: String]) async {
