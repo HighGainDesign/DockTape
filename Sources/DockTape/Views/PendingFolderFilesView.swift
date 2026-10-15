@@ -32,15 +32,27 @@ struct PendingFolderFilesView: View {
                             Text(status(item))
                             if item.purpose == .retain { Text("Keep this folder by reviewing its current files. The previous deletion will not restart.") }
                             if item.purpose == .delete { Text("Continue deletion of this folder after related recordings and folders have the required approvals. Unknown files are preserved for review.") }
-                            if item.needsReplanning { Text("Competing changes prevent this plan from continuing. Review the competing edits before trying again.").foregroundStyle(.secondary) }
+                            if item.canReviewDeletionScope { Text("The child list changed. Review the updated list before preparing deletions.").foregroundStyle(.secondary) }
+                            else if item.needsReplanning { Text("Competing changes prevent this plan from continuing. Review the competing edits before trying again.").foregroundStyle(.secondary) }
                             if !item.waitingForMacs.isEmpty { Text("Waiting for: " + item.waitingForMacs.joined(separator: ", ")).foregroundStyle(.secondary) }
                             Text("Paths involved").font(.headline)
                             ForEach(item.paths, id: \.self) { Text($0).textSelection(.enabled) }
-                            HStack {
+                            VStack(alignment: .leading, spacing: 8) {
                                 if item.purpose == .delete {
                                     Button("Approve Folder Deletion on This Mac") { perform(.acknowledge, item) }
                                         .disabled(!item.canAcknowledge || disabled)
                                         .accessibilityLabel("Approve deletion of folder " + item.name + " on this Mac")
+                                }
+                                if item.canReviewDeletionScope {
+                                    Button("Review Updated Child List…") {
+                                        guard let coordinator = state.sharedLibrary.coordinator else { return }
+                                        Task { await model.prepareDeletionScope(item, using: coordinator) }
+                                    }.disabled(disabled)
+                                }
+                                if item.canPrepareChildren {
+                                    Button("Prepare Child Deletions") { perform(.prepareChildren, item) }
+                                        .disabled(disabled)
+                                        .accessibilityLabel("Prepare child deletions in " + item.name)
                                 }
                                 if item.canReplan {
                                     Button("Review Updated Plan…") {
@@ -86,6 +98,36 @@ struct PendingFolderFilesView: View {
                         .accessibilityLabel("Apply reviewed folder location " + plan.destination)
                 }
             }.padding(24).frame(width: 500).interactiveDismissDisabled(model.isWorking)
+        }
+        .sheet(item: Binding(get: { model.deletionScope }, set: { if $0 == nil { model.dismissDeletionScope() } })) { scope in
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Review Updated Child List").font(.title2)
+                Text(scope.path).font(.headline).textSelection(.enabled)
+                Text("Review the current recordings and folders included in this deletion. Saving the list removes no files and grants no cleanup approval. Unknown files are preserved.")
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(scope.members, id: \.state.id) { member in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(member.path).textSelection(.enabled)
+                                Text(member.state.lifecycle == .deleted ? "Already pending deletion; original cleanup plan is preserved." : "Will be prepared for deletion in a separate step.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        if scope.members.isEmpty { Text("No owned child recordings or folders.").foregroundStyle(.secondary) }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(maxHeight: 240)
+                if let message = model.message { Text(message).foregroundStyle(.secondary) }
+                HStack {
+                    Button("Cancel") { model.dismissDeletionScope() }.keyboardShortcut(.cancelAction).disabled(model.isWorking)
+                    Spacer()
+                    if model.isWorking { ProgressView().controlSize(.small) }
+                    Button("Save Child List") {
+                        guard let coordinator = state.sharedLibrary.coordinator else { return }
+                        Task { if await model.applyDeletionScope(using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
+                    }.keyboardShortcut(.defaultAction).disabled(model.isWorking || model.isLoading)
+                        .accessibilityLabel("Save reviewed child list for " + scope.path)
+                }
+            }.padding(24).frame(width: 520).interactiveDismissDisabled(model.isWorking)
         }
         .task(id: state.sharedLibrary.revision) { await reload() }
         .onChange(of: model.items.map(\.id)) { _, ids in if !ids.contains(where: { $0 == selected }) { selected = ids.first } }

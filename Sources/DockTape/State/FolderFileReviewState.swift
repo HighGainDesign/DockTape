@@ -4,13 +4,14 @@ import Observation
 import HiDockKit
 
 @Observable @MainActor final class FolderFileReviewState {
-    enum Action { case resume, acknowledge }
+    enum Action { case resume, acknowledge, prepareChildren }
     private(set) var items: [SharedFolderOperationReview] = []
     private(set) var isLoading = false
     private(set) var isWorking = false
     private(set) var inspectionFailed = false
     private(set) var message: String?
     private(set) var updatedPlan: SharedFolderReplanReview?
+    private(set) var deletionScope: SharedFolderDeletionScopeReview?
     private var binding: SharedLibraryCoordinator?
     private var request = UUID()
     private var action: Task<Bool, Never>?
@@ -18,7 +19,7 @@ import HiDockKit
 
     func clear() {
         request = UUID(); workID = UUID(); action?.cancel(); action = nil
-        binding = nil; items = []; message = nil; updatedPlan = nil; isLoading = false; isWorking = false; inspectionFailed = false
+        binding = nil; items = []; message = nil; updatedPlan = nil; deletionScope = nil; isLoading = false; isWorking = false; inspectionFailed = false
     }
     func refresh(using coordinator: SharedLibraryCoordinator) async {
         if binding !== coordinator { clear(); binding = coordinator }
@@ -51,7 +52,7 @@ import HiDockKit
         do {
             let prepared = try await coordinator.prepareFolderReplan(review)
             guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
-            updatedPlan = prepared
+            deletionScope = nil; updatedPlan = prepared
         } catch {
             if binding === coordinator, request == ticket, !(error is CancellationError) { message = "The directory plan could not be prepared. Reload after sync finishes; existing folders and files are preserved." }
         }
@@ -83,6 +84,45 @@ import HiDockKit
         if binding === coordinator, workID == work { isWorking = false; action = nil }
         return result
     }
+    func dismissDeletionScope() { guard !isWorking else { return }; deletionScope = nil }
+    func prepareDeletionScope(_ review: SharedFolderOperationReview, using coordinator: SharedLibraryCoordinator) async {
+        guard binding === coordinator, !isLoading, !isWorking, review.canReviewDeletionScope else { return }
+        let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
+        defer { if binding === coordinator, workID == work { isWorking = false } }
+        do {
+            let prepared = try await coordinator.prepareFolderDeletionScope(review)
+            guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
+            updatedPlan = nil; deletionScope = prepared
+        } catch {
+            if binding === coordinator, request == ticket, !(error is CancellationError) { message = "The child list could not be prepared. Reload after sync finishes; existing files are preserved." }
+        }
+    }
+    @discardableResult func applyDeletionScope(using coordinator: SharedLibraryCoordinator) async -> Bool {
+        guard binding === coordinator, !isLoading, !isWorking, let prepared = deletionScope else { return false }
+        let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
+        let task = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                _ = try await coordinator.applyFolderDeletionScope(prepared)
+                guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
+                self.deletionScope = nil
+                await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
+                self.message = "Child list updated. Prepare child deletions separately; existing cleanup approvals remain required."
+                return true
+            } catch {
+                guard let self, self.binding === coordinator, self.request == ticket else { return false }
+                self.deletionScope = nil
+                await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return false }
+                if !(error is CancellationError) { self.message = "The folder, child list, receipt or participating Macs changed. Reload before reviewing it again; existing files are preserved." }
+                return false
+            }
+        }
+        action = task; let result = await task.value
+        if binding === coordinator, workID == work { isWorking = false; action = nil }
+        return result
+    }
     @discardableResult func perform(_ choice: Action, review: SharedFolderOperationReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
         guard binding === coordinator, !isLoading, !isWorking, items.contains(where: { $0.id == review.id }) else { return false }
         let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
@@ -94,12 +134,16 @@ import HiDockKit
                 case .acknowledge:
                     try await coordinator.acknowledgeReviewedFolderOperation(review)
                     text = "Folder deletion approval recorded on this Mac."
-                case .resume:
-                    let outcome = try await coordinator.resumeReviewedFolderOperation(review)
+                case .resume, .prepareChildren:
+                    let outcome: SharedFolderFileOutcome
+                    if case .prepareChildren = choice { outcome = try await coordinator.prepareReviewedFolderChildren(review) }
+                    else { outcome = try await coordinator.resumeReviewedFolderOperation(review) }
                     switch outcome.result {
                     case .complete: text = outcome.projectionError == nil ? "Folder change completed." : "Folder change completed. Readable files still need to be refreshed."
                     case .needsReplanning: text = "The folder plan changed. Reload and review its competing changes."
-                    case .waitingForAcknowledgments: text = "Waiting for approval from participating Macs. Review related pending recordings and folders."
+                    case .waitingForAcknowledgments:
+                        if case .prepareChildren = choice { text = "Child deletions prepared. Review Pending Files for recording approvals; folder approval remains separate." }
+                        else { text = "Waiting for approval from participating Macs. Review related pending recordings and folders." }
                     case .waitingForActiveWork: text = "Waiting for active work in this folder to finish."
                     case .waitingForFile(let path): text = "Waiting for " + path + " to become available."
                     case .directoryNotEmpty(let path): text = path + " still contains files that need review. Existing files are preserved."

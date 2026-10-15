@@ -1283,8 +1283,15 @@ public actor SharedLibraryCoordinator {
       if purpose == .create, selected?.valid == true, case .createDirectory(let destination)? = operation?.steps.first,
          try await folderDirectoryIsPresent(destination, permission: permission) { return nil }
     }
+    var currentScope: CurrentFolderDeletionScope?
+    if let request, view.state.conflicts.isEmpty {
+      do { currentScope = try await currentFolderDeletionScope(view, path: request.path) }
+      catch SharedSidecarError.conflictedContent { }
+      catch SharedLibraryPathError.ambiguousPath { }
+    }
+    let scopeMatches = request.map { request in currentScope.map { folderDeletionScopeMatches(request, current: $0) } ?? false } ?? true
     let valid = request != nil && view.state.lifecycle == .alive ? true : selected?.valid == true
-    let needsReplanning = conflict || !valid
+    let needsReplanning = conflict || !valid || !scopeMatches
     if purpose == .delete, !needsReplanning, view.state.lifecycle == .deleted {
       let removalPaths = request.map { [$0.path] } ?? paths
       if try await acknowledgedRemovalIsPresent(paths: removalPaths, permission: permission) { return nil }
@@ -1299,8 +1306,10 @@ public actor SharedLibraryCoordinator {
       && (!deleting || permission.mayDestroy(.delete))
     let name = request?.path ?? view.state.value(for: "name").flatMap { if case .text(let text) = $0 { return text }; return nil } ?? "Folder"
     return .init(name: name, purpose: purpose, paths: paths, waitingForMacs: waiting, hasActiveWork: permission.hasPendingWork,
-      needsReplanning: needsReplanning, canAcknowledge: canAcknowledge, canResume: canResume, base: view,
-      cohort: permission.membership.fingerprint, deletionRequest: request != nil, operation: operation, intentWriter: selected?.owner, localOperation: progress?.operation)
+      needsReplanning: needsReplanning, canAcknowledge: canAcknowledge, canResume: canResume,
+      canReviewDeletionScope: request != nil && !scopeMatches && currentScope != nil && !permission.hasPendingWork && permission.membership.mayEdit(writerID),
+      canPrepareChildren: deleting && !needsReplanning && permission.hasLiveDescendants && !permission.hasPendingWork && permission.membership.mayEdit(writerID),
+      base: view, cohort: permission.membership.fingerprint, deletionRequest: request != nil, operation: operation, intentWriter: selected?.owner, localOperation: progress?.operation)
   }
   private enum FolderMoveFilesStatus { case complete, pending, conflict }
   /// Completion is a physical proof, not a metadata/receipt assertion. The
@@ -1650,6 +1659,96 @@ public actor SharedLibraryCoordinator {
           }) else { throw SharedLibraryOperationError.differentBinding }
     return request
   }
+  private struct CurrentFolderDeletionScope {
+    let request: FolderDeletionRequest
+    let members: [SharedFolderDeletionScopeReview.Member]
+    let context: String
+  }
+  private func currentFolderDeletionScope(_ base: SharedLibraryViewSnapshot, path: String) async throws -> CurrentFolderDeletionScope {
+    let views = try await snapshots(kinds: [.recording, .folder])
+    guard views.contains(where: { $0.state.id == base.state.id && $0.state == base.state }) else { throw SharedLibraryCoordinatorError.staleReview }
+    let sensitive = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
+    let index = try await pathIndex(for: views, caseSensitive: sensitive)
+    guard index.resolvedPaths[base.state.id] == path, index.owners(of: path) == [base.state.id] else { throw SharedLibraryPathError.ambiguousPath }
+    var descendants: Set<UUID> = [base.state.id]
+    while true {
+      let found = Set(views.filter { view in
+        let field = view.state.kind == .folder ? "parent" : "folder"
+        return (view.state.fields[field]?.values ?? []).contains { value in
+          if case .text(let text) = value, let id = UUID(uuidString: text) { return descendants.contains(id) }; return false
+        }
+      }.map { $0.state.id })
+      let next = descendants.union(found)
+      if next == descendants { break }; descendants = next
+    }
+    descendants.remove(base.state.id)
+    var members: [SharedFolderDeletionScopeReview.Member] = [], requested: [FolderDeletionMember] = []
+    for view in views.filter({ descendants.contains($0.state.id) }).sorted(by: { $0.state.id.uuidString < $1.state.id.uuidString }) {
+      guard view.state.conflicts.isEmpty, view.state.lifecycle == .alive || view.state.lifecycle == .deleted else { throw SharedSidecarError.conflictedContent }
+      guard let memberPath = index.resolvedPaths[view.state.id], memberPath.hasPrefix(path + "/"), index.owners(of: memberPath) == [view.state.id] else { throw SharedLibraryPathError.ambiguousPath }
+      members.append(.init(path: memberPath, state: view.state))
+      requested.append(.init(id: view.state.id, kind: view.state.kind, path: memberPath, revision: view.fingerprint))
+    }
+    struct Context: Encodable { let graph: String; let members: [SharedEntityState] }
+    let context = try SharedStateFingerprint.of(Context(graph: recordingPathContext(views), members: members.map(\.state)))
+    return .init(request: .init(library: base.libraryID, folder: base.state.id, path: path, members: requested), members: members, context: context)
+  }
+  private func folderDeletionScopeMatches(_ request: FolderDeletionRequest, current: CurrentFolderDeletionScope) -> Bool {
+    guard request.members.count == current.request.members.count else { return false }
+    return current.request.members.allSatisfy { member in
+      guard let old = request.members.first(where: { $0.id == member.id }), old.kind == member.kind, old.path == member.path else { return false }
+      // Deleting a reviewed child changes its revision. Its own original
+      // recipe and fresh per-child approvals remain authoritative for cleanup.
+      return current.members.first(where: { $0.state.id == member.id })?.state.lifecycle == .deleted || old.revision == member.revision
+    }
+  }
+  public func prepareFolderDeletionScope(_ review: SharedFolderOperationReview) async throws -> SharedFolderDeletionScopeReview {
+    try await validateFolderReview(review)
+    guard review.canReviewDeletionScope, case .document(let old)? = review.base.state.value(for: "deletionRequest") else { throw SharedLibraryOperationError.invalidOperation }
+    let request = try validatedFolderDeletionRequest(old, base: review.base)
+    let scope = try await currentFolderDeletionScope(review.base, path: request.path)
+    let permission = try await operationAuthority(entity: .init(id: review.id, kind: .folder), paths: [])
+    guard permission.state == review.base.state, permission.membership.fingerprint == review.cohort, !permission.hasPendingWork,
+          try await currentFolderDeletionScope(review.base, path: request.path).context == scope.context else { throw SharedLibraryOperationError.staleAuthority }
+    let receiptFile = try operationReceipts(library: review.base.libraryID).appendingPathComponent(review.id.uuidString + ".json")
+    let receipt = try await RecordingFileAccess().readDataIfPresent(at: receiptFile)
+    try await validateFolderReview(review)
+    return .init(path: request.path, members: scope.members, original: review, context: scope.context,
+      document: try SharedDocument(id: UUID(), json: JSONEncoder().encode(scope.request)), receiptFile: receiptFile,
+      receiptFingerprint: receipt.map(SharedLibraryOperation.fingerprint))
+  }
+  public func applyFolderDeletionScope(_ review: SharedFolderDeletionScopeReview,
+      beforeCommit: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedLibraryViewSnapshot {
+    let original = review.original
+    try await validateFolderReview(original)
+    guard original.canReviewDeletionScope,
+          try await currentFolderDeletionScope(original.base, path: review.path).context == review.context else { throw SharedLibraryCoordinatorError.staleReview }
+    let permission = try await operationAuthority(entity: .init(id: original.id, kind: .folder), paths: [])
+    guard permission.state == original.base.state, permission.membership.fingerprint == original.cohort, !permission.hasPendingWork,
+          try await currentFolderDeletionScope(original.base, path: review.path).context == review.context else { throw SharedLibraryOperationError.staleAuthority }
+    var prepared: SharedPreparedFileOperation?
+    if original.base.state.lifecycle == .deleted { prepared = try await folderRemovalPlan(base: original.base, path: review.path) }
+    let bindings = permission.additionalBindings + (permission.binding.map { [$0] } ?? [])
+    var changes: [SharedLibraryMutation] = original.base.state.lifecycle == .deleted ? [.restore] : []
+    changes.append(.assign(field: "deletionRequest", value: .document(review.document)))
+    if original.base.state.lifecycle == .deleted { changes.append(.delete) }
+    let validation: @Sendable () throws -> Void = {
+      let current = try Data(contentsOf: review.receiptFile, options: .mappedIfSafe)
+      guard SharedLibraryOperation.fingerprint(current) == review.receiptFingerprint else { throw SharedLibraryCoordinatorError.staleReview }
+    }
+    let receiptValidation: @Sendable () throws -> Void = {
+      if review.receiptFingerprint != nil { try validation() }
+      else if FileManager.default.fileExists(atPath: review.receiptFile.path) { throw SharedLibraryCoordinatorError.staleReview }
+    }
+    try await beforeCommit(); try Task.checkCancellation()
+    return try await commit(.init(base: original.base, changes: changes), review: true, exact: true,
+      bindings: bindings, preparedFileOperation: prepared, additionalValidation: receiptValidation)
+  }
+  public func prepareReviewedFolderChildren(_ review: SharedFolderOperationReview) async throws -> SharedFolderFileOutcome {
+    try await validateFolderReview(review)
+    guard review.canPrepareChildren else { throw SharedLibraryOperationError.invalidOperation }
+    return try await resumeFolderDeletion(id: review.id, reviewedFolder: review.base, expectedCohort: review.cohort, preparingChildrenOnly: true)
+  }
   public func folderDeletionRequestChoices(_ base: SharedLibraryViewSnapshot) async throws -> [SharedFolderDeletionRequestReview] {
     let manifest = try await bind(force: true)
     guard base.libraryID == manifest.libraryID, repository.accepts(base.repository) else { throw SharedLibraryCoordinatorError.differentBinding }
@@ -1738,7 +1837,7 @@ public actor SharedLibraryCoordinator {
     return try await resumeFolderDeletion(id: base.state.id, beforeFinalRemoval: beforeFinalRemoval)
   }
   public func resumeFolderDeletion(id: UUID, reviewedFolder: SharedLibraryViewSnapshot? = nil, expectedCohort: String? = nil,
-                                   beforeMemberDeletion: @escaping @Sendable () async throws -> Void = {}, beforeFinalRemoval: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedFolderFileOutcome {
+                                   preparingChildrenOnly: Bool = false, beforeMemberDeletion: @escaping @Sendable () async throws -> Void = {}, beforeFinalRemoval: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedFolderFileOutcome {
     let rootEntity = SharedEntityIdentity(id: id, kind: .folder)
     let view = try await read(rootEntity)
     if let reviewedFolder {
@@ -1799,6 +1898,7 @@ public actor SharedLibraryCoordinator {
       let outcome = try await removeDeletedEmptyFolder(id: member.id, path: member.path, reviewedFolder: reviewedFolder, expectedCohort: expectedCohort)
       if outcome.result != .complete { return .init(id: id, name: request.path, result: outcome.result, projectionError: outcome.projectionError) }
     }
+    if preparingChildrenOnly { return .init(id: id, name: request.path, result: .waitingForAcknowledgments, projectionError: nil) }
     try await beforeFinalRemoval()
     return try await removeDeletedEmptyFolder(id: id, path: request.path, reviewedFolder: reviewedFolder, expectedCohort: expectedCohort)
   }
@@ -2107,7 +2207,17 @@ public actor SharedLibraryCoordinator {
     if let member = expectedMember {
       guard let reference, member.kind == .recording, reference.entityID == member.id else { throw SharedLibraryCoordinatorError.differentBinding }
       base = try await read(.init(id: member.id, kind: .recording))
-      source = try await currentPath(base)
+      if let reviewedFolder, reviewedFolder.state.lifecycle == .deleted,
+         case .document(let document)? = reviewedFolder.state.value(for: "deletionRequest") {
+        let request = try validatedFolderDeletionRequest(document, base: reviewedFolder)
+        let current = try await currentFolderDeletionScope(reviewedFolder, path: request.path)
+        guard folderDeletionScopeMatches(request, current: current), current.request.members.contains(where: {
+          $0.id == member.id && $0.kind == .recording && $0.path == member.path
+        }) else { throw SharedLibraryCoordinatorError.staleReview }
+        // The root tombstone deliberately prevents ordinary path use. Only
+        // this exact reviewed deletion scope may prepare its owned children.
+        source = member.path
+      } else { source = try await currentPath(base) }
       guard source == member.path, base.state.lifecycle == .deleted || base.fingerprint == member.revision else { throw SharedLibraryCoordinatorError.staleReview }
     } else {
       if let reviewed { source = try await currentPath(reviewed) }
@@ -2152,7 +2262,22 @@ public actor SharedLibraryCoordinator {
           try published.validateCompanion(path: path, bytes: bytes, entity: entity.id, library: base.libraryID,
               kind: suffix == ".transcript.json" ? "transcript" : "summary")
         }
-        steps.append(.trash(path: path, fingerprint: SharedLibraryOperation.fingerprint(bytes)))
+        let fingerprint = SharedLibraryOperation.fingerprint(bytes)
+        if expectedMember != nil, suffix == ".mp3" {
+          let selected: String?
+          if case .text(let known)? = base.state.value(for: "audioFingerprint") { selected = known }
+          else { selected = try SharedRecordingMetadataAdapter.render(base).audioSHA256 }
+          // Bootstrap keeps the imported baseline in legacy metadata. Older
+          // files may instead have only an accepted relocation's byte proof.
+          // Neither can be replaced by a fresh hash during child preparation.
+          let history = try knownRecordingFiles(base.state, library: base.libraryID)[path] ?? []
+          if let selected {
+            guard selected == fingerprint else { throw SharedLibraryOperationError.contentChanged(path) }
+          } else if !history.isEmpty, !history.contains(fingerprint) {
+            throw SharedLibraryOperationError.contentChanged(path)
+          }
+        }
+        steps.append(.trash(path: path, fingerprint: fingerprint))
       } else if suffix == ".mp3" { throw CocoaError(.fileReadNoSuchFile) }
     }
     let paths = steps.compactMap { step -> String? in

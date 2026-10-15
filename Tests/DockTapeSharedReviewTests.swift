@@ -501,6 +501,81 @@ import HiDockKit
         print("Actual unprepared deletion passed: retry, explicit Keep, native external-file restoration and deletion again complete without fixture repair writes.")
     }
 
+    @MainActor static func folderDeletionScopeChecks(parent: URL) async throws {
+        let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right"), trash = parent.appendingPathComponent("synthetic-trash")
+        try FileManager.default.createDirectory(at: left.appendingPathComponent("Empty"), withIntermediateDirectories: true)
+        let owner = FolderFileReviewState(), pause = SavePause()
+        let identityFile = parent.appendingPathComponent("qa-writer.json")
+        let identity = try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "synthetic folder scope installation").load()
+        let a = SharedLibraryCoordinator(root: left, writerID: identity.writer, witnessDirectory: parent.appendingPathComponent("a-local"), afterPublishedLibraryRead: {
+            if await MainActor.run(body: { owner.isWorking && owner.isLoading }) { await pause.pauseOnce() }
+        }, trash: { file in
+            try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: file, to: trash.appendingPathComponent(UUID().uuidString + "-" + file.lastPathComponent))
+        })
+        _ = try await a.enable(); _ = try await a.projectOutputs()
+        let folders = try await a.snapshots(kinds: [.folder])
+        guard let folder = folders.first(where: { $0.state.value(for: "name") == .text("Empty") }) else { throw Failure(message: "Missing scope fixture folder") }
+        let entity = SharedEntityIdentity(id: folder.state.id, kind: .folder)
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("b-local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Late child peer")
+        for _ in 0..<3 { try deliver(right, to: left, writer: b.writerID); try await a.refresh(); try deliver(left, to: right, writer: a.writerID); try await b.refresh() }
+        _ = try await a.deleteFolder(named: "Empty")
+        _ = try await b.renameFolder(from: "Empty", to: "Away"); _ = try await b.renameFolder(from: "Away", to: "Empty")
+        let store = RecordingStore(baseDirectory: right, shared: SharedRecordingMetadataAdapter(coordinator: b)); try await store.setup()
+        var audio = Data(repeating: 0, count: 417); audio.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+        _ = try await store.importRecording(hdaData: audio, entry: FileEntry(filename: "Late.hda", size: UInt32(audio.count)))
+        _ = try await store.moveRecording(filename: "Late.mp3", toFolder: "Empty")
+        let child = SharedEntityIdentity(id: try await b.reference(to: "Empty/Late.mp3").entityID, kind: .recording)
+        try deliver(right, to: left, writer: b.writerID)
+        try FileManager.default.copyItem(at: right.appendingPathComponent("Empty/Late.mp3"), to: left.appendingPathComponent("Empty/Late.mp3"))
+        try Data(contentsOf: right.appendingPathComponent("library.json")).write(to: left.appendingPathComponent("library.json"), options: .atomic)
+        let choices = SharedLibraryReviewState(); await choices.refresh(using: a)
+        guard let item = choices.items.first(where: { $0.id == entity.id }), let field = item.fields.first(where: { $0.id == "$lifecycle" }),
+              let choice = field.choices.first(where: { $0.value == .flag(false) }) else { throw Failure(message: "Missing root Delete choice") }
+        try expect(await choices.apply(item: item, selections: [field.id: choice.id], using: a), "Root Delete choice saves separately from child cleanup")
+        await owner.refresh(using: a)
+        guard let row = owner.items.first(where: { $0.id == entity.id }), row.canReviewDeletionScope else { throw Failure(message: "Late child must offer an updated child-list review") }
+        await owner.prepareDeletionScope(row, using: a)
+        guard let scope = owner.deletionScope else { throw Failure(message: "Updated child-list preview must open") }
+        try expect(scope.path == "Empty" && scope.members.map(\.path) == ["Empty/Late.mp3"], "Review names the exact new child")
+        if CommandLine.arguments.contains("--folder-scopes-ui") {
+            UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+            let state = AppState(baseDirectory: left, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "synthetic folder scope installation").load()
+            }, sharedWitnessDirectory: parent.appendingPathComponent("a-local"))
+            try await state.setup()
+            state.sharedLibrary.reviewTab = .pendingFolders
+            NSApp.setActivationPolicy(.regular)
+            NSApp.mainMenu = MainMenu.build(appState: state)
+            let host = MainWindowController(appState: state)
+            host.showWindow(nil); host.showSharedLibraryReview(nil)
+            NSApp.activate(); qaWindow = host
+            print("Native folder-scope QA ready with synthetic pending late child; nothing has been deleted or approved.")
+            return
+        }
+        let action = Task { await owner.applyDeletionScope(using: a) }
+        for _ in 0..<500 { if await pause.entered { break }; try await Task.sleep(for: .milliseconds(20)) }
+        guard await pause.entered else { action.cancel(); await pause.release(); _ = await action.value; throw Failure(message: "Updated scope did not reach held feedback refresh") }
+        owner.clear()
+        let otherRoot = parent.appendingPathComponent("other-library"); try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
+        let other = SharedLibraryCoordinator(root: otherRoot, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("other-local"))
+        _ = try await other.enable(); await owner.refresh(using: other)
+        await pause.release()
+        try expect(await action.value, "Scope acceptance survives library-switch feedback cancellation")
+        try expect(owner.message == nil && owner.items.isEmpty && !owner.isWorking && !owner.isLoading, "Old updated-scope feedback cannot affect a different library")
+        let savedChild = try await a.read(child), savedRoot = try await a.reviewFolderOperation(id: entity.id)
+        try expect(savedChild.state.lifecycle == .alive && savedRoot?.waitingForMacs.count == 2, "Saving scope leaves child live and grants no root approval")
+        await owner.refresh(using: a)
+        guard let pending = owner.items.first(where: { $0.id == entity.id }), pending.canPrepareChildren else { throw Failure(message: "Separate child preparation must be usable without root approval") }
+        try expect(await owner.perform(.prepareChildren, review: pending, using: a), "Child preparation is an actionable model command")
+        let deletedChild = try await a.read(child), unapprovedRoot = try await a.reviewFolderOperation(id: entity.id)
+        try expect(deletedChild.state.lifecycle == .deleted && unapprovedRoot?.waitingForMacs.count == 2, "Child preparation never approves root cleanup")
+        try expect(try Data(contentsOf: left.appendingPathComponent("Empty/Late.mp3")) == audio, "Unapproving peer protects original child audio")
+        print("Actual updated folder deletion scope passed: exact child-list review, separate preparation, retained audio, fresh approvals and library-switch feedback.")
+    }
+
     @MainActor static func folderLifecycleChecks(parent: URL) async throws {
         let choices = CommandLine.arguments.contains("--folder-lifecycle-keep-only") ? [true] : CommandLine.arguments.contains("--folder-lifecycle-delete-only") ? [false] : [true, false]
         for keep in choices {
@@ -1006,6 +1081,7 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--folder-scopes-only") || arguments.contains("--folder-scopes-ui") { try await folderDeletionScopeChecks(parent: parent); return }
         if arguments.contains("--folder-lifecycle-only") || arguments.contains("--folder-lifecycle-keep-only") || arguments.contains("--folder-lifecycle-delete-only") { try await folderLifecycleChecks(parent: parent); return }
         if arguments.contains("--folder-paths-only") { try await folderPathChecks(parent: parent); return }
         if arguments.contains("--recording-paths-only") || arguments.contains("--recording-path-published-only") || arguments.contains("--recording-path-deleted-published-only") { try await recordingPathChecks(parent: parent); return }
@@ -1021,6 +1097,7 @@ import HiDockKit
             return
         }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
+        try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-scopes"))
         try await folderLifecycleChecks(parent: parent.appendingPathComponent("folder-lifecycle"))
         try await folderPathChecks(parent: parent.appendingPathComponent("folder-paths"))
         try await recordingPathChecks(parent: parent.appendingPathComponent("recording-paths"))

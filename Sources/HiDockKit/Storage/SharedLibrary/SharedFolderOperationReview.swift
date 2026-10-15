@@ -13,6 +13,8 @@ public struct SharedFolderOperationReview: Identifiable, Sendable {
     public let needsReplanning: Bool
     public let canAcknowledge: Bool
     public let canResume: Bool
+    public let canReviewDeletionScope: Bool
+    public let canPrepareChildren: Bool
     public var canReplan: Bool {
         guard (purpose == .rename || purpose == .retain), needsReplanning, !hasActiveWork,
               base.state.lifecycle == .alive, base.state.value(for: "deletionRequest") == nil,
