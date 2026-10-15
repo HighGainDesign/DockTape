@@ -132,6 +132,41 @@ final class LegacyLibraryBootstrapTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("Meeting.mp3")), original.0)
         XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("Meeting.transcript.json")), original.1)
     }
+    func testInterruptedBootstrapRejectsAddedEmptyFolderBeforeFinishing() async throws {
+        let directory = try root(), writer = UUID()
+        _ = try seed(directory)
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("Empty"), withIntermediateDirectories: true)
+        let bootstrap = LegacyLibraryBootstrap(root: directory, writerID: writer)
+        let ready = try await bootstrap.enable()
+        var pending = ready; pending.complete = false
+        for path in [".docktape/format.json", ".docktape/bootstraps/\(writer.uuidString.lowercased()).json"] {
+            try JSONEncoder().encode(pending).write(to: directory.appendingPathComponent(path), options: .atomic)
+        }
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("Late empty"), withIntermediateDirectories: true)
+        do { _ = try await bootstrap.resume(); XCTFail("A changed directory list needs review") }
+        catch LegacyBootstrapError.changedLegacyInput {}
+        let header = try await bootstrap.publishedManifest()
+        XCTAssertEqual(header, .pending(pending))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("Late empty").path))
+    }
+    func testInterruptedLegacyInputProofWithoutDirectoryIndexStillResumes() async throws {
+        let directory = try root(), writer = UUID()
+        let originals = try seed(directory)
+        let bootstrap = LegacyLibraryBootstrap(root: directory, writerID: writer)
+        let ready = try await bootstrap.enable()
+        let files = try await SharedProjectionInputs.capture(root: directory, includeDirectoryProof: false)
+        let oldInputs = try SharedProjectionInputs(manifest: ready, files: files)
+        try oldInputs.encoded().write(to: SharedProjectionInputs.file(in: directory), options: .atomic)
+        var pending = ready; pending.complete = false
+        for path in [".docktape/format.json", ".docktape/bootstraps/\(writer.uuidString.lowercased()).json"] {
+            try JSONEncoder().encode(pending).write(to: directory.appendingPathComponent(path), options: .atomic)
+        }
+        try FileManager.default.removeItem(at: directory.appendingPathComponent(".docktape/records"))
+        let resumed = try await bootstrap.resume()
+        XCTAssertEqual(resumed, ready)
+        XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("Meeting.mp3")), originals.0)
+    }
+
     func testManifestSymlinkCannotReadOutsideTheLibrary() async throws {
         let directory = try root(), outside = try root()
         try FileManager.default.createDirectory(at: directory.appendingPathComponent(".docktape"), withIntermediateDirectories: true)

@@ -614,6 +614,29 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         }
     }
 
+    func testAcknowledgmentCannotConsumeAChangedReviewedRevision() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let base = try await coordinator.recording(at: "Meeting.mp3")
+        let entity = SharedEntityIdentity(id: base.state.id, kind: .recording)
+        let token = try await coordinator.pinJob(entity, audioURL: root.appendingPathComponent("Meeting.mp3"))
+        let pending = try await coordinator.deleteSharedRecording(filename: "Meeting.mp3")
+        XCTAssertEqual(pending.result, .waitingForAcknowledgments)
+        let accepted = try await coordinator.read(entity)
+        let reviewed = try SharedLibraryOperation.revision(for: accepted.state)
+        await coordinator.finishJob(token)
+        _ = try await coordinator.edit(.init(base: accepted, changes: [.restore]))
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.delete]))
+        do { try await coordinator.acknowledgeOperation(entity: entity, purpose: .delete, expectedRevision: reviewed); XCTFail("Old review cannot consent to a new deletion") }
+        catch SharedLibraryOperationError.staleAuthority {}
+        let beforeApproval = try await coordinator.operationAuthority(entity: entity, paths: [])
+        XCTAssertTrue(beforeApproval.acknowledgments.isEmpty)
+        let current = try SharedLibraryOperation.revision(for: beforeApproval.state)
+        try await coordinator.acknowledgeOperation(entity: entity, purpose: .delete, expectedRevision: current)
+        let approved = try await coordinator.operationAuthority(entity: entity, paths: [])
+        XCTAssertEqual(approved.acknowledgments.count, 1)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), Data("single synthetic original".utf8))
+    }
+
     func testVerifiedSourceImportIdentityIsDeterministicAndChecksumSkipDetectsCorruption() async throws {
         let (root, coordinator, store) = try await fixture()
         let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])

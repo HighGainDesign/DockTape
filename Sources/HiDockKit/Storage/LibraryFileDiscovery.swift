@@ -16,6 +16,31 @@ enum LibraryFileDiscovery {
         let isPlaceholder: Bool
     }
 
+    /// Metadata-only folder discovery. Errors are not an empty library; symlink
+    /// children and private control directories are never traversed.
+    static func directories(in directory: URL) async throws -> [String] {
+        let root = directory.standardizedFileURL.resolvingSymlinksInPath()
+        let task = Task.detached { () throws -> [String] in
+            let fm = FileManager.default
+            let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+            var pending = [root], result: Set<String> = []
+            while let parent = pending.popLast() {
+                try Task.checkCancellation()
+                for url in try fm.contentsOfDirectory(at: parent, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: []) {
+                    guard !url.lastPathComponent.hasPrefix(".") else { continue }
+                    let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                    guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
+                    let path = url.standardizedFileURL.path
+                    guard path.hasPrefix(prefix) else { throw SharedLibraryOperationError.unsafePath }
+                    result.insert(try SharedLibraryIdentity.normalized(String(path.dropFirst(prefix.count))))
+                    pending.append(url)
+                }
+            }
+            return result.sorted()
+        }
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
     static func files(in directory: URL, relativeTo base: URL? = nil, suffix: String) -> [File] {
         let fm = FileManager.default
         guard

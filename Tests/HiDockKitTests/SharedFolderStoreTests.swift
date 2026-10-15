@@ -28,6 +28,68 @@ final class SharedFolderStoreTests: XCTestCase {
         try await store.setup()
         return (root, coordinator, store)
     }
+    private actor CommitCounter {
+        var value = 0
+        func next() -> Int { value += 1; return value }
+    }
+    func testFinalEmptyFolderRemovalKeepsOriginalGuardAcrossMissingReceipt() async throws {
+        for change in ["maintenance", "ABA", "missingProof"] {
+            let (root, original, _) = try await fixture()
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Empty"), withIntermediateDirectories: true)
+            let extra = root.deletingLastPathComponent().appendingPathComponent("empty-library")
+            try FileManager.default.createDirectory(at: extra, withIntermediateDirectories: true)
+            let local = extra.deletingLastPathComponent().appendingPathComponent("empty-local")
+            let coordinator = SharedLibraryCoordinator(root: extra, writerID: original.writerID, witnessDirectory: local)
+            _ = try await coordinator.enable(); try await coordinator.createSharedFolder(named: "Empty")
+            _ = try await coordinator.projectOutputs()
+            let folders = try await coordinator.snapshots(kinds: [.folder])
+            let folder = try XCTUnwrap(folders.first)
+            let entity = SharedEntityIdentity(id: folder.state.id, kind: .folder)
+            let counter = CommitCounter()
+            let interrupted = SharedLibraryCoordinator(root: extra, writerID: coordinator.writerID, witnessDirectory: local,
+                afterCommit: { if await counter.next() == 2 { withUnsafeCurrentTask { $0?.cancel() } } })
+            let task = Task { try await interrupted.deleteFolder(named: "Empty") }
+            do { _ = try await task.value; XCTFail("Cancel final accepted removal") } catch is CancellationError {}
+            XCTAssertTrue(FileManager.default.fileExists(atPath: extra.appendingPathComponent("Empty").path))
+            let receipt = local.appendingPathComponent("Operations").appendingPathComponent(folder.libraryID.uuidString)
+                .appendingPathComponent(coordinator.writerID.uuidString).appendingPathComponent(entity.id.uuidString + ".json")
+            if FileManager.default.fileExists(atPath: receipt.path) { try FileManager.default.removeItem(at: receipt) }
+            var current = try await coordinator.read(entity)
+            XCTAssertEqual(current.state.lifecycle, .deleted)
+            if change == "maintenance" { try await coordinator.refresh() }
+            else {
+                current = try await coordinator.edit(.init(base: current, changes: [.restore]))
+                var changes: [SharedLibraryMutation] = []
+                if change == "missingProof" { changes.append(.assign(field: "materialization.files." + coordinator.writerID.uuidString.lowercased(), value: .unset)) }
+                changes.append(.delete)
+                _ = try await coordinator.edit(.init(base: current, changes: changes))
+            }
+            let result = try await coordinator.resumeFolderDeletion(id: entity.id)
+            XCTAssertEqual(result.result, change == "maintenance" ? .complete : .needsReplanning, change)
+            XCTAssertEqual(FileManager.default.fileExists(atPath: extra.appendingPathComponent("Empty").path), change != "maintenance", change)
+        }
+    }
+
+    func testLegacyBootstrapPreservesEmptyAndNonAudioFolders() async throws {
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent)
+        let root = parent.appendingPathComponent("library")
+        for path in ["Empty", "Empty/Nested", "Notes", ".private"] {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(path), withIntermediateDirectories: true)
+        }
+        try Data("ordinary notes".utf8).write(to: root.appendingPathComponent("Notes/readme.txt"))
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        _ = try await coordinator.enable()
+        let views = try await coordinator.snapshots(kinds: [.folder])
+        XCTAssertEqual(Set(views.compactMap { $0.state.value(for: "initialPath").flatMap { if case .text(let path) = $0 { return path }; return nil } }), ["Empty", "Empty/Nested", "Notes"])
+        _ = try await coordinator.projectOutputs()
+        let reopened = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: parent.appendingPathComponent("local"))
+        let restored = try await reopened.snapshots(kinds: [.folder])
+        XCTAssertEqual(Set(restored.map(\.state.id)), Set(views.map(\.state.id)))
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Notes/readme.txt")), Data("ordinary notes".utf8))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Empty/Nested").path))
+    }
+
     func testActualSharedFolderRenamePreservesDescendantIDsAndEveryFile() async throws {
         let (root, coordinator, store) = try await fixture()
         let a = try await coordinator.reference(to: "Folder/A.mp3")

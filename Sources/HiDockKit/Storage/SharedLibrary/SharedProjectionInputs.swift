@@ -22,7 +22,9 @@ struct SharedProjectionInputs: Codable, Sendable {
             if path != ".templates.json" { _ = try SharedLibraryIdentity.normalized(path) }
         }
     }
-    static func capture(root: URL) async throws -> [String: String] {
+    // Virtual proof key cannot be a generated audio/sidecar output path.
+    static let directoryProofKey = "directory-index"
+    static func capture(root: URL, includeDirectoryProof: Bool = true) async throws -> [String: String] {
         let paths = Set(["library.json", ".templates.json"] +
             LibraryFileDiscovery.files(in: root, suffix: ".transcript.json").map(\.relativePath) +
             LibraryFileDiscovery.files(in: root, suffix: ".summary.json").map(\.relativePath))
@@ -31,6 +33,10 @@ struct SharedProjectionInputs: Codable, Sendable {
             if let bytes = try await RecordingFileAccess().readDataIfPresent(at: root.appendingPathComponent(path)) {
                 result[path] = SharedLibraryOperation.fingerprint(bytes)
             }
+        }
+        if includeDirectoryProof {
+            let directories = try await LibraryFileDiscovery.directories(in: root)
+            result[directoryProofKey] = SharedLibraryOperation.fingerprint(try JSONEncoder().encode(directories))
         }
         return result
     }

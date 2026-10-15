@@ -160,7 +160,7 @@ public actor LegacyLibraryBootstrap {
     }
     let inputs = try JSONDecoder().decode(SharedProjectionInputs.self, from: await access.read(at: SharedProjectionInputs.file(in: root)))
     try inputs.validate(manifest: manifest)
-    guard try await SharedProjectionInputs.capture(root: root) == inputs.files else { throw LegacyBootstrapError.changedLegacyInput }
+    guard try await SharedProjectionInputs.capture(root: root, includeDirectoryProof: inputs.files[SharedProjectionInputs.directoryProofKey] != nil) == inputs.files else { throw LegacyBootstrapError.changedLegacyInput }
     let seeds = try await legacySeeds()
     let references = try seeds.map { seed -> SharedBootstrapReference in
       var state = SharedEntityState(id: seed.entity.id, kind: seed.entity.kind)
@@ -260,7 +260,7 @@ public actor LegacyLibraryBootstrap {
       }
     }
     var seeds: [Seed] = []
-    var folders: Set<String> = []
+    var folders = Set(try await LibraryFileDiscovery.directories(in: root))
     for file in files.sorted(by: { $0.relativePath < $1.relativePath }) {
       let path = try SharedLibraryIdentity.normalized(file.relativePath)
       try validate(root.appendingPathComponent(path))

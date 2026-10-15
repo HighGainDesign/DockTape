@@ -632,7 +632,7 @@ public actor SharedLibraryCoordinator {
     try Task.checkCancellation()
     if !repair && hasPublishedAudio {
       let permission = try await operationAuthority(entity: entity, paths: [])
-      if !permission.hasPendingWork { try await acknowledgeOperation(entity: entity, purpose: .replaceAudio) }
+      if !permission.hasPendingWork { try await acknowledgeOperation(entity: entity, purpose: .replaceAudio, expectedRevision: operation.outputRevision) }
     }
     try beforeReplay()
     let result = try await materializer.replay(operation)
@@ -780,11 +780,13 @@ public actor SharedLibraryCoordinator {
   private func preparedFileOperation(base: SharedLibraryViewSnapshot, steps: [SharedLibraryOperation.Step]) -> SharedPreparedFileOperation {
     .init(libraryID: base.libraryID, entity: .init(id: base.state.id, kind: base.state.kind), inputRevision: base.fingerprint, steps: steps)
   }
-  private func recoverFileIntent(view: SharedLibraryViewSnapshot, reader: SharedLibraryMaterializer) async throws -> Bool {
-    guard case .document(let document)? = view.state.value(for: fileIntentField) else { return true }
+  private func recoverFileIntent(view: SharedLibraryViewSnapshot, reader: SharedLibraryMaterializer, intentWriter: UUID? = nil) async throws -> Bool {
+    let owner = intentWriter ?? writerID
+    let field = SharedEntityState.fileIntentField(writer: owner)
+    guard case .document(let document)? = view.state.value(for: field) else { return true }
     guard let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json), intent.schema == 1 else { throw SharedLibraryOperationError.invalidReceipt }
     guard intent.libraryID == view.libraryID, intent.entity == SharedEntityIdentity(id: view.state.id, kind: view.state.kind) else { throw SharedLibraryOperationError.differentBinding }
-    guard view.state.conflicts.isEmpty, try view.state.fileIntentGuardRevision(writer: writerID) == intent.guardRevision else { return false }
+    guard view.state.conflicts.isEmpty, try view.state.fileIntentGuardRevision(writer: owner) == intent.guardRevision else { return false }
     guard intent.steps.allSatisfy({ step in
       switch step { case .move, .moveDirectory, .trash, .createDirectory, .removeEmptyDirectory: return true; default: return false }
     }) else { throw SharedLibraryOperationError.invalidOperation }
@@ -1034,18 +1036,45 @@ public actor SharedLibraryCoordinator {
     }
     let before = try await operationAuthority(entity: entity, paths: [path])
     if before.hasLiveDescendants { return .init(id: id, name: path, result: .needsReplanning, projectionError: nil) }
-    let accepted = base.state.lifecycle == .deleted ? base : try await commit(.init(base: base, changes: [.delete]), review: false, exact: true)
+    let steps: [SharedLibraryOperation.Step] = [.removeEmptyDirectory(path: path)]
     let materializer = try await makeMaterializer(entity: entity, paths: [path], receipts: operationReceipts(library: base.libraryID))
-    let progress = try await materializer.progress(entity: entity, libraryID: base.libraryID)
-    let operation: SharedLibraryOperation
-    if let progress, progress.operation.steps == [.removeEmptyDirectory(path: path)] { operation = progress.operation }
-    else {
-      operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
-        inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: [.removeEmptyDirectory(path: path)])
+    let accepted: SharedLibraryViewSnapshot
+    if base.state.lifecycle != .deleted {
+      accepted = try await commit(.init(base: base, changes: [.delete]), review: false, exact: true,
+        preparedFileOperation: preparedFileOperation(base: base, steps: steps))
+      let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
+        inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: steps)
       try await Task.detached { try await materializer.recordIntent(operation) }.value
+      try Task.checkCancellation()
+    } else {
+      accepted = base
+      // A peer may have accepted the deletion before this Mac received its
+      // directory removal. Use that original guarded intent, never fresh bytes
+      // or a fresh lifecycle permission inferred from the tombstone alone.
+      let prefix = "materialization.files."
+      var candidates: [UUID] = []
+      for field in base.state.fields.keys where field.hasPrefix(prefix) {
+        guard let owner = UUID(uuidString: String(field.dropFirst(prefix.count))),
+          case .document(let document)? = base.state.value(for: field),
+          let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json),
+          intent.schema == 1, intent.libraryID == base.libraryID, intent.entity == entity, intent.steps == steps,
+          try base.state.fileIntentGuardRevision(writer: owner) == intent.guardRevision else { continue }
+        candidates.append(owner)
+      }
+      if let owner = candidates.sorted(by: { $0.uuidString < $1.uuidString }).first {
+        guard try await recoverFileIntent(view: base, reader: materializer, intentWriter: owner) else {
+          return .init(id: id, name: path, result: .needsReplanning, projectionError: nil)
+        }
+      }
     }
+    guard let progress = try await materializer.progress(entity: entity, libraryID: accepted.libraryID),
+      progress.operation.steps == steps,
+      try SharedLibraryOperation.matchesRevision(progress.operation.outputRevision, state: accepted.state) else {
+      return .init(id: id, name: path, result: .needsReplanning, projectionError: nil)
+    }
+    let operation = progress.operation
     let permission = try await operationAuthority(entity: entity, paths: [path])
-    if !permission.hasPendingWork && !permission.hasLiveDescendants { try await acknowledgeOperation(entity: entity, purpose: .delete) }
+    if !permission.hasPendingWork && !permission.hasLiveDescendants { try await acknowledgeOperation(entity: entity, purpose: .delete, expectedRevision: operation.outputRevision) }
     let result = try await materializer.replay(operation)
     var projectionError: String?
     if result == .complete { do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription } }
@@ -1220,18 +1249,24 @@ public actor SharedLibraryCoordinator {
     try await Task.detached { try await materializer.recordIntent(operation) }.value
     try Task.checkCancellation()
     let permission = try await operationAuthority(entity: entity, paths: Array(operation.canonicalPaths))
-    if !permission.hasPendingWork { try await acknowledgeOperation(entity: entity, purpose: .delete) }
+    if !permission.hasPendingWork { try await acknowledgeOperation(entity: entity, purpose: .delete, expectedRevision: operation.outputRevision) }
     let result = try await materializer.replay(operation)
     var projectionError: String?
     if result == .complete { do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription } }
     return .init(filename: source, result: result, projectionError: projectionError, view: accepted)
   }
-  public func acknowledgeOperation(entity: SharedEntityIdentity, purpose: SharedDestructivePurpose) async throws {
+  public func acknowledgeOperation(entity: SharedEntityIdentity, purpose: SharedDestructivePurpose, expectedRevision: String? = nil) async throws {
     let manifest = try await bind(force: true)
     guard let directory = witnessDirectory, let gate else { throw SharedLibraryOperationError.invalidOperation }
     let witness = SharedOwnerWitness(directory: directory, libraryID: manifest.libraryID, writerID: writerID)
     _ = try await SharedOperationAcknowledgmentStore(root: root, libraryID: manifest.libraryID, writer: writerID, witness: witness, gate: gate)
-      .acknowledge(purpose: purpose, authority: { try await self.operationAuthority(entity: entity, paths: []) })
+      .acknowledge(purpose: purpose, authority: {
+        let permission = try await self.operationAuthority(entity: entity, paths: [])
+        if let expectedRevision, try !SharedLibraryOperation.matchesRevision(expectedRevision, state: permission.state) {
+          throw SharedLibraryOperationError.staleAuthority
+        }
+        return permission
+      })
     revokeAuthority()
   }
 
@@ -1286,8 +1321,8 @@ public actor SharedLibraryCoordinator {
       let permission = try await operationAuthority(entity: entity, paths: [])
       if !permission.hasPendingWork && view.state.conflicts.isEmpty {
         switch audio {
-        case .trash where view.state.lifecycle == .deleted: try await acknowledgeOperation(entity: entity, purpose: .delete)
-        case .replaceAudio(_, _, _, _, false) where view.state.lifecycle == .alive: try await acknowledgeOperation(entity: entity, purpose: .replaceAudio)
+        case .trash where view.state.lifecycle == .deleted: try await acknowledgeOperation(entity: entity, purpose: .delete, expectedRevision: progress.operation.outputRevision)
+        case .replaceAudio(_, _, _, _, false) where view.state.lifecycle == .alive: try await acknowledgeOperation(entity: entity, purpose: .replaceAudio, expectedRevision: progress.operation.outputRevision)
         default: break
         }
       }
