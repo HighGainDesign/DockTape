@@ -66,7 +66,12 @@ public actor RecordingStore {
 
     /// Create a new top-level folder. Throws if it already exists.
     public func createFolder(named name: String) async throws {
-        if let shared { try shared.requireRoot(baseDirectory); try await shared.coordinator.createSharedFolder(named: Self.sanitizeFilename(name)); return }
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            try await shared.coordinator.createSharedFolder(named: Self.sanitizeFilename(name))
+            try await loadLibraryMeta()
+            return
+        }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let sanitized = Self.sanitizeFilename(name)
         guard !sanitized.isEmpty else {
@@ -146,15 +151,27 @@ public actor RecordingStore {
     /// Move a recording (and its sidecars) to a folder, or to root if folder is nil.
     /// Returns the new relative filename.
     @discardableResult
-    public func moveRecording(filename: String, toFolder folderName: String?) async throws -> String {
+    public func moveRecording(filename: String, toFolder folderName: String?, reference: SharedRecordingReference? = nil,
+                              destinationReference: SharedFolderReference? = nil) async throws -> String {
+        _ = try SharedLibraryIdentity.normalized(filename)
+        if let folderName { _ = try SharedLibraryIdentity.normalized(folderName) }
         if let shared {
             try shared.requireRoot(baseDirectory)
+            guard let source = reference ?? recordingReferences[filename] else { throw SharedSidecarError.reloadRequired }
+            let target = destinationReference ?? folderName.flatMap { folderReferences[$0] }
+            guard folderName == nil || target != nil else { throw SharedSidecarError.reloadRequired }
             metadataTicket += 1
             await beforeSharedFileOperation()
-            let outcome = try await shared.coordinator.relocateRecording(filename: filename, toFolder: folderName, changeFolder: true)
+            let outcome = try await shared.coordinator.relocateRecording(filename: filename, toFolder: folderName, changeFolder: true,
+                reference: source, destinationReference: target)
             return try cacheSharedRelocation(outcome, from: filename)
         }
+        guard reference == nil, destinationReference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
+        let destinationIsContained = folderName.map { SharedLibraryMaterializer.contained(baseDirectory.appendingPathComponent($0), in: baseDirectory) } ?? true
+        guard SharedLibraryMaterializer.contained(baseDirectory.appendingPathComponent(filename), in: baseDirectory), destinationIsContained else {
+            throw SharedLibraryOperationError.unsafePath
+        }
         let fm = FileManager.default
         let basename = (filename as NSString).lastPathComponent
         let basenameNoExt = (basename as NSString).deletingPathExtension
@@ -507,17 +524,23 @@ public actor RecordingStore {
     /// Rename a recording file on disk, plus the associated transcript file.
     /// Returns the new filename.
     @discardableResult
-    public func renameRecording(filename: String, to newName: String) async throws -> String {
+    public func renameRecording(filename: String, to newName: String, reference: SharedRecordingReference? = nil) async throws -> String {
+        _ = try SharedLibraryIdentity.normalized(filename)
         if let shared {
             try shared.requireRoot(baseDirectory)
             let title = Self.sanitizeFilename(newName.hasSuffix(".mp3") ? String(newName.dropLast(4)) : newName)
             guard !title.isEmpty else { throw HiDockError.invalidFilename(newName) }
+            guard let source = reference ?? recordingReferences[filename] else { throw SharedSidecarError.reloadRequired }
             metadataTicket += 1
             await beforeSharedFileOperation()
-            let outcome = try await shared.coordinator.relocateRecording(filename: filename, title: title)
+            let outcome = try await shared.coordinator.relocateRecording(filename: filename, title: title, reference: source)
             return try cacheSharedRelocation(outcome, from: filename)
         }
+        guard reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
+        guard SharedLibraryMaterializer.contained(baseDirectory.appendingPathComponent(filename), in: baseDirectory) else {
+            throw SharedLibraryOperationError.unsafePath
+        }
         let oldBasename = (filename as NSString).deletingPathExtension
         let sanitized = Self.sanitizeFilename(newName.hasSuffix(".mp3") ? String(newName.dropLast(4)) : newName)
         guard !sanitized.isEmpty else {

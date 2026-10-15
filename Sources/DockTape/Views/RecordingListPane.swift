@@ -66,7 +66,7 @@ struct RecordingListPane: View {
                         )
                         .tag(rec.filename)
                         .contextMenu { recordingContextMenu(for: rec) }
-                        .draggable(rec.filename)
+                        .draggable(state.library.recordingSelection(rec))
                     }
                 }
             }
@@ -269,10 +269,11 @@ struct RecordingListPane: View {
 
         Divider()
 
+        let recordingSelection = state.library.recordingSelection(rec)
         if rec.folder != nil {
             Button {
                 Task {
-                    await state.moveRecording(rec, toFolder: nil)
+                    await state.moveRecording(selection: recordingSelection, toFolder: nil)
                 }
             } label: {
                 Label("Move to Library Root", systemImage: "tray.and.arrow.up")
@@ -281,13 +282,13 @@ struct RecordingListPane: View {
 
         // Move to folder submenu
         if !state.library.folders.isEmpty {
-            let availableFolders = state.library.folders.filter { $0 != rec.folder }
+            let availableFolders = state.library.folderSelections.filter { $0.name != rec.folder }
             if !availableFolders.isEmpty {
                 Menu("Move to Folder") {
-                    ForEach(availableFolders, id: \.self) { folder in
-                        Button(folder) {
+                    ForEach(availableFolders) { folder in
+                        Button(folder.name) {
                             Task {
-                                await state.moveRecording(rec, toFolder: folder)
+                                await state.moveRecording(selection: recordingSelection, toFolder: folder)
                             }
                         }
                     }

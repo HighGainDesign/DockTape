@@ -632,21 +632,39 @@ final class AppState {
     }
 
     func renameRecording(_ rec: RecordingMetadata, to name: String) async {
-        let originalSelection = library.selectedRecordings
+        await renameRecording(selection: library.recordingSelection(rec), to: name)
+    }
+    func renameRecording(selection: RecordingSelection, to name: String) async {
+        guard selection.libraryBinding == library.binding else { errorMessage = "The library changed. Select the recording again."; return }
+        guard requireWritableLibrary() else { return }
+        let captured = library, coordinator = sharedLibrary.coordinator
+        let originalSelection = captured.selectedRecordings
         do {
-            let newFilename = try await library.renameRecording(rec, to: name)
-            try await didRelocateRecording(from: rec.filename, to: newFilename, originalSelection: originalSelection)
+            let newFilename = try await captured.renameRecording(selection: selection, to: name)
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            try await didRelocateRecording(from: selection.filename, to: newFilename, originalSelection: originalSelection, library: captured)
         } catch {
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             errorMessage = "Rename failed: \(error.localizedDescription)"
         }
     }
 
     func moveRecording(_ rec: RecordingMetadata, toFolder folder: String?) async {
-        let originalSelection = library.selectedRecordings
+        await moveRecording(selection: library.recordingSelection(rec), toFolder: folder.map { library.folderSelection(named: $0) })
+    }
+    func moveRecording(selection: RecordingSelection, toFolder folder: FolderSelection?) async {
+        guard selection.libraryBinding == library.binding, folder == nil || folder?.libraryBinding == library.binding else {
+            errorMessage = "The library changed. Select the recording and folder again."; return
+        }
+        guard requireWritableLibrary() else { return }
+        let captured = library, coordinator = sharedLibrary.coordinator
+        let originalSelection = captured.selectedRecordings
         do {
-            let newFilename = try await library.moveRecording(filename: rec.filename, toFolder: folder)
-            try await didRelocateRecording(from: rec.filename, to: newFilename, originalSelection: originalSelection)
+            let newFilename = try await captured.moveRecording(selection: selection, toFolder: folder)
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            try await didRelocateRecording(from: selection.filename, to: newFilename, originalSelection: originalSelection, library: captured)
         } catch {
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             errorMessage = "Move failed: \(error.localizedDescription)"
         }
     }
@@ -704,7 +722,7 @@ final class AppState {
             for rec in affected {
                 let newFilename = actualName + rec.filename.dropFirst(oldName.count)
                 try await didRelocateRecording(from: rec.filename, to: newFilename,
-                                                originalSelection: captured.selectedRecordings)
+                                                originalSelection: captured.selectedRecordings, library: captured)
             }
         } catch {
             if await showPendingFolder(id: id, purpose: .rename, requestedName: RecordingStore.sanitizeFilename(newName), library: captured, coordinator: coordinator) { return }
@@ -714,11 +732,14 @@ final class AppState {
     }
 
     private func didRelocateRecording(from oldFilename: String, to newFilename: String,
-                                      originalSelection: Set<String>) async throws {
+                                      originalSelection: Set<String>, library captured: LibraryState) async throws {
+        guard library === captured else { return }
+        let coordinator = sharedLibrary.coordinator, summaries = summarization
+        if coordinator == nil { try await summaries.summaryStore.rename(from: oldFilename, to: newFilename) }
+        else { try await summaries.summaryStore.loadAll() }
+        guard library === captured, sharedLibrary.coordinator === coordinator, summarization === summaries else { return }
         if playback.playingFile == oldFilename { playback.playingFile = newFilename }
         if transcription.transcribingFile == oldFilename { transcription.transcribingFile = newFilename }
-        if sharedLibrary.coordinator == nil { try await summarization.summaryStore.rename(from: oldFilename, to: newFilename) }
-        else { try await summarization.summaryStore.loadAll() }
         if let status = transcription.statuses.removeValue(forKey: oldFilename) {
             transcription.statuses[newFilename] = status
         }

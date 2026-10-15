@@ -13,7 +13,7 @@ struct DetailPane: View {
 
     private var transcript: Transcript? { transcriptState.content }
     private var transcriptLoadedFor: String? { transcriptState.filename }
-    @State private var renamingRecording: RecordingMetadata?
+    @State private var renamingRecording: RecordingSelection?
     @State private var renameText: String = ""
     @State private var confirmRetranscribe: RecordingMetadata?
     @State private var customPromptText: String = ""
@@ -163,7 +163,7 @@ struct DetailPane: View {
             if trigger, renamingRecording == nil {
                 let filename = (rec.filename as NSString).lastPathComponent
                 renameText = (filename as NSString).deletingPathExtension
-                renamingRecording = rec
+                renamingRecording = state.library.recordingSelection(rec)
                 state.triggerRename = false
             }
         }
@@ -182,8 +182,9 @@ struct DetailPane: View {
             TextField("Name", text: $renameText)
             Button("Cancel", role: .cancel) { renamingRecording = nil }
             Button("Save") {
-                if let rec = renamingRecording {
-                    Task { await state.renameRecording(rec, to: renameText) }
+                if let selection = renamingRecording {
+                    let name = renameText
+                    Task { await state.renameRecording(selection: selection, to: name) }
                 }
                 renamingRecording = nil
             }

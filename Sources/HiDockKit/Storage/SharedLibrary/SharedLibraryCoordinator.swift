@@ -14,7 +14,7 @@ public struct SharedLibraryViewSnapshot: Sendable {
   public var fingerprint: String { repository.fingerprint }
   public var confirmedState: SharedEntityState? { repository.projection?.state }
 }
-public struct SharedRecordingReference: Hashable, Sendable {
+public struct SharedRecordingReference: Hashable, Codable, Sendable {
   public let libraryID: UUID
   public let entityID: UUID
 }
@@ -1632,17 +1632,22 @@ public actor SharedLibraryCoordinator {
     guard try await materializer.replay(operation) == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
   }
   public func relocateRecording(filename: String, title: String? = nil, toFolder: String? = nil,
-                                changeFolder: Bool = false,
+                                changeFolder: Bool = false, reference: SharedRecordingReference? = nil,
+                                destinationReference: SharedFolderReference? = nil,
                                 beforeCommit: @escaping @Sendable () async throws -> Void = {},
                                 afterMutation: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedRecordingFileOutcome {
     let source = try SharedLibraryIdentity.normalized(filename)
     let initial = try await recording(at: source)
+    if let reference, reference.libraryID != initial.libraryID || reference.entityID != initial.state.id { throw SharedLibraryCoordinatorError.differentBinding }
+    if destinationReference != nil && (!changeFolder || toFolder == nil) { throw SharedLibraryCoordinatorError.differentBinding }
+    var target: SharedFolderReference?
+    if changeFolder, let toFolder { target = try await relocationFolder(named: toFolder, reference: destinationReference).reference }
     return try await relocateRecordingAttempt(filename: source, title: title, toFolder: toFolder, changeFolder: changeFolder,
-      beforeCommit: beforeCommit, afterMutation: afterMutation, initial: initial, retries: 2)
+      beforeCommit: beforeCommit, afterMutation: afterMutation, initial: initial, destinationReference: target, retries: 2)
   }
   private func relocateRecordingAttempt(filename: String, title: String?, toFolder: String?, changeFolder: Bool,
       beforeCommit: @escaping @Sendable () async throws -> Void, afterMutation: @escaping @Sendable (Int) throws -> Void,
-      initial: SharedLibraryViewSnapshot, retries: Int) async throws -> SharedRecordingFileOutcome {
+      initial: SharedLibraryViewSnapshot, destinationReference: SharedFolderReference?, retries: Int) async throws -> SharedRecordingFileOutcome {
     let source = filename
     let selected = try await read(.init(id: initial.state.id, kind: .recording))
     if title != nil, selected.state.fields["title"] != initial.state.fields["title"] { throw SharedLibraryCoordinatorError.staleReview }
@@ -1653,6 +1658,14 @@ public actor SharedLibraryCoordinator {
     if changeFolder, base.state.fields["folder"] != initial.state.fields["folder"] { throw SharedLibraryCoordinatorError.staleReview }
     let entity = SharedEntityIdentity(id: base.state.id, kind: .recording)
     guard base.state.lifecycle == .alive, base.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
+    var ancestorBindings: [SharedMaterializationBinding] = []
+    let sourceFolder = (source as NSString).deletingLastPathComponent
+    if !sourceFolder.isEmpty && sourceFolder != "." {
+      guard case .text(let text)? = base.state.value(for: "folder"), let id = UUID(uuidString: text) else { throw SharedLibraryPathError.unknownPath }
+      let placement = try await relocationFolder(named: sourceFolder,
+        reference: .init(libraryID: base.libraryID, entityID: id), acceptingChildren: false)
+      for view in placement.chain { ancestorBindings += try repository.readBindings(view.repository, validateSourceSet: true) }
+    }
     let receipts = try operationReceipts(library: base.libraryID)
     let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
     try await discardCancelledDeletion(view: base, reader: reader)
@@ -1663,20 +1676,21 @@ public actor SharedLibraryCoordinator {
     guard !basename.contains("/") else { throw SharedLibraryIdentityError.invalidRelativePath }
     var folder = (source as NSString).deletingLastPathComponent
     var changes: [SharedLibraryMutation] = []
+    var destinationBindings = ancestorBindings
     if let title { changes.append(.assign(field: "title", value: .text(title))) }
     if changeFolder {
       folder = toFolder ?? ""
       if let toFolder {
-        let views = try await snapshots(kinds: [.folder])
-        let index = try await pathIndex(for: views)
-        guard let id = index.resolvedPaths.first(where: { $0.value == toFolder })?.key else { throw SharedLibraryPathError.unknownPath }
-        changes.append(.assign(field: "folder", value: .text(id.uuidString)))
+        let destination = try await relocationFolder(named: toFolder, reference: destinationReference)
+        for view in destination.chain { destinationBindings += try repository.readBindings(view.repository, validateSourceSet: true) }
+        changes.append(.assign(field: "folder", value: .text(destination.reference.entityID.uuidString)))
       } else { changes.append(.assign(field: "folder", value: .unset)) }
     }
     let destination = folder.isEmpty ? basename + ".mp3" : folder + "/" + basename + ".mp3"
     if source == destination { return .init(filename: source, result: .complete, projectionError: nil, view: base) }
     let all = try await snapshots(kinds: [.recording, .folder])
-    let index = try await pathIndex(for: all)
+    let sensitive = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
+    let index = try await pathIndex(for: all, caseSensitive: sensitive)
     guard index.owners(of: destination).isEmpty else { throw SharedLibraryOperationError.pathConflict(destination) }
     let sourceStem = (source as NSString).deletingPathExtension
     let destinationStem = (destination as NSString).deletingPathExtension
@@ -1686,7 +1700,7 @@ public actor SharedLibraryCoordinator {
     var steps: [SharedLibraryOperation.Step] = []
     var sourceBindings = published.proofs.map { file, hash in
       SharedMaterializationBinding(file: file) { SharedLibraryOperation.fingerprint($0) == hash }
-    }
+    } + destinationBindings
     for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
       let from = sourceStem + suffix, to = destinationStem + suffix
       let target = root.appendingPathComponent(to)
@@ -1704,6 +1718,11 @@ public actor SharedLibraryCoordinator {
         steps.append(.move(source: from, destination: to, fingerprint: hash))
       } else if suffix == ".mp3" { throw CocoaError(.fileReadNoSuchFile) }
     }
+    // Ancestor source-set proofs share the format item. Coordinate it once,
+    // while retaining every entity/source-set validator on that item.
+    sourceBindings = Dictionary(grouping: sourceBindings, by: \.file).map { file, proofs in
+      SharedMaterializationBinding(file: file) { bytes in try proofs.allSatisfy { try $0.validate(bytes) } }
+    }.sorted { $0.file.path < $1.file.path }
     try await beforeCommit()
     // Accept the logical intent before touching any source. Receipt replay,
     // ownership and expected bytes make each related physical phase recoverable.
@@ -1719,7 +1738,7 @@ public actor SharedLibraryCoordinator {
       let changed = error as? SharedLibraryRepositoryError == .staleRevision || error as? SharedLibraryCoordinatorError == .staleReview || error as? SharedLibraryOperationError == .staleAuthority
       guard retries > 0, changed, !Task.isCancelled else { throw error }
       return try await relocateRecordingAttempt(filename: source, title: title, toFolder: toFolder, changeFolder: changeFolder,
-        beforeCommit: beforeCommit, afterMutation: afterMutation, initial: initial, retries: retries - 1)
+        beforeCommit: beforeCommit, afterMutation: afterMutation, initial: initial, destinationReference: destinationReference, retries: retries - 1)
     }
     let operation = try SharedLibraryOperation(libraryID: accepted.libraryID, entity: entity,
       inputRevision: base.fingerprint, outputRevision: SharedLibraryOperation.revision(for: accepted.state), steps: steps)
@@ -1731,6 +1750,30 @@ public actor SharedLibraryCoordinator {
       do { _ = try await projectOutputs() } catch { projectionError = error.localizedDescription }
     }
     return .init(filename: result == .complete ? destination : source, result: result, projectionError: projectionError, view: accepted)
+  }
+
+  private func relocationFolder(named name: String, reference: SharedFolderReference?, acceptingChildren: Bool = true) async throws
+    -> (reference: SharedFolderReference, chain: [SharedLibraryViewSnapshot]) {
+    _ = try SharedLibraryIdentity.normalized(name)
+    let views = try await snapshots(kinds: [.folder])
+    let sensitive = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
+    let index = try await pathIndex(for: views, caseSensitive: sensitive)
+    let matches = views.filter { index.resolvedPaths[$0.state.id] == name && $0.state.lifecycle == .alive }
+    guard matches.count == 1, let destination = matches.first else { throw SharedLibraryPathError.unknownPath }
+    if let reference, reference.libraryID != destination.libraryID || reference.entityID != destination.state.id { throw SharedLibraryCoordinatorError.differentBinding }
+    guard index.owners(of: name) == [destination.state.id] else { throw SharedLibraryPathError.ambiguousPath }
+    var chain: [SharedLibraryViewSnapshot] = [], current = destination, visited: Set<UUID> = []
+    while true {
+      guard visited.insert(current.state.id).inserted, current.state.lifecycle == .alive, current.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
+      if acceptingChildren, current.state.value(for: "deletionRequest") != nil { throw SharedLibraryOperationError.unfinishedOperation }
+      if case .text(let physical)? = current.state.value(for: "physicalPath"), physical != index.resolvedPaths[current.state.id] { throw SharedLibraryOperationError.unfinishedOperation }
+      chain.append(current)
+      if current.state.fields["parent"]?.resolvedValue == .unset { break }
+      guard case .text(let text)? = current.state.value(for: "parent"), let id = UUID(uuidString: text),
+            let parent = views.first(where: { $0.state.id == id }) else { throw SharedLibraryPathError.unknownPath }
+      current = parent
+    }
+    return (.init(libraryID: destination.libraryID, entityID: destination.state.id), chain)
   }
 
   private func folderReviewBindings(_ base: SharedLibraryViewSnapshot?, excluding entity: SharedEntityIdentity) throws -> [SharedMaterializationBinding] {

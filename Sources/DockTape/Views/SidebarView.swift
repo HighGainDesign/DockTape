@@ -33,13 +33,9 @@ struct SidebarView: View {
                         Image(systemName: "folder")
                     }
                     .tag(SidebarSelection.allRecordings)
-                    .dropDestination(for: String.self) { filenames, _ in
+                    .dropDestination(for: RecordingSelection.self) { selections, _ in
                         Task {
-                            for filename in filenames {
-                                if let rec = state.library.recordings.first(where: { $0.filename == filename }) {
-                                    await state.moveRecording(rec, toFolder: nil)
-                                }
-                            }
+                            for selection in selections { await state.moveRecording(selection: selection, toFolder: nil) }
                         }
                         return true
                     }
@@ -82,13 +78,9 @@ struct SidebarView: View {
                                 Task { await state.deleteFolder(selection: selection) }
                             }
                         }
-                        .dropDestination(for: String.self) { filenames, _ in
+                        .dropDestination(for: RecordingSelection.self) { recordings, _ in
                             Task {
-                                for filename in filenames {
-                                    if let rec = state.library.recordings.first(where: { $0.filename == filename }) {
-                                        await state.moveRecording(rec, toFolder: folder)
-                                    }
-                                }
+                                for recording in recordings { await state.moveRecording(selection: recording, toFolder: selection) }
                             }
                             return true
                         }

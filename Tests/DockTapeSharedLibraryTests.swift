@@ -28,7 +28,16 @@ struct DockTapeSharedLibraryTests {
     }
     @MainActor static func main() async {
         do {
-            if CommandLine.arguments.contains("--folder-selection-only") {
+            if CommandLine.arguments.contains("--recording-relocation-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeRecordingRelocation-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await recordingRelocationChecks(parent: parent)
+                try await capturedRecordingRelocationChecks(parent: parent.appendingPathComponent("captured"))
+                try await lateRecordingRelocationChecks(parent: parent.appendingPathComponent("late"))
+                try await malformedRecordingSelectionChecks(parent: parent.appendingPathComponent("malformed"))
+            } else if CommandLine.arguments.contains("--folder-selection-only") {
                 _ = NSApplication.shared
                 UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
                 let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeFolderSelection-" + UUID().uuidString)
@@ -244,6 +253,10 @@ struct DockTapeSharedLibraryTests {
         try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.mp3").path), "Storage switching must not move recordings")
         await reopened.sharedLibrary.close()
         try await mergeSelectionChecks(parent: parent, identity: identity)
+        try await recordingRelocationChecks(parent: parent.appendingPathComponent("recording-relocation"))
+        try await capturedRecordingRelocationChecks(parent: parent.appendingPathComponent("recording-relocation-captured"))
+        try await lateRecordingRelocationChecks(parent: parent.appendingPathComponent("recording-relocation-late"))
+        try await malformedRecordingSelectionChecks(parent: parent.appendingPathComponent("recording-relocation-malformed"))
         try await folderSelectionChecks(parent: parent.appendingPathComponent("folder-selection"))
         try await capturedFolderSelectionChecks(parent: parent.appendingPathComponent("folder-captured"))
         try await folderRenameChecks(parent: parent, identity: identity)
@@ -666,6 +679,157 @@ struct DockTapeSharedLibraryTests {
         try expect(!FileManager.default.fileExists(atPath: other.appendingPathComponent("Wrong library.mp3").path), "A changed library must invalidate the open merge dialog")
         try expect(state.errorMessage?.contains("library changed") == true, "Explain the changed merge binding")
         await state.sharedLibrary.close()
+    }
+
+    @MainActor static func recordingRelocationChecks(parent: URL) async throws {
+        for scenario in ["source-move", "source-rename", "destination-move"] {
+            let directory = parent.appendingPathComponent(scenario), root = directory.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+            let original = Data("original relocation fixture".utf8), replacement = Data("replacement relocation fixture".utf8)
+            try original.write(to: root.appendingPathComponent("Meeting.mp3"))
+            let identity = directory.appendingPathComponent("identity.json"), local = directory.appendingPathComponent("local")
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "relocation fixture").load()
+            }, sharedWitnessDirectory: local, sharedTrash: { try FileManager.default.removeItem(at: $0) })
+            try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable actual relocation fixture")
+            guard let a = state.sharedLibrary.coordinator, let recording = state.library.recordings.first else { throw Failure(description: "Missing relocation fixture source") }
+            await a.stopMonitoring()
+            let other = SharedLibraryCoordinator(root: root, writerID: a.writerID, witnessDirectory: local, trash: { try FileManager.default.removeItem(at: $0) })
+            if scenario.hasPrefix("source") {
+                let moved = try await other.relocateRecording(filename: "Meeting.mp3", title: "Moved Original")
+                try expect(moved.result == .complete, "Original relocation completes before stale action")
+                try replacement.write(to: root.appendingPathComponent("Meeting.mp3"))
+                let entity = SharedEntityIdentity(id: UUID(), kind: .recording)
+                _ = try await other.edit(.init(base: try await other.read(entity), changes: [
+                    .assign(field: "initialPath", value: .text("Meeting.mp3")), .assign(field: "title", value: .text("Meeting")), .assign(field: "folder", value: .unset)]))
+                _ = try await other.projectOutputs()
+                if scenario == "source-move" { await state.moveRecording(recording, toFolder: "Folder") }
+                else { await state.renameRecording(recording, to: "Unexpected") }
+                try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path), "Stale source action must preserve the replacement at its name")
+                try expect(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")) == replacement, "Stale source action cannot move/rename replacement bytes")
+                try expect(try Data(contentsOf: root.appendingPathComponent("Moved Original.mp3")) == original, "Original moved identity remains intact")
+            } else {
+                let moved = try await other.renameFolder(from: "Folder", to: "Moved Folder")
+                try expect(moved.result == .complete, "Original destination folder moved")
+                try await other.createSharedFolder(named: "Folder")
+                await state.moveRecording(recording, toFolder: "Folder")
+                try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path), "Stale destination must not move recording into the replacement folder")
+                try expect(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")) == original, "Destination refusal preserves source bytes")
+            }
+            try expect(state.errorMessage != nil, "A stale relocation selection needs reload feedback")
+            await state.sharedLibrary.close()
+        }
+        print("Actual recording relocation selection passed: stale source Move/Rename and stale destination refuse path reuse.")
+    }
+
+    @MainActor static func capturedRecordingRelocationChecks(parent: URL) async throws {
+        for kind in ["same-library-copy", "legacy"] {
+            let directory = parent.appendingPathComponent(kind), root = directory.appendingPathComponent("library"), next = directory.appendingPathComponent("next")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+            let original = Data("captured original".utf8)
+            try original.write(to: root.appendingPathComponent("Meeting.mp3"))
+            let identity = directory.appendingPathComponent("identity.json"), local = directory.appendingPathComponent("local")
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "captured relocation fixture").load()
+            }, sharedWitnessDirectory: local, sharedTrash: { try FileManager.default.removeItem(at: $0) })
+            try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable captured relocation fixture")
+            guard let recording = state.library.recordings.first else { throw Failure(description: "Missing captured source") }
+            await state.sharedLibrary.coordinator?.stopMonitoring()
+            let source = state.library.recordingSelection(recording), folder = state.library.folderSelection(named: "Folder")
+            let decoded = try JSONDecoder().decode(RecordingSelection.self, from: JSONEncoder().encode(source))
+            try expect(decoded == source, "Drag serialization preserves source identity and library instance")
+            if kind == "same-library-copy" { try FileManager.default.copyItem(at: root, to: next) }
+            else {
+                try FileManager.default.createDirectory(at: next.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+                try Data("unrelated legacy recording".utf8).write(to: next.appendingPathComponent("Meeting.mp3"))
+            }
+            try expect(await state.switchStorageLocation(to: .custom, customURL: next), "Switch actual recording action library")
+            await state.moveRecording(selection: source, toFolder: folder)
+            try expect(state.errorMessage?.contains("library changed") == true, "Queued move refuses a changed library instance")
+            state.errorMessage = nil
+            await state.renameRecording(selection: source, to: "Unexpected")
+            try expect(state.errorMessage?.contains("library changed") == true, "Open rename editor refuses a changed library instance")
+            try expect(FileManager.default.fileExists(atPath: next.appendingPathComponent("Meeting.mp3").path), "Unrelated root recording remains")
+            try expect(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")) == original, "Original binding stays intact")
+            await state.sharedLibrary.close()
+        }
+        print("Actual recording relocation binding passed: captured menu/editor/drag values refuse copied-library and shared-to-legacy root changes.")
+    }
+
+    @MainActor static func lateRecordingRelocationChecks(parent: URL) async throws {
+        for action in ["move", "rename"] {
+            for ending in ["complete", "reject"] {
+                let directory = parent.appendingPathComponent(action + ending), root = directory.appendingPathComponent("library"), next = directory.appendingPathComponent("next")
+                try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+                try Data("in-flight original".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+                try FileManager.default.createDirectory(at: next, withIntermediateDirectories: true)
+                let unrelated = Data("unrelated next-library file".utf8)
+                try unrelated.write(to: next.appendingPathComponent("Meeting.mp3"))
+                let identity = directory.appendingPathComponent("identity.json"), local = directory.appendingPathComponent("local")
+                let state = AppState(baseDirectory: root, sharedIdentity: {
+                    try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "late relocation fixture").load()
+                }, sharedWitnessDirectory: local, sharedTrash: { try FileManager.default.removeItem(at: $0) })
+                try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable late relocation fixture")
+                guard let a = state.sharedLibrary.coordinator else { throw Failure(description: "Missing late relocation coordinator") }
+                await a.stopMonitoring()
+                let pause = Gate()
+                let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: a), beforeSharedFileOperation: { await pause.wait() })
+                let captured = LibraryState(store: store, transcriptStore: state.library.transcriptStore, sharedCoordinator: a)
+                try await captured.setup(); state.library = captured
+                guard let recording = captured.recordings.first else { throw Failure(description: "Missing late source") }
+                let source = captured.recordingSelection(recording), destination = captured.folderSelection(named: "Folder")
+                let work = Task { @MainActor in
+                    if action == "move" { await state.moveRecording(selection: source, toFolder: destination) }
+                    else { await state.renameRecording(selection: source, to: "Renamed") }
+                }
+                let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+                while !(await pause.waiting) {
+                    if ContinuousClock.now >= deadline { await pause.release(); await work.value; throw Failure(description: "Relocation did not reach awaited store hook") }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                let switched = await state.switchStorageLocation(to: .custom, customURL: next)
+                if !switched { await pause.release(); await work.value; throw Failure(description: "Late relocation root switch failed") }
+                state.errorMessage = "Current library message"
+                state.library.selectedRecording = "Meeting.mp3"; state.library.selectedRecordings = ["Meeting.mp3"]
+                state.playback.playingFile = "Meeting.mp3"
+                if ending == "reject" {
+                    do { _ = try await a.relocateRecording(filename: "Meeting.mp3", title: "Changed Before Resume") }
+                    catch { await pause.release(); await work.value; throw error }
+                }
+                await pause.release(); await work.value
+                try expect(state.errorMessage == "Current library message", "Old relocation completion/error cannot overwrite new-library feedback")
+                try expect(state.library.selectedRecording == "Meeting.mp3" && state.library.selectedRecordings == ["Meeting.mp3"], "Old relocation cannot retarget new-library selection")
+                try expect(state.playback.playingFile == "Meeting.mp3", "Old relocation cannot retarget the new library player")
+                try expect(try Data(contentsOf: next.appendingPathComponent("Meeting.mp3")) == unrelated, "New library file remains unchanged")
+                let final = ending == "reject" ? "Changed Before Resume.mp3" : (action == "move" ? "Folder/Meeting.mp3" : "Renamed.mp3")
+                try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent(final).path), "Started work stays within its captured original library")
+                await state.sharedLibrary.close()
+            }
+        }
+        print("Actual in-flight relocation binding passed: old Move/Rename completion and rejection preserve the new library's feedback, selection and player.")
+    }
+
+    @MainActor static func malformedRecordingSelectionChecks(parent: URL) async throws {
+        for attack in ["traversal", "uncatalogued"] {
+            let directory = parent.appendingPathComponent(attack), root = directory.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+            try Data("displayed legacy recording".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+            let state = AppState(baseDirectory: root)
+            try await state.setup()
+            guard let recording = state.library.recordings.first else { throw Failure(description: "Missing displayed legacy recording") }
+            let legitimate = state.library.recordingSelection(recording)
+            let source = attack == "traversal" ? directory.appendingPathComponent("Outside.mp3") : root.appendingPathComponent("Late.mp3")
+            let original = Data("not selected by the drag".utf8)
+            try original.write(to: source)
+            var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(legitimate)) as! [String: Any]
+            object["filename"] = attack == "traversal" ? "../Outside.mp3" : "Late.mp3"
+            let decoded = try JSONDecoder().decode(RecordingSelection.self, from: JSONSerialization.data(withJSONObject: object))
+            await state.moveRecording(selection: decoded, toFolder: state.library.folderSelection(named: "Folder"))
+            try expect(FileManager.default.fileExists(atPath: source.path), "Decoded drag cannot move an outside or undisplayed legacy file")
+            try expect(try Data(contentsOf: source) == original && state.errorMessage != nil, "Malformed selection preserves original bytes and reports refusal")
+            await state.sharedLibrary.close()
+        }
+        print("Actual malformed recording selection passed: traversal and uncatalogued decoded legacy drags refuse.")
     }
 
     @MainActor static func folderSelectionChecks(parent: URL) async throws {

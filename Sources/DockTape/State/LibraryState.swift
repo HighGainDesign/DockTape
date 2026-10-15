@@ -21,6 +21,17 @@ final class LibraryState {
             guard selection.reference != nil else { throw SharedSidecarError.reloadRequired }
         } else if selection.reference != nil { throw SharedLibraryCoordinatorError.differentBinding }
     }
+    func recordingSelection(_ recording: RecordingMetadata) -> RecordingSelection {
+        .init(filename: recording.filename, reference: recording.reference, libraryBinding: binding)
+    }
+    private func validate(_ selection: RecordingSelection) throws {
+        guard selection.libraryBinding == binding else { throw SharedLibraryCoordinatorError.differentBinding }
+        _ = try SharedLibraryIdentity.normalized(selection.filename)
+        guard recordings.contains(where: { $0.filename == selection.filename && $0.reference == selection.reference }) else { throw SharedSidecarError.reloadRequired }
+        if sharedCoordinator != nil {
+            guard selection.reference != nil else { throw SharedSidecarError.reloadRequired }
+        } else if selection.reference != nil { throw SharedLibraryCoordinatorError.differentBinding }
+    }
     var selectedFolder: String? = nil  // nil = "All Recordings"
     var selectedRecording: String? = nil
     var selectedRecordings: Set<String> = []
@@ -172,7 +183,15 @@ final class LibraryState {
     }
 
     func moveRecording(filename: String, toFolder folder: String?) async throws -> String {
-        let newFilename = try await store.moveRecording(filename: filename, toFolder: folder)
+        guard let recording = recordings.first(where: { $0.filename == filename }) else { throw SharedSidecarError.reloadRequired }
+        return try await moveRecording(selection: recordingSelection(recording), toFolder: folder.map { folderSelection(named: $0) })
+    }
+    func moveRecording(selection: RecordingSelection, toFolder folder: FolderSelection?) async throws -> String {
+        try validate(selection)
+        if let folder { try validate(folder) }
+        let filename = selection.filename
+        let newFilename = try await store.moveRecording(filename: filename, toFolder: folder?.name,
+            reference: selection.reference, destinationReference: folder?.reference)
         if sharedCoordinator == nil { try await transcriptStore.rename(from: filename, to: newFilename) }
         else { try await transcriptStore.loadAll() }
         await refresh()
@@ -199,8 +218,12 @@ final class LibraryState {
     }
 
     func renameRecording(_ rec: RecordingMetadata, to name: String) async throws -> String {
-        let newFilename = try await store.renameRecording(filename: rec.filename, to: name)
-        if sharedCoordinator == nil { try await transcriptStore.rename(from: rec.filename, to: newFilename) }
+        try await renameRecording(selection: recordingSelection(rec), to: name)
+    }
+    func renameRecording(selection: RecordingSelection, to name: String) async throws -> String {
+        try validate(selection)
+        let newFilename = try await store.renameRecording(filename: selection.filename, to: name, reference: selection.reference)
+        if sharedCoordinator == nil { try await transcriptStore.rename(from: selection.filename, to: newFilename) }
         else { try await transcriptStore.loadAll() }
         await refresh()
         return newFilename

@@ -32,6 +32,192 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         try await store.setup()
         return (root, coordinator, store)
     }
+    func testStoreRelocationKeepsSourceAndDestinationReferencesAcrossAwait() async throws {
+        for scenario in ["source-move", "source-rename", "destination"] {
+            let (root, a, _) = try await fixture()
+            try await a.createSharedFolder(named: "Folder")
+            let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: a), beforeSharedFileOperation: {
+                if scenario == "destination" {
+                    _ = try? await a.renameFolder(from: "Folder", to: "Moved Folder")
+                    try? await a.createSharedFolder(named: "Folder")
+                } else {
+                    _ = try? await a.relocateRecording(filename: "Meeting.mp3", title: "Moved Original")
+                    try? Data("replacement audio".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+                    let entity = SharedEntityIdentity(id: UUID(), kind: .recording)
+                    if let base = try? await a.read(entity) {
+                        _ = try? await a.edit(.init(base: base, changes: [.assign(field: "initialPath", value: .text("Meeting.mp3")),
+                            .assign(field: "title", value: .text("Meeting")), .assign(field: "folder", value: .unset)]))
+                    }
+                    _ = try? await a.projectOutputs()
+                }
+            })
+            try await store.setup()
+            let recording = try await a.reference(to: "Meeting.mp3")
+            let folders = await store.folderCatalog(), destination = try XCTUnwrap(folders.references["Folder"])
+            do {
+                if scenario == "source-rename" { _ = try await store.renameRecording(filename: "Meeting.mp3", to: "Unexpected", reference: recording) }
+                else { _ = try await store.moveRecording(filename: "Meeting.mp3", toFolder: "Folder", reference: recording, destinationReference: destination) }
+                XCTFail("Awaited operation cannot renew source/destination authority")
+            } catch SharedLibraryCoordinatorError.differentBinding {}
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path))
+            if scenario != "destination" { XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Moved Original.mp3")), Data("single synthetic original".utf8)) }
+        }
+    }
+
+    func testLegacyRelocationRefusesTraversalAndSymlinkEscapes() async throws {
+        for action in ["move", "rename"] {
+            for attack in ["traversal", "symlink", "destination"] where action == "move" || attack != "destination" {
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                roots.append(parent)
+                let root = parent.appendingPathComponent("library"), outside = parent.appendingPathComponent("outside")
+                try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+                let original = Data("outside relocation fixture".utf8)
+                let source: URL, filename: String, destination: String
+                if attack == "traversal" { source = parent.appendingPathComponent("Outside.mp3"); filename = "../Outside.mp3"; destination = "Folder" }
+                else if attack == "symlink" {
+                    source = outside.appendingPathComponent("Outside.mp3"); filename = "Alias/Outside.mp3"; destination = "Folder"
+                    try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("Alias"), withDestinationURL: outside)
+                } else { source = root.appendingPathComponent("Meeting.mp3"); filename = "Meeting.mp3"; destination = "../outside" }
+                try original.write(to: source)
+                let store = RecordingStore(baseDirectory: root)
+                try await store.setup()
+                do {
+                    if action == "move" { _ = try await store.moveRecording(filename: filename, toFolder: destination) }
+                    else { _ = try await store.renameRecording(filename: filename, to: "Unexpected") }
+                    XCTFail("A recording action cannot escape its library")
+                } catch {}
+                XCTAssertTrue(FileManager.default.fileExists(atPath: source.path), "Original remains within its original scope")
+                if FileManager.default.fileExists(atPath: source.path) { XCTAssertEqual(try Data(contentsOf: source), original) }
+            }
+        }
+    }
+
+    private actor RelocationProbe {
+        private(set) var called = false
+        func enter() { called = true }
+    }
+    func testRelocationRefusesSourceAncestorChangeBeforeCommit() async throws {
+        for action in ["rename", "root", "other"] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let root = directory.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Source"), withIntermediateDirectories: true)
+            try Data("source ancestor fixture".utf8).write(to: root.appendingPathComponent("Source/Clip.mp3"))
+            let (_, a, _) = try await fixture(directory: directory)
+            try await a.createSharedFolder(named: "Other")
+            let before = try await a.recording(at: "Source/Clip.mp3"), probe = RelocationProbe()
+            let interrupted = SharedLibraryCoordinator(root: root, writerID: a.writerID, witnessDirectory: directory.appendingPathComponent("local"),
+                afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+            do {
+                _ = try await a.relocateRecording(filename: "Source/Clip.mp3", title: action == "rename" ? "Unexpected" : nil,
+                    toFolder: action == "other" ? "Other" : nil, changeFolder: action != "rename", beforeCommit: {
+                        await probe.enter()
+                        let changing = Task { try await interrupted.renameFolder(from: "Source", to: "Moved") }
+                        do { _ = try await changing.value; XCTFail("Expected interruption after ancestor acceptance") }
+                        catch is CancellationError {}
+                    })
+                XCTFail("Old source paths cannot be accepted after their ancestor changes")
+            } catch {}
+            let entered = await probe.called
+            XCTAssertTrue(entered, "Race must reach the real commit boundary")
+            let current = try await a.read(.init(id: before.state.id, kind: .recording))
+            XCTAssertEqual(current.state.fields["title"], before.state.fields["title"], "Stale rename was not accepted")
+            XCTAssertEqual(current.state.fields["folder"], before.state.fields["folder"], "Stale move was not accepted")
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Source/Clip.mp3")), Data("source ancestor fixture".utf8))
+        }
+    }
+
+    func testRelocationBindsNestedDestinationAncestors() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString), probe = RelocationProbe()
+        let root = directory.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Parent/Nested"), withIntermediateDirectories: true)
+        let (_, a, _) = try await fixture(directory: directory)
+        let before = try await a.recording(at: "Meeting.mp3")
+        let interrupted = SharedLibraryCoordinator(root: root, writerID: a.writerID, witnessDirectory: directory.appendingPathComponent("local"),
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        do {
+            _ = try await a.relocateRecording(filename: "Meeting.mp3", toFolder: "Parent/Nested", changeFolder: true, beforeCommit: {
+                await probe.enter()
+                let changing = Task { try await interrupted.renameFolder(from: "Parent", to: "Moved Parent") }
+                do { _ = try await changing.value; XCTFail("Expected interrupted destination ancestor rename") }
+                catch is CancellationError {}
+            })
+            XCTFail("A changed ancestor cannot retarget the destination after preparation")
+        } catch {}
+        let entered = await probe.called
+        XCTAssertTrue(entered)
+        let current = try await a.read(.init(id: before.state.id, kind: .recording))
+        XCTAssertEqual(current.state.fields["folder"], before.state.fields["folder"])
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), Data("single synthetic original".utf8))
+    }
+
+    func testRelocationRejectsUnknownForeignAndAmbiguousSelections() async throws {
+        let (root, a, store) = try await fixture(), (_, b, other) = try await fixture()
+        try await store.createFolder(named: "Folder"); try await other.createFolder(named: "Folder")
+        let source = try await a.reference(to: "Meeting.mp3"), foreignSource = try await b.reference(to: "Meeting.mp3")
+        let catalog = await store.folderCatalog(), otherCatalog = await other.folderCatalog()
+        let target = try XCTUnwrap(catalog.references["Folder"]), foreignTarget = try XCTUnwrap(otherCatalog.references["Folder"])
+        for change in ["source", "target"] {
+            do {
+                _ = try await a.relocateRecording(filename: "Meeting.mp3", toFolder: "Folder", changeFolder: true,
+                    reference: change == "source" ? foreignSource : source, destinationReference: change == "target" ? foreignTarget : target)
+                XCTFail("Foreign reference cannot authorize relocation")
+            } catch SharedLibraryCoordinatorError.differentBinding {}
+        }
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Unknown"), withIntermediateDirectories: true)
+        try await store.loadLibraryMeta()
+        do { _ = try await store.moveRecording(filename: "Meeting.mp3", toFolder: "Unknown"); XCTFail("Raw folder grants no identity") }
+        catch SharedSidecarError.reloadRequired {}
+        try await a.createSharedFolder(named: "Other")
+        let views = try await a.snapshots(kinds: [.folder]), extra = try XCTUnwrap(views.first { $0.state.value(for: "name") == .text("Other") })
+        _ = try await a.edit(.init(base: extra, changes: [.assign(field: "name", value: .text("Folder"))]))
+        do {
+            _ = try await a.relocateRecording(filename: "Meeting.mp3", toFolder: "Folder", changeFolder: true, reference: source, destinationReference: target)
+            XCTFail("Ambiguous folder cannot receive a recording")
+        } catch {
+            XCTAssertTrue(error as? SharedLibraryPathError == .unknownPath || error as? SharedLibraryPathError == .ambiguousPath)
+        }
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), Data("single synthetic original".utf8))
+    }
+
+    func testDirectRelocationToOrdinaryFolderCompletes() async throws {
+        let (root, a, _) = try await fixture()
+        try await a.createSharedFolder(named: "Folder")
+        let moved = try await a.relocateRecording(filename: "Meeting.mp3", toFolder: "Folder", changeFolder: true)
+        XCTAssertEqual(moved.result, .complete)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Folder/Meeting.mp3")), Data("single synthetic original".utf8))
+    }
+
+    func testDestinationIdentityIsBoundAcrossCommitAndRetry() async throws {
+        for change in ["rename-reuse", "delete"] {
+            let (root, a, store) = try await fixture()
+            try await a.createSharedFolder(named: "Folder"); try await store.loadLibraryMeta()
+            let folders = await store.folderCatalog(), destination = try XCTUnwrap(folders.references["Folder"])
+            let recording = try await a.reference(to: "Meeting.mp3")
+            let before = try await a.recording(at: "Meeting.mp3"), probe = RelocationProbe()
+            do {
+                _ = try await a.relocateRecording(filename: "Meeting.mp3", toFolder: "Folder", changeFolder: true,
+                    reference: recording, destinationReference: destination, beforeCommit: {
+                        await probe.enter()
+                        if change == "delete" { _ = try await a.deleteFolder(named: "Folder", reference: destination) }
+                        else {
+                            _ = try await a.renameFolder(from: "Folder", to: "Moved Folder", reference: destination)
+                            try await a.createSharedFolder(named: "Folder")
+                        }
+                    })
+                XCTFail("Destination identity/path changed before acceptance")
+            } catch {
+                XCTAssertTrue(error as? SharedLibraryCoordinatorError == .differentBinding || error as? SharedLibraryPathError == .unknownPath
+                    || error as? SharedLibraryPathError == .ambiguousPath, "Expected destination refusal, got \(error)")
+            }
+            let entered = await probe.called
+            XCTAssertTrue(entered, "The fixture must reach the destination change at the actual commit boundary")
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), Data("single synthetic original".utf8))
+            let current = try await a.recording(at: "Meeting.mp3")
+            XCTAssertEqual(current.state.fields["folder"], before.state.fields["folder"], "No destination change is accepted under a stale binding")
+        }
+    }
+
     func testActualStoreRenamePreservesIdentityAudioAssociationAndAllCompanions() async throws {
         let (root, coordinator, store) = try await fixture()
         let before = try await coordinator.recording(at: "Meeting.mp3")
@@ -549,7 +735,10 @@ final class SharedRecordingFileStoreTests: XCTestCase {
             _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Renamed", afterMutation: { _ in throw Stopped.interrupted })
             XCTFail()
         } catch Stopped.interrupted {}
-        do { _ = try await store.renameRecording(filename: "Renamed.mp3", to: "Again"); XCTFail("Keep unfinished intent recoverable") }
+        do { _ = try await store.renameRecording(filename: "Renamed.mp3", to: "Again"); XCTFail("An unseen path cannot renew the displayed reference") }
+        catch SharedSidecarError.reloadRequired {}
+        try await store.loadLibraryMeta()
+        do { _ = try await store.renameRecording(filename: "Renamed.mp3", to: "Again"); XCTFail("Keep unfinished intent recoverable after catalog refresh") }
         catch SharedLibraryOperationError.unfinishedOperation {}
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.mp3").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Again.mp3").path))

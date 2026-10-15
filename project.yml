@@ -27,6 +27,11 @@ targets:
     info:
       path: .build/DockTape-Info.plist
       properties:
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: design.highgain.docktape.recording-selection
+            UTTypeDescription: DockTape Recording Selection
+            UTTypeConformsTo:
+              - public.data
         NSUbiquitousContainers:
           iCloud.design.highgain.docktape:
             NSUbiquitousContainerIsDocumentScopePublic: true

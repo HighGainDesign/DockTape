@@ -40,6 +40,7 @@ final class SharedFolderStoreTests: XCTestCase {
         }
         let root = parent.appendingPathComponent("library")
         for name in ["Foo", "foo"] { try FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true) }
+        for name in ["Meeting.mp3", "Other.mp3"] { try Data(name.utf8).write(to: root.appendingPathComponent(name)) }
         let missing = root.appendingPathComponent("Missing/Nested/file.json")
         XCTAssertTrue(SharedLibraryMaterializer.contained(missing, in: root))
         XCTAssertFalse(SharedLibraryMaterializer.contained(root, in: root))
@@ -58,6 +59,14 @@ final class SharedFolderStoreTests: XCTestCase {
         let catalog = await store.folderCatalog()
         let upper = try XCTUnwrap(catalog.references["Foo"]), lower = try XCTUnwrap(catalog.references["foo"])
         XCTAssertNotEqual(upper, lower)
+        for (filename, folder, target) in [("Meeting.mp3", "Foo", upper), ("Other.mp3", "foo", lower)] {
+            let reference = try await a.reference(to: filename)
+            let into = try await a.relocateRecording(filename: filename, toFolder: folder, changeFolder: true, reference: reference, destinationReference: target)
+            XCTAssertEqual(into.result, .complete, "Distinct case-sensitive destination remains writable")
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(folder + "/" + filename)), Data(filename.utf8))
+            let back = try await a.relocateRecording(filename: folder + "/" + filename, changeFolder: true, reference: reference)
+            XCTAssertEqual(back.result, .complete, "Distinct source ancestor remains writable")
+        }
         let deleted = try await a.deleteFolder(named: "foo", reference: lower)
         XCTAssertEqual(deleted.result, .complete)
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Foo").path))
