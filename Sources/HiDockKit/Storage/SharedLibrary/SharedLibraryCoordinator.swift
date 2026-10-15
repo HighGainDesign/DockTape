@@ -360,7 +360,7 @@ public actor SharedLibraryCoordinator {
     }
     return matches[0]
   }
-  private func pathIndex(for views: [SharedLibraryViewSnapshot], caseSensitive: Bool = false) async throws -> SharedLibraryPathIndex {
+  func pathIndex(for views: [SharedLibraryViewSnapshot], caseSensitive: Bool = false) async throws -> SharedLibraryPathIndex {
     let manifest = try await bind(force: true)
     let membership = try await memberRepository().load().membership
     let locations = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)

@@ -196,6 +196,8 @@ public actor RecordingStore {
     private func scanRecordings(in directory: URL, relativeTo base: URL) -> [RecordingMetadata] {
         var results: [RecordingMetadata] = []
         for file in LibraryFileDiscovery.files(in: directory, relativeTo: base, suffix: ".mp3") {
+            let relativePath = file.relativePath
+            if sharedVisibility?.hides(relativePath) == true { continue }
             let url = file.url
             if file.isPlaceholder {
                 try? FileManager.default.startDownloadingUbiquitousItem(at: url)
@@ -204,7 +206,6 @@ public actor RecordingStore {
                 continue
             }
             let realLastComponent = file.logicalName
-            let relativePath = file.relativePath
 
             // Determine folder from relative path (first path component if nested)
             let components = relativePath.split(separator: "/", maxSplits: 1)
@@ -589,6 +590,7 @@ public actor RecordingStore {
     private var meta: [String: RecordingMeta] = [:]
     private var metaBaseline: [String: RecordingMeta] = [:]
     private var recordingReferences: [String: SharedRecordingReference] = [:]
+    private var sharedVisibility: SharedRecordingMetadataAdapter.Visibility?
     private var metadataTicket: UInt64 = 0
 
     /// Load library.json from disk. Also migrates modes.json if present.
@@ -597,7 +599,7 @@ public actor RecordingStore {
             try shared.requireRoot(baseDirectory)
             metadataTicket += 1; let ticket = metadataTicket
             let loaded = try await shared.loadCatalog()
-            if metadataTicket == ticket { meta = loaded.metadata; metaBaseline = loaded.metadata; recordingReferences = loaded.references }
+            if metadataTicket == ticket { meta = loaded.metadata; metaBaseline = loaded.metadata; recordingReferences = loaded.references; sharedVisibility = loaded.visibility }
             return
         }
         let url = baseDirectory.appendingPathComponent("library.json")

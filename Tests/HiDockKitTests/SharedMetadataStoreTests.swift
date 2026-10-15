@@ -18,6 +18,44 @@ final class SharedMetadataStoreTests: XCTestCase {
         _ = try await coordinator.enable()
         return (root, coordinator)
     }
+    func testAcceptedDeletionHidesRetainedAudioUntilExplicitRestore() async throws {
+        let (root, coordinator) = try await fixture()
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        try await store.setup()
+        try Data("untracked external audio".utf8).write(to: root.appendingPathComponent("Untracked.mp3"))
+        let original = try await coordinator.recording(at: "One.mp3")
+        let deleted = try await coordinator.edit(.init(base: original, changes: [.delete]))
+        try await store.loadLibraryMeta()
+        let pending = await store.allRecordings()
+        XCTAssertFalse(pending.contains { $0.filename == "One.mp3" }, "A known deletion must be hidden while its single original is retained")
+        XCTAssertTrue(pending.contains { $0.filename == "Folder/One.mp3" }, "Same basename is a different identity")
+        XCTAssertTrue(pending.contains { $0.filename == "Untracked.mp3" }, "Unknown audio must not disappear merely because it has no reference")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("One.mp3").path))
+        _ = try await coordinator.edit(.init(base: deleted, changes: [.restore]))
+        try await store.loadLibraryMeta()
+        let restored = await store.allRecordings()
+        XCTAssertEqual(restored.first { $0.filename == "One.mp3" }?.reference?.entityID, original.state.id)
+    }
+
+    func testDeleteVersusEditRemainsVisibleForReview() async throws {
+        let (root, coordinator) = try await fixture()
+        let peer = SharedLibraryCoordinator(root: root, writerID: UUID())
+        try await peer.requestEnrollment(requestID: UUID(), label: "Peer")
+        try await coordinator.refresh(); try await peer.refresh(); try await coordinator.refresh()
+        guard case .ready(let manifest) = try await LegacyLibraryBootstrap(root: root, writerID: coordinator.writerID).publishedManifest() else { return XCTFail("Ready fixture") }
+        let original = try await coordinator.recording(at: "One.mp3")
+        let repository = SharedLibraryRepository(root: root, writerID: peer.writerID, manifest: manifest)
+        let offline = try await repository.load(entity: .init(id: original.state.id, kind: .recording))
+        _ = try await coordinator.edit(.init(base: original, changes: [.delete]))
+        _ = try await repository.commit(.init(base: offline, changes: [.assign(field: "metadata.mode", value: .text("\"Mee\""))]))
+        let conflicted = try await coordinator.read(.init(id: original.state.id, kind: .recording))
+        XCTAssertEqual(conflicted.state.lifecycle, .conflicted)
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        try await store.setup()
+        let recordings = await store.allRecordings()
+        XCTAssertTrue(recordings.contains { $0.filename == "One.mp3" }, "A competing live edit must stay available for explicit review")
+    }
+
     func testRealRecordingStoresRefreshAcceptedMetadataAndKeepNestedIdentities() async throws {
         let (root, coordinator) = try await fixture()
         let a = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))

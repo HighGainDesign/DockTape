@@ -240,6 +240,44 @@ final class SharedRecordingFileStoreTests: XCTestCase {
             XCTAssertTrue(FileManager.default.fileExists(atPath: root.deletingLastPathComponent().appendingPathComponent("recycled/Meeting" + suffix).path))
         }
     }
+    func testPeerDeletionDoesNotReclaimACompletedRenameSource() async throws {
+        let (root, coordinator, store) = try await fixture()
+        _ = try await store.renameRecording(filename: "Meeting.mp3", to: "Renamed")
+        let peer = SharedLibraryCoordinator(root: root, writerID: UUID(),
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("peer-local"))
+        try await peer.requestEnrollment(requestID: UUID(), label: "Peer")
+        try await coordinator.refresh(); try await peer.refresh(); try await coordinator.refresh()
+        let unrelated = Data("untracked audio at a released path".utf8)
+        try unrelated.write(to: root.appendingPathComponent("Meeting.mp3"))
+        let pending = try await peer.deleteSharedRecording(filename: "Renamed.mp3")
+        XCTAssertEqual(pending.result, .waitingForAcknowledgments)
+        try await store.loadLibraryMeta()
+        let visible = await store.allRecordings()
+        XCTAssertTrue(visible.contains { $0.filename == "Meeting.mp3" }, "Published completion released this path; an old rename recipe must not hide unrelated audio")
+        XCTAssertFalse(visible.contains { $0.filename == "Renamed.mp3" })
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), unrelated)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.mp3").path))
+    }
+
+    func testDeletionHidesOriginalRetainedByAnInterruptedRename() async throws {
+        let (root, coordinator, store) = try await fixture()
+        let original = try await coordinator.recording(at: "Meeting.mp3")
+        let interrupted = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"),
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let moving = Task { try await interrupted.relocateRecording(filename: "Meeting.mp3", title: "Renamed") }
+        do { _ = try await moving.value; XCTFail("Fixture must interrupt after semantic acceptance") }
+        catch is CancellationError {}
+        let renamed = try await coordinator.read(.init(id: original.state.id, kind: .recording))
+        XCTAssertEqual(renamed.state.value(for: "title"), .text("Renamed"))
+        _ = try await coordinator.edit(.init(base: renamed, changes: [.delete]))
+        try await store.loadLibraryMeta()
+        let visible = await store.allRecordings()
+        XCTAssertFalse(visible.contains { $0.filename == "Meeting.mp3" }, "The accepted path recipe still owns this retained original")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.mp3").path))
+    }
+
     func testActiveJobDelaysDeleteAndItsSavedPlanResumesAfterJobFinishes() async throws {
         let (root, coordinator, _) = try await fixture()
         let before = try await coordinator.recording(at: "Meeting.mp3")
@@ -272,7 +310,7 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         }
     }
     func testOfflineParticipantMustAcknowledgeExactDeleteBeforePhysicalRemoval() async throws {
-        let (left, a, _) = try await fixture()
+        let (left, a, leftStore) = try await fixture()
         let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         roots.append(parent)
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -290,6 +328,9 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         let pending = try await a.deleteSharedRecording(filename: "Meeting.mp3")
         XCTAssertEqual(pending.result, .waitingForAcknowledgments)
         XCTAssertTrue(FileManager.default.fileExists(atPath: left.appendingPathComponent("Meeting.mp3").path))
+        try await leftStore.loadLibraryMeta()
+        let leftVisible = await leftStore.allRecordings()
+        XCTAssertFalse(leftVisible.contains { $0.filename == "Meeting.mp3" }, "Pending physical removal must not make the accepted deletion reappear")
         let stillWaiting = try await a.resumeRecordingOperation(id: entity.id)
         XCTAssertEqual(stillWaiting.result, .waitingForAcknowledgments)
         try deliverOwner(left, to: right, writer: a.writerID)
@@ -301,6 +342,10 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: left.appendingPathComponent("Meeting.mp3").path))
         // This simulated provider has not delivered physical removal yet.
         XCTAssertTrue(FileManager.default.fileExists(atPath: right.appendingPathComponent("Meeting.mp3").path))
+        let rightStore = RecordingStore(baseDirectory: right, shared: SharedRecordingMetadataAdapter(coordinator: b))
+        try await rightStore.setup()
+        let rightVisible = await rightStore.allRecordings()
+        XCTAssertFalse(rightVisible.contains { $0.filename == "Meeting.mp3" }, "State-first delivery must hide the retained peer original too")
     }
 
     func testResumingCompletedRenameIsIdempotentAfterNewProjectionReleasedOldPath() async throws {

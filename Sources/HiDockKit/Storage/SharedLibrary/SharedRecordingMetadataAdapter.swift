@@ -17,11 +17,29 @@ public actor SharedRecordingMetadataAdapter {
             throw SharedLibraryCoordinatorError.differentBinding
         }
     }
+    struct Visibility: Sendable {
+        let paths: SharedLibraryPathIndex
+        let deleted: Set<UUID>
+        func hides(_ filename: String) -> Bool {
+            let owners = paths.owners(of: filename)
+            return !owners.isEmpty && owners.isSubset(of: deleted)
+        }
+    }
     public func load() async throws -> [String: RecordingStore.RecordingMeta] { try await loadCatalog().metadata }
-    func loadCatalog() async throws -> (metadata: [String: RecordingStore.RecordingMeta], references: [String: SharedRecordingReference]) {
+    func loadCatalog() async throws -> (metadata: [String: RecordingStore.RecordingMeta], references: [String: SharedRecordingReference], visibility: Visibility) {
         let request = UUID(); loadRequest = request
         let views = try await coordinator.snapshots(kinds: [.recording, .folder])
-        let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: true)
+        let states = views.map(\.state)
+        let deleted = Set(states.filter { $0.kind == .recording && $0.lifecycle == .deleted }.map(\.id))
+        let index: SharedLibraryPathIndex
+        if deleted.isEmpty {
+            index = try SharedLibraryPathIndex(states: states, caseSensitive: true)
+        } else {
+            // Pending recipes retain originals, but trusted publication proofs
+            // release completed aliases so unrelated files stay visible.
+            index = try await coordinator.pathIndex(for: views, caseSensitive: true)
+        }
+        let visibility = Visibility(paths: index, deleted: deleted)
         var result: [String: RecordingStore.RecordingMeta] = [:]
         var references: [String: SharedRecordingReference] = [:]
         for view in views where view.state.kind == .recording && view.state.lifecycle == .alive {
@@ -33,7 +51,7 @@ public actor SharedRecordingMetadataAdapter {
         await beforeLoadReturn()
         try Task.checkCancellation()
         if loadRequest == request { displayed = Dictionary(uniqueKeysWithValues: views.map { ($0.state.id, $0) }) }
-        return (result, references)
+        return (result, references, visibility)
     }
     public func save(filename: String, before: RecordingStore.RecordingMeta?, after: RecordingStore.RecordingMeta) async throws -> RecordingStore.RecordingMeta {
         loadRequest = nil

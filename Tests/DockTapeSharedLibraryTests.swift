@@ -28,7 +28,13 @@ struct DockTapeSharedLibraryTests {
     }
     @MainActor static func main() async {
         do {
-            if CommandLine.arguments.contains("--refresh-notifications-only") {
+            if CommandLine.arguments.contains("--publication-overlap-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapePublication-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await publicationOverlapChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--refresh-notifications-only") {
                 _ = NSApplication.shared
                 UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
                 let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeRefresh-" + UUID().uuidString)
@@ -92,8 +98,15 @@ struct DockTapeSharedLibraryTests {
         _ = try await state.library.transcriptStore.loadTranscript(for: "Meeting.mp3")
         try await state.library.updateSpeakerNames(for: "Meeting.mp3", names: ["s": "Alice"])
         await state.refreshAll()
-        let json = try Data(contentsOf: root.appendingPathComponent("Meeting.transcript.json"))
-        try expect(String(decoding: json, as: UTF8.self).contains("Alice"), "App edits must publish canonical sidecars")
+        let transcriptFile = root.appendingPathComponent("Meeting.transcript.json")
+        var json = try Data(contentsOf: transcriptFile)
+        let publicationDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !String(decoding: json, as: UTF8.self).contains("Alice"),
+              ContinuousClock.now < publicationDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+            json = try Data(contentsOf: transcriptFile)
+        }
+        try expect(String(decoding: json, as: UTF8.self).contains("Alice"), "App edits must publish canonical sidecars without another refresh")
         let revision = state.sharedLibrary.revision
         let coordinator = state.sharedLibrary.coordinator!
         let peer = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: witnesses)
@@ -178,8 +191,77 @@ struct DockTapeSharedLibraryTests {
         try await folderRenameChecks(parent: parent, identity: identity)
         try await folderDeleteLibraryChecks(parent: parent)
         try await refreshStatusChecks(parent: parent)
+        try await retainedDeletionVisibilityChecks(parent: parent, identity: identity)
+        try await publicationOverlapChecks(parent: parent.appendingPathComponent("publication-overlap"))
         print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions, reconnect and ID-bound merge/original deletion and folder rename/delete.")
     }
+    @MainActor static func publicationOverlapChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("synthetic publication audio".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+        try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture", hasSpeakerLabels: true,
+            segments: [.init(startTime: 0, endTime: 1, text: "Synthetic publication", speakerID: "s")]), mp3Filename: "Meeting.mp3")
+        let identity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "publication fixture").load()
+        let witnesses = parent.appendingPathComponent("witnesses")
+        let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: witnesses)
+        _ = try await seed.enable(); _ = try await seed.projectOutputs()
+        let original = try await seed.recording(at: "Meeting.mp3")
+        guard let generation = original.state.currentDocument(for: .transcript) else { throw Failure(description: "Missing publication fixture transcript") }
+        _ = try await seed.edit(.init(base: original, changes: [.generationEdit(component: .transcript, generation: generation.id, key: "s", value: .text("Alice"))]))
+        let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: witnesses)
+        try await state.setup()
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        let olderGate = Gate(), newerGate = Gate()
+        let older = Task { @MainActor in await state.refreshAll(refreshShared: false, beforePublication: { await olderGate.wait() }) }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await olderGate.waiting) {
+            guard ContinuousClock.now < deadline else { throw Failure(description: "Older publication did not reach barrier") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let newer = Task { @MainActor in await state.refreshAll(refreshShared: false, beforePublication: { await newerGate.wait() }) }
+        while !(await newerGate.waiting) {
+            guard ContinuousClock.now < deadline else { throw Failure(description: "Newer publication did not reach barrier") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await olderGate.release(); await older.value
+        let file = root.appendingPathComponent("Meeting.transcript.json")
+        let immediate = String(decoding: try Data(contentsOf: file), as: UTF8.self).contains("Alice")
+        try expect(!immediate, "A superseded request can return while the actual canonical publication is still pending")
+        await newerGate.release(); await newer.value
+        let current = String(decoding: try Data(contentsOf: file), as: UTF8.self).contains("Alice")
+        try expect(current, "The current refresh must publish the accepted semantic edit")
+        await state.sharedLibrary.close()
+        print("Actual publication overlap passed: superseded return precedes canonical output; current refresh publishes accepted edit.")
+    }
+
+    @MainActor static func retainedDeletionVisibilityChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {
+        let root = parent.appendingPathComponent("retained-deletion")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let audio = Data("synthetic retained original".utf8)
+        try audio.write(to: root.appendingPathComponent("Meeting.mp3"))
+        let witnesses = parent.appendingPathComponent("retained-deletion-witnesses")
+        let refuseTrash: @Sendable (URL) throws -> Void = { _ in throw Failure(description: "Pending fixture must never attempt disposal") }
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: witnesses, sharedTrash: refuseTrash)
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable retained-deletion app fixture")
+        guard let coordinator = state.sharedLibrary.coordinator else { throw Failure(description: "Missing retained-deletion binding") }
+        await coordinator.stopMonitoring()
+        let original = try await coordinator.recording(at: "Meeting.mp3")
+        let token = try await coordinator.pinJob(.init(id: original.state.id, kind: .recording))
+        let pending = try await coordinator.deleteSharedRecording(filename: "Meeting.mp3")
+        try expect(pending.result == .waitingForAcknowledgments, "An active job must retain the original after logical deletion")
+        await state.library.refresh()
+        try expect(state.library.recordings.isEmpty, "The actual library list must hide the accepted deletion while the original remains")
+        try expect(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")) == audio, "Visibility must never dispose or rewrite retained media")
+        await state.sharedLibrary.close()
+        let reopened = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: witnesses, sharedTrash: refuseTrash)
+        try await reopened.setup()
+        try expect(reopened.library.recordings.isEmpty, "Fresh launch must not rediscover a pending-deleted original as a new recording")
+        await reopened.sharedLibrary.close()
+        await coordinator.finishJob(token)
+        print("Actual retained-deletion visibility passed: refresh and fresh launch hide pending original; audio unchanged.")
+    }
+
     @MainActor static func mergeSelectionChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {
         let root = parent.appendingPathComponent("merge-library")
         let legacy = RecordingStore(baseDirectory: root)
