@@ -351,15 +351,26 @@ public actor SharedLibraryMaterializer {
   /// The owner finalized metadata for the SAME accepted directory move after
   /// this Mac saved its receipt. Refresh only output authority; keep every
   /// original input, phase and cleanup witness. This never renews file hashes.
-  func refreshFolderMoveAuthority(_ previous: SharedLibraryOperationProgress, intentWriter: UUID) async throws {
+  func refreshFolderOperationAuthority(_ previous: SharedLibraryOperationProgress, intentWriter: UUID) async throws {
     let operation = previous.operation
     guard operation.entity.kind == .folder, operation.steps.count == 1,
-          case .moveDirectory(_, let destination, _) = operation.steps[0],
           active.insert(operation.entity.id).inserted else { throw SharedLibraryOperationError.unfinishedOperation }
     defer { active.remove(operation.entity.id) }
     let current = try await authority()
-    guard current.state.lifecycle == .alive, current.state.conflicts.isEmpty, current.directoryScopeMatches,
-          current.state.value(for: "physicalPath") == .text(destination), current.state.value(for: "name") == .text(destination),
+    let removing: Bool
+    switch operation.steps[0] {
+    case .moveDirectory(_, let destination, _):
+      removing = false
+      guard current.state.lifecycle == .alive, current.directoryScopeMatches,
+            current.state.value(for: "physicalPath") == .text(destination), current.state.value(for: "name") == .text(destination) else { throw SharedLibraryOperationError.staleAuthority }
+    case .removeEmptyDirectory(let path):
+      removing = true
+      guard current.state.lifecycle == .deleted, current.pathOwners[path] == [operation.entity.id],
+            (current.state.value(for: "physicalPath") == nil || current.state.value(for: "physicalPath") == .text(path)),
+            current.state.value(for: "name") == .text(path) else { throw SharedLibraryOperationError.staleAuthority }
+    default: throw SharedLibraryOperationError.invalidOperation
+    }
+    guard current.state.conflicts.isEmpty,
           case .document(let document)? = current.state.value(for: SharedEntityState.fileIntentField(writer: intentWriter)),
           let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json),
           intent.schema == 1, intent.libraryID == operation.libraryID, intent.entity == operation.entity,
@@ -370,7 +381,7 @@ public actor SharedLibraryMaterializer {
     rebound.outputRevision = try SharedLibraryOperation.revision(for: current.state)
     let replacement = rebound
     let pending = try Self.check(replacement, authority: current)
-    guard pending == nil || pending == .waitingForActiveWork else { throw SharedLibraryOperationError.staleAuthority }
+    guard pending == nil || pending == .waitingForActiveWork || (removing && pending == .waitingForAcknowledgments) else { throw SharedLibraryOperationError.staleAuthority }
     let root = self.root, receipts = self.receipts, gate = self.gate
     let file = receipts.appendingPathComponent(operation.entity.id.uuidString + ".json")
     let gateItems = try gate?.items(outside: root) ?? []

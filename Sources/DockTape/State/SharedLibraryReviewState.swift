@@ -27,6 +27,7 @@ final class SharedLibraryReviewState {
         let snapshot: SharedLibraryViewSnapshot
         let fields: [Field]
         let reviewSignature: String
+        let folderRequests: [String: SharedFolderDeletionRequestReview]
 
         func visibleFields(selections: [String: String]) -> [Field] {
             if snapshot.state.lifecycle == .conflicted {
@@ -63,7 +64,13 @@ final class SharedLibraryReviewState {
         do {
             let views = try await coordinator.snapshots(kinds: [.recording, .folder, .template])
             guard request == ticket, binding === coordinator, !Task.isCancelled else { return }
-            items = views.filter { !$0.state.conflicts.isEmpty }.map(Self.item).sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+            var loaded: [Item] = []
+            for view in views where !view.state.conflicts.isEmpty {
+                let requests = view.state.kind == .folder ? try await coordinator.folderDeletionRequestChoices(view) : []
+                loaded.append(Self.item(view, folderRequests: requests))
+            }
+            guard request == ticket, binding === coordinator, !Task.isCancelled else { return }
+            items = loaded.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
             revision &+= 1
         } catch {
             if request == ticket, binding === coordinator { message = error.localizedDescription }
@@ -72,6 +79,10 @@ final class SharedLibraryReviewState {
     func apply(item: Item, selections: [String: String], using coordinator: SharedLibraryCoordinator) async -> Bool {
         guard binding === coordinator, !isApplying, !isLoading else { return false }
         let fields = item.visibleFields(selections: selections).filter { !$0.choices.isEmpty }
+        if let field = fields.first(where: { $0.id == "deletionRequest" }), item.snapshot.state.kind == .folder {
+            guard let selected = selections[field.id], let review = item.folderRequests[selected], fields.count == 1 else { return false }
+            return await applyFolderRequest(review, using: coordinator)
+        }
         let decidingLifecycle = item.snapshot.state.kind == .recording && item.snapshot.state.lifecycle == .conflicted
         let preservingDeletion = item.snapshot.state.kind == .recording && item.snapshot.state.lifecycle == .deleted
         guard !fields.isEmpty, item.snapshot.state.lifecycle == .alive || decidingLifecycle || preservingDeletion else { return false }
@@ -141,8 +152,36 @@ final class SharedLibraryReviewState {
         if binding === coordinator { isApplying = false; action = nil }
         return result
     }
-    private static func item(_ snapshot: SharedLibraryViewSnapshot) -> Item {
+    private func applyFolderRequest(_ review: SharedFolderDeletionRequestReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
+        let ticket = request
+        isApplying = true; message = nil
+        let task = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                guard let self, self.binding === coordinator, self.request == ticket else { return false }
+                _ = try await coordinator.resolveFolderDeletionRequest(review)
+                guard self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
+                await self.refresh(using: coordinator)
+                guard self.binding === coordinator, !Task.isCancelled else { return true }
+                self.message = "Deletion request selected. Files have not been removed. Open Pending Folders to review and continue cleanup."
+                return true
+            } catch {
+                guard let self, self.binding === coordinator, self.request == ticket else { return false }
+                if error as? SharedLibraryCoordinatorError == .staleReview || error as? SharedLibraryRepositoryError == .staleRevision {
+                    self.message = "This folder changed during review. Reload the choices before deciding."
+                } else if error as? SharedLibraryCoordinatorError == .enrollmentPending { self.message = "This Mac must join the shared library before applying choices." }
+                else if !(error is CancellationError) { self.message = "The request could not be saved. Reload the review and try again." }
+                return false
+            }
+        }
+        action = task
+        let result = await task.value
+        if binding === coordinator { isApplying = false; action = nil }
+        return result
+    }
+    private static func item(_ snapshot: SharedLibraryViewSnapshot, folderRequests requests: [SharedFolderDeletionRequestReview] = []) -> Item {
         let state = snapshot.state
+        let requestChoices = Dictionary(uniqueKeysWithValues: requests.map { (identity($0.value), $0) })
         let title = text(state.value(for: state.kind == .recording ? "title" : "name"))
             ?? text(state.value(for: "initialPath")) ?? (state.kind == .template ? "Summary template" : "Library item")
         var fields: [Field] = []
@@ -156,9 +195,19 @@ final class SharedLibraryReviewState {
             let safeScalar = ["prompt", "description"].contains(conflict.field) || conflict.field == "metadata.mode" || (state.kind == .template && conflict.field == "name")
             let lifecycleChoice = state.kind == .recording && state.lifecycle == .conflicted && conflict.field == "$lifecycle"
             let editableContent = state.lifecycle == .alive || (state.kind == .recording && state.lifecycle == .deleted)
-            let supported = lifecycleChoice || (editableContent && (isContent || generation != nil || safeScalar))
+            let folderRequest = state.kind == .folder && conflict.field == "deletionRequest" && (state.lifecycle == .alive || state.lifecycle == .deleted)
+            let supported = folderRequest || lifecycleChoice || (editableContent && (isContent || generation != nil || safeScalar))
             let choices = supported ? conflict.values.compactMap { value -> Choice? in
                 if isContent { guard case .document = value else { return nil } }
+                if folderRequest {
+                    let id = identity(value)
+                    guard let request = requestChoices[id] else {
+                        return .init(id: id, value: value, label: "Unavailable deletion request", detail: "This request could not be validated. It cannot authorize cleanup.", isAvailable: false)
+                    }
+                    let detail = "Folder: " + request.path + "\n\n" + (request.members.isEmpty ? "No recorded children." : request.members.map(\.path).joined(separator: "\n"))
+                        + "\n\nSelecting this request saves its scope. Files remain until cleanup is reviewed in Pending Folders."
+                    return .init(id: id, value: value, label: "Delete " + request.path + " (\(request.members.count) items)", detail: detail, isAvailable: true)
+                }
                 if lifecycleChoice {
                     guard case .flag(let keep) = value else { return nil }
                     let label = keep ? "Keep Recording and Edits" : "Delete Recording"
@@ -204,7 +253,7 @@ final class SharedLibraryReviewState {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         for key in keys { if let register = state.fields[key] { context[key] = (try? encoder.encode(register))?.base64EncodedString() } }
         let signature = SharedLibraryOperation.fingerprint((try? encoder.encode(context)) ?? Data())
-        return .init(title: title, snapshot: snapshot, fields: fields, reviewSignature: signature)
+        return .init(title: title, snapshot: snapshot, fields: fields, reviewSignature: signature, folderRequests: requestChoices)
     }
     private static func lifecyclePreview(_ state: SharedEntityState) -> String {
         var sections: [String] = []
@@ -230,6 +279,7 @@ final class SharedLibraryReviewState {
         case "metadata.mode": return "Recording type"
         case "title", "name": return "Name"
         case "folder", "parent": return "Folder"
+        case "deletionRequest": return "Folder deletion request"
         case "$lifecycle": return "Keep or delete"
         default: return "File change"
         }

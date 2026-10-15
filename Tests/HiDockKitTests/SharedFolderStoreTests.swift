@@ -754,6 +754,136 @@ final class SharedFolderStoreTests: XCTestCase {
         XCTAssertEqual(mirrored.result, .complete, "A complete acknowledged provider removal does not wait for absent original audio")
     }
 
+    func testFolderRequestChoicePreservesUnrelatedIntentWithoutLocalReceipt() async throws {
+        let (root, coordinator, _) = try await fixture()
+        try await coordinator.createSharedFolder(named: "Empty"); _ = try await coordinator.projectOutputs()
+        let local = root.deletingLastPathComponent().appendingPathComponent("local")
+        let stopped = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: local,
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let work = Task { try await stopped.deleteFolder(named: "Empty") }
+        do { _ = try await work.value; XCTFail("Expected request-only interruption") } catch is CancellationError { }
+        let folders = try await coordinator.snapshots(kinds: [.folder])
+        let folder = try XCTUnwrap(folders.first { $0.state.value(for: "name") == .text("Empty") })
+        // Controlled interrupted-lifecycle state: no root removal was prepared.
+        let deleted = try await coordinator.resolve(.init(base: folder, changes: [.delete]))
+        let receipt = local.appendingPathComponent("Operations/" + deleted.libraryID.uuidString + "/" + coordinator.writerID.uuidString + "/" + deleted.state.id.uuidString + ".json")
+        try FileManager.default.removeItem(at: receipt) // Only this synthetic local receipt is lost.
+        let choices = try await coordinator.folderDeletionRequestChoices(deleted)
+        let choice = try XCTUnwrap(choices.first)
+        do { _ = try await coordinator.resolveFolderDeletionRequest(choice); XCTFail("A missing receipt cannot erase an unrelated durable creation intent") }
+        catch SharedLibraryOperationError.unfinishedOperation { }
+        let after = try await coordinator.read(.init(id: deleted.state.id, kind: .folder))
+        XCTAssertEqual(after.state, deleted.state)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: receipt.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Empty").path))
+    }
+
+    func testDeletedFolderRequestChoiceRetainsReceiptAndRequiresFreshApprovalsToContinue() async throws {
+        let (left, a, _) = try await fixture()
+        try await a.createSharedFolder(named: "Empty"); _ = try await a.projectOutputs()
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString); roots.append(parent)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let right = parent.appendingPathComponent("library")
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Folder peer")
+        for _ in 0..<3 {
+            try deliver(right, to: left, writer: b.writerID); try await a.refresh()
+            try deliver(left, to: right, writer: a.writerID); try await b.refresh()
+        }
+        let pending = try await a.deleteFolder(named: "Empty")
+        XCTAssertEqual(pending.result, .waitingForAcknowledgments)
+        let base = try await a.read(.init(id: pending.id, kind: .folder))
+        let choices = try await a.folderDeletionRequestChoices(base)
+        let selected = try XCTUnwrap(choices.first)
+        let receiptFile = left.deletingLastPathComponent().appendingPathComponent("local/Operations/" + base.libraryID.uuidString + "/" + a.writerID.uuidString + "/" + pending.id.uuidString + ".json")
+        var original = try SharedOperationReceipt.decode(Data(contentsOf: receiptFile))
+        // Controlled receipt evidence: no physical attempt is claimed by this fixture.
+        original.attempting = true
+        original.reviewedCleanups["retain unrelated evidence"] = "synthetic witness"
+        try original.encoded().write(to: receiptFile, options: .atomic)
+        let accepted = try await a.resolveFolderDeletionRequest(selected)
+        XCTAssertEqual(accepted.state.lifecycle, .deleted)
+        let observed = try await a.reviewFolderOperation(id: pending.id)
+        let current = try XCTUnwrap(observed)
+        XCTAssertFalse(current.needsReplanning, "The selected deleted request needs actionable current cleanup authority")
+        XCTAssertTrue(current.canAcknowledge && !current.canResume, "New request requires fresh owner approval; old approval cannot carry over")
+        try await a.acknowledgeReviewedFolderOperation(current)
+        try deliver(left, to: right, writer: a.writerID)
+        let peerObserved = try await b.reviewFolderOperation(id: pending.id)
+        let peer = try XCTUnwrap(peerObserved)
+        XCTAssertTrue(peer.canAcknowledge, "Peer must separately approve the new selected state")
+        try await b.acknowledgeReviewedFolderOperation(peer)
+        try deliver(right, to: left, writer: b.writerID)
+        let approvedObserved = try await a.reviewFolderOperation(id: pending.id)
+        let approved = try XCTUnwrap(approvedObserved)
+        XCTAssertTrue(approved.canResume)
+        let unknown = left.appendingPathComponent("Empty/keep.txt")
+        try Data("preserve unknown child".utf8).write(to: unknown)
+        let refused = try await a.resumeReviewedFolderOperation(approved)
+        XCTAssertEqual(refused.result, .directoryNotEmpty("Empty"))
+        XCTAssertEqual(try Data(contentsOf: unknown), Data("preserve unknown child".utf8))
+        XCTAssertEqual(try Data(contentsOf: receiptFile), try original.encoded(), "Selection, approval and refused removal never discard attempted receipt evidence")
+        try FileManager.default.removeItem(at: unknown)
+        let readyObserved = try await a.reviewFolderOperation(id: pending.id)
+        let ready = try XCTUnwrap(readyObserved)
+        let done = try await a.resumeReviewedFolderOperation(ready)
+        XCTAssertEqual(done.result, .complete)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path))
+        let final = try SharedOperationReceipt.decode(Data(contentsOf: receiptFile))
+        original.operation.outputRevision = final.operation.outputRevision
+        original.completed = 1; original.attempting = false
+        XCTAssertEqual(try final.encoded(), try original.encoded(), "Continuation changes only output authority and actual phase, retaining original ID/input/steps/cleanup witnesses")
+    }
+
+    func testFolderRequestChoicesBindWholeReviewedStateAndNeverDisposeFiles() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let local = root.deletingLastPathComponent().appendingPathComponent("local")
+        let stopped = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: local,
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let work = Task { try await stopped.deleteFolder(named: "Folder") }
+        do { _ = try await work.value; XCTFail("Expected durable-request interruption") } catch is CancellationError { }
+        let folders = try await coordinator.snapshots(kinds: [.folder])
+        let entity = try XCTUnwrap(folders.first { $0.state.value(for: "name") == .text("Folder") })
+        let choices = try await coordinator.folderDeletionRequestChoices(entity)
+        let choice = try XCTUnwrap(choices.first)
+        XCTAssertEqual(choice.path, "Folder")
+        let original = try await coordinator.reference(to: "Folder/A.mp3")
+        let job = try await coordinator.pinJob(.init(id: original.entityID, kind: .recording))
+        let pendingReview = try await coordinator.reviewFolderOperation(id: entity.state.id)
+        XCTAssertTrue(pendingReview?.isDeletionRequest == true && pendingReview?.hasActiveWork == true && pendingReview?.canResume == false,
+                      "A request containing separately owned child paths remains inspectable while child work is active")
+        await coordinator.finishJob(job)
+        XCTAssertEqual(Set(choice.members.map(\.path)), ["Folder/A.mp3", "Folder/Nested", "Folder/Nested/B.mp3"])
+        _ = try await coordinator.edit(.init(base: entity, changes: [.assign(field: "description", value: .text("unseen folder change"))]))
+        do { _ = try await coordinator.resolveFolderDeletionRequest(choice); XCTFail("Whole reviewed folder state changed") }
+        catch SharedLibraryCoordinatorError.staleReview { }
+        let fresh = try await coordinator.read(.init(id: entity.state.id, kind: .folder))
+        let freshChoices = try await coordinator.folderDeletionRequestChoices(fresh)
+        let updated = try XCTUnwrap(freshChoices.first)
+        let accepted = try await coordinator.resolveFolderDeletionRequest(updated)
+        XCTAssertEqual(accepted.state.value(for: "deletionRequest"), .document(updated.document))
+        XCTAssertEqual(accepted.state.lifecycle, .alive)
+        for name in ["Folder/A.mp3", "Folder/Nested/B.mp3", "Folder/.notes", "Folder/Notes.txt"] { XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path)) }
+        let (otherRoot, foreign, _) = try await fixture()
+        do { _ = try await foreign.resolveFolderDeletionRequest(updated); XCTFail("Foreign library cannot use another review") }
+        catch SharedLibraryCoordinatorError.differentBinding { }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: otherRoot.appendingPathComponent("Folder/A.mp3").path))
+        var object = try JSONSerialization.jsonObject(with: updated.document.json) as! [String: Any]
+        object["path"] = "../Outside"
+        let invalid = try SharedDocument(id: UUID(), json: JSONSerialization.data(withJSONObject: object))
+        let changed = try await coordinator.edit(.init(base: accepted, changes: [.assign(field: "deletionRequest", value: .document(invalid))]))
+        let refused = try await coordinator.folderDeletionRequestChoices(changed)
+        XCTAssertTrue(refused.isEmpty, "Malformed request cannot receive a cleanup-capable choice")
+        let restored = try await coordinator.resolve(.init(base: changed, changes: [.assign(field: "deletionRequest", value: updated.value)]))
+        let deleted = try await coordinator.resolve(.init(base: restored, changes: [.delete]))
+        let deletedChoices = try await coordinator.folderDeletionRequestChoices(deleted)
+        let deletedChoice = try XCTUnwrap(deletedChoices.first)
+        let preservedDeletion = try await coordinator.resolveFolderDeletionRequest(deletedChoice)
+        XCTAssertEqual(preservedDeletion.state.lifecycle, .deleted, "Reviewing a pending deleted folder cannot revive it")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder/A.mp3").path), "Choosing scope still grants no physical cleanup")
+    }
+
     func testCancelledFolderDeletionRequestResumesFromSharedState() async throws {
         let (root, original, _) = try await fixture()
         try FileManager.default.removeItem(at: root.appendingPathComponent("Folder/.notes"))

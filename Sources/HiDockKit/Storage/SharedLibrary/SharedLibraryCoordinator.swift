@@ -984,11 +984,15 @@ public actor SharedLibraryCoordinator {
     let previous = try await reader.progress(entity: intent.entity, libraryID: intent.libraryID)
     if let previous, previous.operation.steps == intent.steps, previous.operation.inputRevision == intent.inputRevision,
        previous.operation.reviewedExistingDestinations == intent.reviewedExistingDestinations {
-      if view.state.kind == .folder, intent.steps.count == 1, case .moveDirectory = intent.steps[0],
+      if view.state.kind == .folder, intent.steps.count == 1,
          try !SharedLibraryOperation.matchesRevision(previous.operation.outputRevision, state: view.state) {
-        let materializer = try await makeMaterializer(entity: intent.entity, paths: Array(previous.operation.canonicalPaths),
-          receipts: operationReceipts(library: intent.libraryID), expectedCohort: expectedCohort, reviewedFolder: reviewedFolder)
-        try await materializer.refreshFolderMoveAuthority(previous, intentWriter: owner)
+        switch intent.steps[0] {
+        case .moveDirectory, .removeEmptyDirectory:
+          let materializer = try await makeMaterializer(entity: intent.entity, paths: Array(previous.operation.canonicalPaths),
+            receipts: operationReceipts(library: intent.libraryID), expectedCohort: expectedCohort, reviewedFolder: reviewedFolder)
+          try await materializer.refreshFolderOperationAuthority(previous, intentWriter: owner)
+        default: break
+        }
       }
       return true
     }
@@ -1205,7 +1209,10 @@ public actor SharedLibraryCoordinator {
     var paths = operation.map { Array($0.canonicalPaths) } ?? []
     if let request { paths += [request.path] + request.members.map(\.path) }
     paths = Array(Set(paths)).sorted()
-    let permission = try await operationAuthority(entity: entity, paths: purpose == .rename ? [] : paths)
+    // Children retain their own recording/folder authorities. This inspection
+    // checks only the root path while aggregating descendant jobs and state.
+    let authorityPaths = request.map { [$0.path] } ?? paths
+    let permission = try await operationAuthority(entity: entity, paths: purpose == .rename ? [] : authorityPaths)
     guard try SharedLibraryOperation.matchesRevision(SharedLibraryOperation.revision(for: view.state), state: permission.state) else { throw SharedLibraryOperationError.staleAuthority }
     var conflict = !view.state.conflicts.isEmpty
     if !conflict, view.state.lifecycle == .alive {
@@ -1407,6 +1414,82 @@ public actor SharedLibraryCoordinator {
     let folder: UUID
     let path: String
     let members: [FolderDeletionMember]
+  }
+  private func validatedFolderDeletionRequest(_ document: SharedDocument, base: SharedLibraryViewSnapshot) throws -> FolderDeletionRequest {
+    let request = try JSONDecoder().decode(FolderDeletionRequest.self, from: document.json)
+    guard base.state.kind == .folder, request.library == base.libraryID, request.folder == base.state.id,
+          !request.path.contains("/"), (try? SharedLibraryIdentity.normalized(request.path)) == request.path,
+          Set(request.members.map(\.id)).count == request.members.count,
+          Set(request.members.map(\.path)).count == request.members.count,
+          request.members.allSatisfy({ member in
+            member.id != request.folder && (member.kind == .recording || member.kind == .folder)
+              && member.path.hasPrefix(request.path + "/")
+              && (try? SharedLibraryIdentity.normalized(member.path)) == member.path
+              && !member.revision.isEmpty
+              && (member.kind != .recording || member.path.hasSuffix(".mp3"))
+          }) else { throw SharedLibraryOperationError.differentBinding }
+    return request
+  }
+  public func folderDeletionRequestChoices(_ base: SharedLibraryViewSnapshot) async throws -> [SharedFolderDeletionRequestReview] {
+    let manifest = try await bind(force: true)
+    guard base.libraryID == manifest.libraryID, repository.accepts(base.repository) else { throw SharedLibraryCoordinatorError.differentBinding }
+    guard base.state.kind == .folder, base.state.lifecycle == .alive || base.state.lifecycle == .deleted else { return [] }
+    return (base.state.fields["deletionRequest"]?.values ?? []).compactMap { value in
+      guard case .document(let document) = value, let request = try? validatedFolderDeletionRequest(document, base: base) else { return nil }
+      return SharedFolderDeletionRequestReview(path: request.path,
+        members: request.members.sorted { $0.path < $1.path }.map { .init(path: $0.path, kind: $0.kind) }, base: base, document: document)
+    }.sorted { $0.document.id.uuidString < $1.document.id.uuidString }
+  }
+  /// Saves only the reviewed request. It grants no cleanup/acknowledgment authority.
+  public func resolveFolderDeletionRequest(_ review: SharedFolderDeletionRequestReview) async throws -> SharedLibraryViewSnapshot {
+    let request = try validatedFolderDeletionRequest(review.document, base: review.base)
+    guard review.base.state.fields["deletionRequest"]?.values.contains(review.value) == true else { throw SharedLibraryCoordinatorError.staleReview }
+    var prepared: SharedPreparedFileOperation?
+    if review.base.state.lifecycle == .deleted {
+      let entity = SharedEntityIdentity(id: review.base.state.id, kind: .folder)
+      let steps: [SharedLibraryOperation.Step] = [.removeEmptyDirectory(path: request.path)]
+      let prefix = "materialization.files."
+      let fields = review.base.state.fields.keys.filter { $0.hasPrefix(prefix) }.sorted {
+        if $0 == fileIntentField { return $1 != fileIntentField }
+        if $1 == fileIntentField { return false }
+        return $0 < $1
+      }
+      let candidates = fields.compactMap { field -> SharedAcceptedFileIntent? in
+        guard case .document(let document)? = review.base.state.value(for: field),
+              let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json),
+              intent.schema == 1, intent.libraryID == review.base.libraryID, intent.entity == entity, intent.steps == steps else { return nil }
+        return intent
+      }
+      let reader = try await makeMaterializer(entity: entity, paths: [], receipts: operationReceipts(library: review.base.libraryID))
+      let previous = try await reader.progress(entity: entity, libraryID: review.base.libraryID)
+      // An unrelated intent owned by this writer must not be overwritten,
+      // even if a peer has a matching removal intent for the local receipt.
+      if fields.contains(fileIntentField), !candidates.contains(where: { candidate in
+        guard case .document(let own)? = review.base.state.value(for: fileIntentField),
+              let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: own.json) else { return false }
+        return candidate.steps == intent.steps && candidate.inputRevision == intent.inputRevision
+      }) { throw SharedLibraryOperationError.unfinishedOperation }
+      let original: SharedAcceptedFileIntent?
+      if let previous {
+        guard previous.operation.steps == steps, let matching = candidates.first(where: {
+          $0.inputRevision == previous.operation.inputRevision && $0.reviewedExistingDestinations == previous.operation.reviewedExistingDestinations
+        }) else { throw SharedLibraryOperationError.unfinishedOperation }
+        original = matching
+      } else {
+        guard fields.isEmpty || !candidates.isEmpty else { throw SharedLibraryOperationError.unfinishedOperation }
+        original = candidates.first
+      }
+      var plan = SharedPreparedFileOperation(libraryID: review.base.libraryID, entity: entity,
+        inputRevision: original?.inputRevision ?? review.base.fingerprint, steps: steps)
+      plan.replacesOperationID = original?.replacesOperationID
+      plan.retainedFiles = original?.retainedFiles ?? [:]
+      plan.reviewedExistingDestinations = original?.reviewedExistingDestinations
+      prepared = plan
+    }
+    var changes: [SharedLibraryMutation] = review.base.state.lifecycle == .deleted ? [.restore] : []
+    changes.append(.assign(field: "deletionRequest", value: review.value))
+    if review.base.state.lifecycle == .deleted { changes.append(.delete) }
+    return try await commit(.init(base: review.base, changes: changes), review: true, exact: true, preparedFileOperation: prepared)
   }
   public func deleteFolder(named name: String, reference: SharedFolderReference? = nil, beforeFinalRemoval: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedFolderFileOutcome {
     _ = try SharedLibraryIdentity.normalized(name)
