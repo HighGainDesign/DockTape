@@ -75,6 +75,10 @@ public struct SharedMaterializationAuthority: Sendable {
   public var jobGate: SharedLibraryJobGate? = nil
   public var jobGates: [SharedLibraryJobGate] = []
   public var hasLiveDescendants: Bool = false
+  /// Known original aliases outside the accepted cleanup, including placeholders.
+  public var unplannedDeletionPaths: [String] = []
+  var recordingFileHistory: [String: Set<String>] = [:]
+  var releasedRecordingPaths: Set<String> = []
   /// Frozen child placements must still match an accepted directory move.
   public var directoryScopeMatches: Bool = true
   /// Exact owners from the current identity/path index plus retained operation
@@ -104,6 +108,7 @@ public struct SharedMaterializationAuthority: Sendable {
   }
   public func mayDestroy(_ purpose: SharedDestructivePurpose) -> Bool {
     guard membership.libraryID == libraryID, state.conflicts.isEmpty, !hasPendingWork,
+      purpose != .delete || unplannedDeletionPaths.isEmpty,
       !(state.kind == .folder && hasLiveDescendants),
       membership.pendingWriters.isEmpty, !membership.hasConcurrentEnrollment,
       purpose == .delete ? state.lifecycle == .deleted : state.lifecycle == .alive
@@ -124,6 +129,7 @@ public struct SharedMaterializationAuthority: Sendable {
     -> SharedOperationAcknowledgment
   {
     guard !hasPendingWork, state.conflicts.isEmpty, membership.mayEdit(writer),
+      purpose != .delete || unplannedDeletionPaths.isEmpty,
       !(state.kind == .folder && hasLiveDescendants),
       membership.pendingWriters.isEmpty, !membership.hasConcurrentEnrollment,
       purpose == .delete ? state.lifecycle == .deleted : state.lifecycle == .alive

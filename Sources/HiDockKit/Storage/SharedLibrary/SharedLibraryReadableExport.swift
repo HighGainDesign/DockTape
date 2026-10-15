@@ -20,16 +20,7 @@ public enum SharedLibraryReadableExport {
             let bytes = try SharedProjectionDocument.make(body: body, libraryID: view.libraryID, entities: [view.state.id],
                 kind: "transcript", generation: generation.id, revision: view.fingerprint, hasConflicts: !view.state.conflicts.isEmpty)
             result[stem + ".transcript.json"] = bytes
-            let header = try banner(bytes)
-            var lines = [header, "# Transcript", "", "*\(iso(transcript.createdAt))*", ""]
-            var previous: String?
-            for segment in transcript.segments {
-                let speaker = segment.speakerID.map { transcript.speakerNames[$0] ?? $0 } ?? "Unknown"
-                if speaker != previous { lines += ["## " + oneLine(speaker), ""]; previous = speaker }
-                lines += ["**[\(timestamp(segment.startTime))]** \(segment.text)", ""]
-            }
-            result[stem + ".transcript.md"] = Data(lines.joined(separator: "\n").utf8)
-            result[stem + ".txt"] = Data(TranscriptExporter.exportPlainText(transcript: transcript).utf8)
+            result.merge(try transcriptCompanions(transcript, json: bytes, stem: stem), uniquingKeysWith: { _, new in new })
         }
         if let summary = try SharedSidecarAdapter.summary(view, filename: recordingPath),
            let state = try SharedSidecarAdapter.content(view, component: .summary),
@@ -55,14 +46,51 @@ public enum SharedLibraryReadableExport {
             let bytes = try SharedProjectionDocument.make(body: body, libraryID: view.libraryID, entities: [view.state.id],
                 kind: "summary", generation: generation.id, revision: view.fingerprint, hasConflicts: !view.state.conflicts.isEmpty)
             result[stem + ".summary.json"] = bytes
-            var lines = [try banner(bytes), "# Summary", "", "*\(iso(summary.createdAt))*", ""]
-            for section in summary.sections {
-                lines += ["## " + oneLine(section.heading), "", section.content, ""]
-                for item in section.items ?? [] { lines.append("- [\(item.isCompleted ? "x" : " ")] \(oneLine(item.text))") }
-                if section.items != nil { lines.append("") }
-            }
-            result[stem + ".summary.md"] = Data(lines.joined(separator: "\n").utf8)
+            result.merge(try summaryCompanions(summary, json: bytes, stem: stem), uniquingKeysWith: { _, new in new })
         }
+        return result
+    }
+    /// Reproduce only derived companions from a producer-validated canonical
+    /// JSON file. Callers must separately bind its registered producer proof.
+    static func derivedCompanions(json: Data, component: SharedComponent, recordingPath: String) throws -> [String: Data] {
+        _ = try SharedLibraryIdentity.normalized(recordingPath)
+        guard let marker = try SharedProjectionDocument.marker(in: json), marker.kind == component.rawValue else { throw SharedSidecarError.invalidContent }
+        let stem = (recordingPath as NSString).deletingPathExtension
+        if component == .transcript {
+            let transcript = try SharedContentCoding.decoder().decode(Transcript.self, from: json)
+            guard transcript.recordingFilename == recordingPath,
+                  transcript.segments.allSatisfy({ $0.startTime.isFinite && $0.endTime.isFinite && $0.startTime >= 0
+                    && $0.endTime >= $0.startTime && $0.endTime <= Double(Int32.max) }) else { throw SharedSidecarError.invalidContent }
+            return try transcriptCompanions(transcript, json: json, stem: stem)
+        }
+        let summary = try SharedContentCoding.decoder().decode(Summary.self, from: json)
+        let items = summary.sections.flatMap { $0.items ?? [] }
+        guard summary.recordingFilename == recordingPath, Set(items.map(\.id)).count == items.count else { throw SharedSidecarError.invalidContent }
+        return try summaryCompanions(summary, json: json, stem: stem)
+    }
+    private static func transcriptCompanions(_ transcript: Transcript, json: Data, stem: String) throws -> [String: Data] {
+        var result: [String: Data] = [:]
+        let header = try banner(json)
+        var lines = [header, "# Transcript", "", "*\(iso(transcript.createdAt))*", ""]
+        var previous: String?
+        for segment in transcript.segments {
+            let speaker = segment.speakerID.map { transcript.speakerNames[$0] ?? $0 } ?? "Unknown"
+            if speaker != previous { lines += ["## " + oneLine(speaker), ""]; previous = speaker }
+            lines += ["**[\(timestamp(segment.startTime))]** \(segment.text)", ""]
+        }
+        result[stem + ".transcript.md"] = Data(lines.joined(separator: "\n").utf8)
+        result[stem + ".txt"] = Data(TranscriptExporter.exportPlainText(transcript: transcript).utf8)
+        return result
+    }
+    private static func summaryCompanions(_ summary: Summary, json: Data, stem: String) throws -> [String: Data] {
+        var result: [String: Data] = [:]
+        var lines = [try banner(json), "# Summary", "", "*\(iso(summary.createdAt))*", ""]
+        for section in summary.sections {
+            lines += ["## " + oneLine(section.heading), "", section.content, ""]
+            for item in section.items ?? [] { lines.append("- [\(item.isCompleted ? "x" : " ")] \(oneLine(item.text))") }
+            if section.items != nil { lines.append("") }
+        }
+        result[stem + ".summary.md"] = Data(lines.joined(separator: "\n").utf8)
         return result
     }
     private static func object(_ bytes: Data) throws -> [String: Any] {

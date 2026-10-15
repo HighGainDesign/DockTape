@@ -501,6 +501,135 @@ import HiDockKit
         print("Actual unprepared deletion passed: retry, explicit Keep, native external-file restoration and deletion again complete without fixture repair writes.")
     }
 
+    @MainActor static func recordingPathChecks(parent: URL) async throws {
+        let stages = CommandLine.arguments.contains("--recording-path-deleted-published-only") ? ["deleted-published"] : CommandLine.arguments.contains("--recording-path-published-only") ? ["published"] : ["unstarted", "partial", "published", "deleted-unstarted", "deleted-partial", "deleted-published"]
+        for stage in stages {
+            let deleted = stage.hasPrefix("deleted-")
+            let phase = deleted ? String(stage.dropFirst("deleted-".count)) : stage
+            let directory = parent.appendingPathComponent(stage), left = directory.appendingPathComponent("left"), right = directory.appendingPathComponent("right")
+            try FileManager.default.createDirectory(at: left.appendingPathComponent("Target"), withIntermediateDirectories: true)
+            let audio = Data("Synthetic original for path conflict".utf8)
+            try audio.write(to: left.appendingPathComponent("Meeting.mp3"))
+            try await TranscriptStore(baseDirectory: left).save(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: "Retained conversation")]), mp3Filename: "Meeting.mp3")
+            try await SummaryStore(baseDirectory: left).save(Summary(recordingFilename: "Meeting.mp3", model: "fixture", provider: "fixture", templateUsed: "meeting",
+                sections: [.init(heading: "Notes", content: "Retained summary")]), mp3Filename: "Meeting.mp3")
+            let writer = UUID(), local = directory.appendingPathComponent("a-local")
+            let seed = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local)
+            _ = try await seed.enable(); _ = try await seed.projectOutputs()
+            try FileManager.default.copyItem(at: left, to: right)
+            let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: directory.appendingPathComponent("b-local"), afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+            // Enrollment itself does not use the user-mutation callback.
+            try await b.requestEnrollment(requestID: UUID(), label: "Path peer")
+            for _ in 0..<3 {
+                try deliver(right, to: left, writer: b.writerID); try await seed.refresh()
+                try deliver(left, to: right, writer: seed.writerID); try await b.refresh()
+            }
+            let a = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local,
+                afterCommit: { if phase == "unstarted" { withUnsafeCurrentTask { $0?.cancel() } } })
+            let entity = SharedEntityIdentity(id: try await a.reference(to: "Meeting.mp3").entityID, kind: .recording)
+            let own = Task { try await a.relocateRecording(filename: "Meeting.mp3", title: "Local", toFolder: "Target", changeFolder: true, afterMutation: { _ in
+                if phase == "partial" { throw CancellationError() }
+            }) }
+            do { _ = try await own.value; try expect(phase == "published", "Expected actual interrupted move") } catch is CancellationError { }
+            let peer = Task { try await b.relocateRecording(filename: "Meeting.mp3", title: "Peer", toFolder: "Target", changeFolder: true) }
+            do { _ = try await peer.value; throw Failure(message: "Expected interrupted peer move") } catch is CancellationError { }
+            try deliver(right, to: left, writer: b.writerID)
+            let current = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local,
+                trash: { try FileManager.default.removeItem(at: $0) })
+            print("Path stage " + stage + ": before lifecycle decision")
+            if deleted { _ = try await current.resolve(.init(base: try await current.read(entity), changes: [.delete])) }
+            print("Path stage " + stage + ": before semantic review")
+            let model = SharedLibraryReviewState(); await model.refresh(using: current)
+            guard var item = model.items.first(where: { $0.id == entity.id }),
+                  var path = item.fields.first(where: { $0.id == "recording.path" }),
+                  var selected = path.choices.first(where: { $0.value == .text("Target/Peer.mp3") }) else { throw Failure(message: "Competing paths must offer validated readable location choices") }
+            try expect(selected.detail.contains("Path peer"), "Path choice identifies the peer name source")
+            if stage == "unstarted" {
+                let beforeSignature = item.reviewSignature
+                let folders = try await current.snapshots(kinds: [.folder])
+                guard let folder = folders.first(where: { $0.state.value(for: "name") == .text("Target") }) else { throw Failure(message: "Missing target folder") }
+                let folderID = SharedEntityIdentity(id: folder.state.id, kind: .folder)
+                _ = try await current.edit(.init(base: folder, changes: [.delete]))
+                _ = try await current.resolve(.init(base: try await current.read(folderID), changes: [.restore]))
+                try expect(!(await model.apply(item: item, selections: [path.id: selected.id], using: current)), "Old destination lifecycle consent must refuse")
+                await model.refresh(using: current)
+                guard let fresh = model.items.first(where: { $0.id == entity.id }), let next = fresh.fields.first(where: { $0.id == "recording.path" }),
+                      let choice = next.choices.first(where: { $0.value == .text("Target/Peer.mp3") }) else { throw Failure(message: "Reloaded path choices missing") }
+                try expect(fresh.reviewSignature != beforeSignature, "A refreshed ABA destination must clear the UI's old selection consent")
+                item = fresh; path = next; selected = choice
+            }
+
+            print("Path stage " + stage + ": before path acceptance")
+            try expect(await model.apply(item: item, selections: [path.id: selected.id], using: current), "Actual review saves the selected path")
+            let pending = RecordingFileReviewState(); await pending.refresh(using: current)
+            guard let row = pending.items.first(where: { $0.id == entity.id }), row.canReplan else { throw Failure(message: "Selected path must lead to a usable updated physical plan; stage=" + stage + "; rows=" + String(pending.items.count) + "; inspection=" + String(pending.inspectionFailed) + "; feedback=" + (pending.message ?? "nil")) }
+            print("Path stage " + stage + ": before physical preview")
+            await pending.prepareUpdatedPlan(row, using: current)
+            guard let plan = pending.updatedPlan else {
+                _ = try await current.prepareRecordingReplan(row)
+                throw Failure(message: "Updated path plan must be inspectable; stage=" + stage)
+            }
+            try expect(plan.destination == "Target/Peer.mp3", "Physical plan follows the exact selected path")
+            try expect(plan.isDeletion == deleted, "Deleted path decisions need an explicit cleanup review")
+            print("Path stage " + stage + ": before physical acceptance")
+            try expect(await pending.applyUpdatedPlan(using: current), "Reviewed physical continuation completes or awaits approval")
+            if deleted {
+                try expect((try await current.read(entity)).state.lifecycle == .deleted, "Path decision cannot reverse Delete")
+                let source = phase == "unstarted" ? "Meeting.mp3" : "Target/Local.mp3"
+                try expect(try Data(contentsOf: left.appendingPathComponent(source)) == audio, "Offline peer prevents removal of exact original audio")
+                print("Path stage " + stage + ": before peer delivery")
+                try deliver(left, to: right, writer: current.writerID); try await b.refresh()
+                // Explicit synthetic provider delivery: the peer must see the
+                // actual moved files, not approve a plan that omits its still-
+                // resident old originals. This is not real-provider acceptance.
+                for stem in ["Meeting", "Target/Local", "Target/Peer"] {
+                    for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+                        let source = left.appendingPathComponent(stem + suffix), target = right.appendingPathComponent(stem + suffix)
+                        if FileManager.default.fileExists(atPath: source.path) {
+                            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                            try Data(contentsOf: source).write(to: target, options: .atomic)
+                        } else if FileManager.default.fileExists(atPath: target.path) { try FileManager.default.removeItem(at: target) }
+                    }
+                }
+                print("Path stage " + stage + ": before peer approval")
+                if phase == "published" {
+                    // Registry metadata arrived before its replacement canonical
+                    // document. Refuse consent until that real provider delivery
+                    // completes; do not bless the peer's superseded document.
+                    do { try await b.acknowledgeOperation(entity: entity, purpose: .delete); throw Failure(message: "Out-of-order canonical metadata must prevent approval") }
+                    catch SharedProjectionWriteError.untracked(let path) { try expect(path == "library.json", "Expected the held canonical document") }
+                    try expect(try Data(contentsOf: left.appendingPathComponent(source)) == audio, "Missing peer metadata cannot authorize removal")
+                    try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+                }
+                try await b.acknowledgeOperation(entity: entity, purpose: .delete)
+                try deliver(right, to: left, writer: b.writerID)
+                let restarted = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local,
+                    trash: { try FileManager.default.removeItem(at: $0) })
+                print("Path stage " + stage + ": before owner restart/resume")
+                let removed = try await restarted.resumeRecordingOperation(id: entity.id)
+                try expect(removed.result == .complete, "Fresh peer approval and restart finish the accepted cleanup")
+                for stem in ["Meeting", "Target/Local", "Target/Peer"] {
+                    for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+                        try expect(!FileManager.default.fileExists(atPath: left.appendingPathComponent(stem + suffix).path), "No known alias remains after approved cleanup")
+                    }
+                }
+                print("Actual recording path stage passed: " + stage)
+                continue
+            }
+            try expect(try Data(contentsOf: left.appendingPathComponent("Target/Peer.mp3")) == audio, "Original audio remains exact")
+            try expect(!FileManager.default.fileExists(atPath: left.appendingPathComponent("Meeting.mp3").path)
+                && !FileManager.default.fileExists(atPath: left.appendingPathComponent("Target/Local.mp3").path), "No original-path duplicate left after completed recovery")
+            let transcript = try await TranscriptStore(baseDirectory: left).loadTranscript(for: "Target/Peer.mp3")
+            try expect(transcript?.segments.first?.text == "Retained conversation", "Companion remains associated after path recovery")
+            let summary = try await SummaryStore(baseDirectory: left).loadSummary(for: "Target/Peer.mp3")
+            try expect(summary?.sections.first?.content == "Retained summary", "Summary and all derived companions follow the selected path")
+            try expect((try await current.read(entity)).state.conflicts.isEmpty, "Path conflict resolved without replacing recording identity")
+            print("Actual recording path stage passed: " + stage)
+        }
+        print("Actual recording path recovery passed: alive/deleted unstarted, partial and published moves lead from explicit path choice to reviewed physical continuation.")
+    }
+
     @MainActor static func sourceMacChecks(parent: URL) async throws {
         let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right"), third = parent.appendingPathComponent("third")
         try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
@@ -714,6 +843,7 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--recording-paths-only") || arguments.contains("--recording-path-published-only") || arguments.contains("--recording-path-deleted-published-only") { try await recordingPathChecks(parent: parent); return }
         if arguments.contains("--source-macs-only") { try await sourceMacChecks(parent: parent); return }
         if arguments.contains("--template-lifecycle-only") { try await templateLifecycleChecks(parent: parent); return }
         if arguments.contains("--folder-requests-only") { try await folderRequestConflictChecks(parent: parent); return }
@@ -726,6 +856,7 @@ import HiDockKit
             return
         }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
+        try await recordingPathChecks(parent: parent.appendingPathComponent("recording-paths"))
         try await sourceMacChecks(parent: parent.appendingPathComponent("source-macs"))
         try await templateLifecycleChecks(parent: parent.appendingPathComponent("template-lifecycle"))
         try await folderRequestConflictChecks(parent: parent.appendingPathComponent("folder-requests"))

@@ -246,7 +246,39 @@ public actor SharedLibraryMaterializer {
         return result
       }
     }
+    if operation.steps.allSatisfy({ if case .trash = $0 { return true }; return false }) {
+      return try await deletionCompletion(operation, receiptURL: receiptURL)
+    }
     return .complete
+  }
+  private func deletionCompletion(_ operation: SharedLibraryOperation, receiptURL: URL) async throws -> SharedMaterializationResult {
+    let checked = try await checkedAuthority(for: operation)
+    if let pending = checked.pending { return pending }
+    let permission = checked.permission
+    let root = self.root, receipts = self.receipts, gate = self.gate
+    let gateItems = try gate?.items(outside: root) ?? []
+    let bindings = permission.additionalBindings + (permission.binding.map { [$0] } ?? [])
+    for binding in bindings { _ = try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) }
+    return try await access.withWrites([.init(receiptURL)] + gateItems, reading: [root] + bindings.map(\.file)) { scopes in
+      if let gate { try gate.validate(scopes[1], outside: root) }
+      try Self.checkRoot(root)
+      guard scopes[gateItems.count + 1].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath(),
+            !permission.revisionLease.isRevoked, try permission.validateLocalCommit() else { return .needsReplanning }
+      let receipt = scopes[0]
+      guard Self.contained(receipt.url, in: receipts), receipt.url.standardizedFileURL == receiptURL.standardizedFileURL else { throw SharedLibraryOperationError.unsafePath }
+      let actual = try SharedOperationReceipt.decode(Data(contentsOf: receipt.url))
+      guard actual.operation == operation, actual.completed == operation.steps.count, !actual.attempting else { return .needsReplanning }
+      for (binding, scope) in zip(bindings, scopes.dropFirst(gateItems.count + 2)) {
+        guard scope.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
+              try binding.validate(Data(contentsOf: scope.url)) else { return .needsReplanning }
+      }
+      for path in operation.canonicalPaths {
+        let file = root.appendingPathComponent(path)
+        let placeholder = file.deletingLastPathComponent().appendingPathComponent("." + file.lastPathComponent + ".icloud")
+        if FileManager.default.fileExists(atPath: file.path) || FileManager.default.fileExists(atPath: placeholder.path) { return .needsReplanning }
+      }
+      return .complete
+    }
   }
   public func progress(entity: SharedEntityIdentity, libraryID: UUID) async throws
     -> SharedLibraryOperationProgress?
@@ -462,11 +494,18 @@ public actor SharedLibraryMaterializer {
         }
       }
       let sameDeletion = deletion && old.operation.steps == replacement.steps
-      guard pending == nil || sameDeletion else { throw SharedLibraryOperationError.invalidOperation }
+      let extendsDeletion = deletion && old.operation.steps.allSatisfy({ if case .trash = $0 { return true }; return false }) &&
+        replacement.steps.count >= old.operation.steps.count && Array(replacement.steps.prefix(old.operation.steps.count)) == old.operation.steps &&
+        Set(replacement.steps.compactMap { if case .trash(let path, _) = $0 { return path }; return nil }).count == replacement.steps.count
+      // Recording a reviewed move-to-cleanup conversion performs no removal.
+      // Fresh lifecycle/revision/cohort approvals are still required by replay.
+      // Other changed deletion recipes retain the stricter existing rule.
+      let moveToDeletion = deletion && old.operation.steps.allSatisfy { if case .move = $0 { return true }; return false }
+      guard pending == nil || sameDeletion || extendsDeletion || moveToDeletion else { throw SharedLibraryOperationError.invalidOperation }
       var receipt = SharedOperationReceipt(replacement)
       // Exact deletion steps retain durable partial/attempted progress. Starting
       // at zero would mistake already-trashed originals for missing cloud data.
-      if sameDeletion { receipt.completed = old.completed; receipt.attempting = old.attempting }
+      if sameDeletion || extendsDeletion { receipt.completed = old.completed; receipt.attempting = old.attempting; receipt.reviewedCleanups = old.reviewedCleanups }
       try scope.checkCancellation()
       try receipt.encoded().write(to: scope.url, options: .atomic)
     }
@@ -677,6 +716,7 @@ public actor SharedLibraryMaterializer {
     for step in operation.steps {
       switch step {
       case .trash:
+        if !authority.unplannedDeletionPaths.isEmpty { return .needsReplanning }
         guard authority.mayDestroy(.delete) else { return .waitingForAcknowledgments }
       case .removeEmptyDirectory:
         if authority.hasLiveDescendants { return .needsReplanning }
