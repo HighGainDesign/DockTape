@@ -18,6 +18,7 @@ struct SharedLibraryProjectionContext: Sendable {
     var completedFileIntents: [UUID: [String: String]] = [:]
     var absentPaths: [String] = []
     var physicalInputs: [URL: String] = [:]
+    var reviewedBootstrap: [String: String] = [:]
 }
 
 struct SharedProjectionRegistry: Codable, Sendable {
@@ -26,23 +27,28 @@ struct SharedProjectionRegistry: Codable, Sendable {
     let writerID: UUID
     let files: [String: SharedProjectionMarker]
     let pending: [String: SharedProjectionMarker]?
+    let attempted: [String: SharedProjectionMarker]?
     let checksum: String
     private struct Body: Codable {
         let schema: Int; let libraryID: UUID; let writerID: UUID
         let files: [String: SharedProjectionMarker]; let pending: [String: SharedProjectionMarker]?
+        let attempted: [String: SharedProjectionMarker]?
     }
-    init(library: UUID, writer: UUID, files: [String: SharedProjectionMarker], pending: [String: SharedProjectionMarker]? = nil) throws {
-        schema = 1; libraryID = library; writerID = writer; self.files = files; self.pending = pending
-        checksum = try SharedStateFingerprint.of(Body(schema: schema, libraryID: libraryID, writerID: writerID, files: files, pending: pending))
+    init(library: UUID, writer: UUID, files: [String: SharedProjectionMarker], pending: [String: SharedProjectionMarker]? = nil,
+         attempted: [String: SharedProjectionMarker]? = nil) throws {
+        schema = 1; libraryID = library; writerID = writer; self.files = files; self.pending = pending; self.attempted = attempted
+        checksum = try SharedStateFingerprint.of(Body(schema: schema, libraryID: libraryID, writerID: writerID, files: files, pending: pending, attempted: attempted))
     }
     func validate(library: UUID, writers: Set<UUID>) throws {
         guard schema == 1, libraryID == library, writers.contains(writerID),
-              checksum == (try SharedStateFingerprint.of(Body(schema: schema, libraryID: libraryID, writerID: writerID, files: files, pending: pending))) else {
+              checksum == (try SharedStateFingerprint.of(Body(schema: schema, libraryID: libraryID, writerID: writerID, files: files, pending: pending, attempted: attempted))) else {
             throw SharedProjectionWriteError.invalidRegistry
         }
-        for (path, marker) in files.merging(pending ?? [:], uniquingKeysWith: { _, new in new }) {
-            if path != ".templates.json" { _ = try SharedLibraryIdentity.normalized(path) }
-            guard marker.libraryID == libraryID else { throw SharedProjectionWriteError.invalidRegistry }
+        for entries in [files, pending ?? [:], attempted ?? [:]] {
+            for (path, marker) in entries {
+                if path != ".templates.json" { _ = try SharedLibraryIdentity.normalized(path) }
+                guard marker.libraryID == libraryID else { throw SharedProjectionWriteError.invalidRegistry }
+            }
         }
     }
     func encoded() throws -> Data {
@@ -69,8 +75,9 @@ struct SharedLibraryProjectionWriter {
             return result
         }
     }
-    static func project(_ context: SharedLibraryProjectionContext, writer: UUID,
+    static func project(_ context: SharedLibraryProjectionContext, writer: UUID, only selectedPath: String? = nil,
                         beforeWrite: @escaping @Sendable () async -> Void = {},
+                        beforeOutput: @escaping @Sendable (Int) throws -> Void = { _ in },
                         afterOutput: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedProjectionWriteResult {
         let root = context.root
         guard let seedBytes = try await RecordingFileAccess().readDataIfPresent(at: SharedProjectionInputs.file(in: root)) else {
@@ -78,7 +85,7 @@ struct SharedLibraryProjectionWriter {
         }
         let inputs = try JSONDecoder().decode(SharedProjectionInputs.self, from: seedBytes)
         try inputs.validate(manifest: context.manifest)
-        let outputs = try render(context)
+        let outputs = try render(context).filter { selectedPath == nil || $0.key == selectedPath }
         let registryDir = root.appendingPathComponent(".docktape/projections")
         guard SharedLibraryMaterializer.contained(registryDir, in: root) else { throw SharedLibraryOperationError.unsafePath }
         try FileManager.default.createDirectory(at: registryDir, withIntermediateDirectories: true)
@@ -136,7 +143,9 @@ struct SharedLibraryProjectionWriter {
                 }
             }
             var known = publications.first(where: { $0.writerID == writer })?.files ?? [:]
-            var changes: [(Int, String, Data)] = []
+            let previousPending = publications.first(where: { $0.writerID == writer })?.pending ?? [:]
+            var attempted = publications.first(where: { $0.writerID == writer })?.attempted ?? [:]
+            var changes: [(Int, String, Data, String?)] = []
             var unchanged = 0
             for (index, path) in paths.enumerated() {
                 let scope = scopes[index + 1]
@@ -167,20 +176,37 @@ struct SharedLibraryProjectionWriter {
                         let original = (reference.initialPath as NSString).deletingPathExtension + "." + desiredMarker.kind + ".json"
                         initial = inputs.files[original] == hash
                     }
+                    // Bootstrap bytes only authorize the first publication.
+                    // A later reappearance is an external change, even if it
+                    // has the same content hash as that original input.
+                    let componentPublications = publications.flatMap { Array($0.files.values) + Array(($0.attempted ?? [:]).values) }.filter { marker in
+                        guard let desiredMarker else { return false }
+                        return marker.libraryID == desiredMarker.libraryID && marker.kind == desiredMarker.kind && marker.entities == desiredMarker.entities
+                    }
+                    if ["library.json", ".templates.json"].contains(path) {
+                        if publications.contains(where: { $0.files[path] != nil || $0.attempted?[path] != nil }) { initial = false }
+                    } else if !componentPublications.isEmpty { initial = false }
                     let adopted: Bool
                     if let desiredMarker, desiredMarker.entities.count == 1,
                        let view = context.views.first(where: { $0.state.id == desiredMarker.entities[0] && $0.state.kind == .recording }),
                        let component = SharedComponent(rawValue: desiredMarker.kind),
-                       view.state.currentDocument(for: component)?.id == desiredMarker.generation {
+                       let generation = desiredMarker.generation,
+                       view.state.currentDocument(for: component)?.id == generation {
                         adopted = view.state.value(for: "externalAdoption." + desiredMarker.kind) == .text(try SharedStateFingerprint.of(existing))
+                            && view.state.value(for: "externalAdoptionGeneration." + desiredMarker.kind) == .text(generation.uuidString.lowercased())
+                            && !componentPublications.contains(where: { $0.generation == desiredMarker.generation })
                     } else { adopted = false }
-                    guard published || initial || adopted else { throw SharedProjectionWriteError.untracked(path) }
+                    let reviewed = ["library.json", ".templates.json"].contains(path)
+                        && context.reviewedBootstrap[path] == hash
+                    guard published || initial || adopted || reviewed else { throw SharedProjectionWriteError.untracked(path) }
                 }
-                changes.append((index + 1, path, desired))
+                changes.append((index + 1, path, desired, existing.map(SharedLibraryOperation.fingerprint)))
             }
             var proposed: [String: SharedProjectionMarker] = [:]
             for (path, bytes) in outputs where path.hasSuffix(".json") { proposed[path] = try SharedProjectionDocument.marker(in: bytes) }
-            let intent = try SharedProjectionRegistry(library: context.manifest.libraryID, writer: writer, files: known, pending: proposed).encoded()
+            let previousFiles = known
+            let pending = selectedPath == nil ? proposed : previousPending.merging(proposed, uniquingKeysWith: { _, new in new })
+            let intent = try SharedProjectionRegistry(library: context.manifest.libraryID, writer: writer, files: previousFiles, pending: pending, attempted: attempted.isEmpty ? nil : attempted).encoded()
             known.merge(proposed, uniquingKeysWith: { _, new in new })
             // Once the same entity/component is published at its new path,
             // an absent old sidecar needs no historical producer entry. Keep
@@ -192,14 +218,33 @@ struct SharedLibraryProjectionWriter {
                 let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
                 return FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path)
             }
-            let registry = try SharedProjectionRegistry(library: context.manifest.libraryID, writer: writer, files: known).encoded()
+            // A restore updates only the reviewed aggregate. Keep unrelated
+            // interrupted-publication evidence until those outputs complete.
+            let remainingPending = selectedPath == nil ? [:] : previousPending.filter { outputs[$0.key] == nil }
+            let remainingAttempts = selectedPath == nil ? [:] : attempted.filter { outputs[$0.key] == nil }
+            let registry = try SharedProjectionRegistry(library: context.manifest.libraryID, writer: writer, files: known,
+                pending: remainingPending.isEmpty ? nil : remainingPending,
+                attempted: remainingAttempts.isEmpty ? nil : remainingAttempts).encoded()
             for scope in scopes { try scope.checkCancellation() }
             guard !context.lease.isRevoked, try context.validate() else { throw SharedProjectionWriteError.stale }
             // The intent registry precedes output publication. An interruption
             // leaves old recognized bytes or new authorized bytes, never backups.
             let previousRegistry = try? Data(contentsOf: scopes[0].url)
             if !changes.isEmpty { try intent.write(to: scopes[0].url, options: .atomic) }
-            for (index, _, bytes) in changes {
+            for (index, path, bytes, expected) in changes {
+                if let marker = proposed[path] {
+                    // Spend input approval before the physical write. If the
+                    // process stops here, unknown source bytes need a new
+                    // review; an installed pending producer marker can replay.
+                    attempted[path] = marker
+                    let attempt = try SharedProjectionRegistry(library: context.manifest.libraryID, writer: writer,
+                        files: previousFiles, pending: pending, attempted: attempted).encoded()
+                    try attempt.write(to: scopes[0].url, options: .atomic)
+                }
+                try beforeOutput(index)
+                let current = FileManager.default.fileExists(atPath: scopes[index].url.path)
+                    ? SharedLibraryOperation.fingerprint(try Data(contentsOf: scopes[index].url)) : nil
+                guard current == expected else { throw SharedProjectionWriteError.stale }
                 try bytes.write(to: scopes[index].url, options: .atomic)
                 try afterOutput(index)
             }
@@ -207,7 +252,7 @@ struct SharedLibraryProjectionWriter {
             return .init(written: changes.count, unchanged: unchanged)
         }
     }
-    private static func render(_ context: SharedLibraryProjectionContext) throws -> [String: Data] {
+    static func render(_ context: SharedLibraryProjectionContext) throws -> [String: Data] {
         let views = context.views
         let pathStates = views.map { view -> SharedEntityState in
             let fields = view.state.kind == .folder ? ["name", "parent"] : ["title", "folder"]

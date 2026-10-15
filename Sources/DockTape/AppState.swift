@@ -94,6 +94,7 @@ final class AppState {
     private var pollingTask: Task<Void, Never>?
     private(set) var playbackTranscriptTask: Task<Void, Never>?
     private var playbackTranscriptRequestID = UUID()
+    private var libraryRefreshRequest = UUID()
 
     init(baseDirectory: URL? = nil,
          sharedIdentity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity = { try await SharedWriterIdentityFactory().load() },
@@ -225,10 +226,12 @@ final class AppState {
 
     /// Refresh library, transcript statuses, and summary statuses from disk.
     /// Called on app activate to pick up external filesystem changes.
-    func refreshAll(refreshShared: Bool = true) async {
+    func refreshAll(refreshShared: Bool = true, beforePublication: @MainActor () async throws -> Void = {}) async {
+        guard !Task.isCancelled else { return }
+        let request = UUID(); libraryRefreshRequest = request
         let currentLibrary = library, currentTranscription = transcription, currentSummary = summarization
         let currentTemplates = templateStore, bound = sharedLibrary.coordinator
-        func stillBound() -> Bool { library === currentLibrary && sharedLibrary.coordinator === bound }
+        func stillBound() -> Bool { !Task.isCancelled && libraryRefreshRequest == request && library === currentLibrary && sharedLibrary.coordinator === bound }
         if let bound {
             do {
                 if refreshShared { try await bound.refresh() }
@@ -237,11 +240,17 @@ final class AppState {
                 guard stillBound() else { return }
                 try await currentTemplates.load()
                 guard stillBound() else { return }
-                if sharedLibrary.phase == .ready { _ = try await bound.projectOutputs() }
+                if sharedLibrary.phase == .ready {
+                    try await beforePublication()
+                    guard stillBound() else { return }
+                    _ = try await bound.projectOutputs()
+                }
                 guard stillBound() else { return }
                 sharedLibrary.message = nil
             } catch SharedProjectionWriteError.untracked {
                 if stillBound() { sharedLibrary.message = "A file changed outside DockTape. Open Shared Library Review → External Files to compare and recover it." }
+            } catch SharedProjectionWriteError.stale {
+                if stillBound() { sharedLibrary.message = "The library changed while refreshing. Refresh again after sync settles." }
             } catch { if stillBound() { sharedLibrary.message = error.localizedDescription } }
         }
         await currentLibrary.refresh()

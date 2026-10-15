@@ -77,7 +77,7 @@ final class SharedLibraryState {
                 switch event {
                 case .loading: continue
                 case .failure(let text): self.message = text
-                case .entity:
+                case .entity, .files:
                     self.refreshTask?.cancel()
                     self.refreshTask = Task { [weak self] in
                         do { try await Task.sleep(for: .milliseconds(150)) } catch { return }

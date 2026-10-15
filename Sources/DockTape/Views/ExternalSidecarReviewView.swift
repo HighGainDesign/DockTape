@@ -36,6 +36,11 @@ struct ExternalSidecarReviewView: View {
                                 }
                                 Text("Your choice replaces this file and updates its readable exports. Unrelated recordings are unchanged.")
                                     .font(.callout).foregroundStyle(.secondary)
+                            } else if let bootstrap = item.bootstrap {
+                                GroupBox("Current in DockTape") { preview(bootstrap.currentText) }
+                                GroupBox("File on disk") { preview(bootstrap.changedText) }
+                                Text("Publishing this library file was interrupted, or its original content reappeared. Restore the current content to finish updating the library.")
+                                    .font(.callout).foregroundStyle(.secondary)
                             } else if let error = item.error { Text(error).foregroundStyle(.orange) }
                         } else {
                             Text(model.isLoading ? "Checking files…" : (model.items.isEmpty ? "No external file changes found" : "Select a file to compare"))
@@ -57,7 +62,7 @@ struct ExternalSidecarReviewView: View {
         .task(id: state.sharedLibrary.revision) { await reload() }
         .onChange(of: model.items.map(\.id)) { _, ids in if !ids.contains(selected ?? "") { selected = ids.first } }
     }
-    private var canApply: Bool { item?.review != nil && state.sharedLibrary.phase == .ready && !model.isApplying }
+    private var canApply: Bool { (item?.review != nil || item?.bootstrap != nil) && state.sharedLibrary.phase == .ready && !model.isApplying }
     private func preview(_ text: String) -> some View {
         Text(text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(4)
     }

@@ -404,7 +404,9 @@ public actor SharedLibraryMaterializer {
     guard try Self.check(operation, authority: current) == nil,
       current.state.value(for: "externalAdoption." + candidate.component.rawValue)
         == .text(candidate.fingerprint),
-      current.state.currentDocument(for: candidate.component)?.json == candidate.document.json
+      let selected = current.state.currentDocument(for: candidate.component),
+      current.state.value(for: "externalAdoptionGeneration." + candidate.component.rawValue) == .text(selected.id.uuidString.lowercased()),
+      selected.json == candidate.document.json
     else {
       throw SharedLibraryOperationError.invalidOperation
     }

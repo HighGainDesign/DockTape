@@ -23,6 +23,103 @@ final class SharedLibraryProjectionWriterTests: XCTestCase {
         _ = try await coordinator.enable()
         return (root, coordinator)
     }
+    func testInterruptedBootstrapAggregateHasExplicitRecovery() async throws {
+        struct Interrupted: Error {}
+        for output in [1, 5] {
+            let (root, coordinator) = try await fixture()
+            do {
+                _ = try await coordinator.projectOutputs(beforeOutput: { index in
+                    if index == output { throw Interrupted() }
+                })
+                XCTFail("Expected interruption")
+            } catch is Interrupted {}
+            let path = output == 1 ? ".templates.json" : "library.json"
+            do { _ = try await coordinator.projectOutputs(); XCTFail("Ordinary replay must require new consent") }
+            catch SharedProjectionWriteError.untracked(let blocked) { XCTAssertEqual(blocked, path) }
+            let reviews = try await coordinator.reviewBootstrapProjections()
+            let review = try XCTUnwrap(reviews.first(where: { $0.filename == path }))
+            _ = try await coordinator.restoreBootstrapProjection(review)
+            _ = try await coordinator.projectOutputs()
+            let settled = try await coordinator.projectOutputs()
+            XCTAssertEqual(settled.written, 0)
+            XCTAssertNotNil(try SharedProjectionDocument.marker(in: Data(contentsOf: root.appendingPathComponent("library.json"))))
+        }
+    }
+
+    func testBootstrapReviewCannotReplayConsentForReappearedBytes() async throws {
+        let (root, coordinator) = try await fixture()
+        let url = root.appendingPathComponent(".templates.json")
+        let original = try Data(contentsOf: url)
+        _ = try await coordinator.projectOutputs()
+        try original.write(to: url)
+        let reviews = try await coordinator.reviewBootstrapProjections()
+        let review = try XCTUnwrap(reviews.first(where: { $0.filename == ".templates.json" }))
+        _ = try await coordinator.restoreBootstrapProjection(review)
+        try original.write(to: url)
+        do { _ = try await coordinator.restoreBootstrapProjection(review); XCTFail("Consumed review must not authorize a later occurrence") }
+        catch SharedLibraryCoordinatorError.staleReview {}
+        XCTAssertEqual(try Data(contentsOf: url), original)
+    }
+
+    func testInterruptedBootstrapSidecarCanBeReviewedBeforeLibraryPublication() async throws {
+        let (root, coordinator) = try await fixture()
+        let url = root.appendingPathComponent("Meeting.transcript.json")
+        let original = try Data(contentsOf: url)
+        do { _ = try await coordinator.projectOutputs(beforeOutput: { index in if index == 2 { throw CancellationError() } }); XCTFail("Expected interruption") }
+        catch is CancellationError {}
+        let view = try await coordinator.recording(at: "Meeting.mp3")
+        let reviews = try await coordinator.reviewSidecars(.init(id: view.state.id, kind: .recording))
+        XCTAssertEqual(reviews.count, 1, "A spent bootstrap approval must be actionable even before library.json publication")
+        if let review = reviews.first {
+            _ = try await coordinator.recoverSidecar(review, useChangedFile: false)
+            _ = try await coordinator.projectOutputs()
+        }
+        XCTAssertNotEqual(try Data(contentsOf: url), original)
+    }
+
+    func testTwoReappearedBootstrapAggregatesCanBeRestoredIndependently() async throws {
+        let (root, coordinator) = try await fixture()
+        let names = [".templates.json", "library.json"]
+        let originals = try Dictionary(uniqueKeysWithValues: names.map { ($0, try Data(contentsOf: root.appendingPathComponent($0))) })
+        _ = try await coordinator.projectOutputs()
+        for path in names { try originals[path]!.write(to: root.appendingPathComponent(path)) }
+        var reviews = try await coordinator.reviewBootstrapProjections()
+        XCTAssertEqual(reviews.count, 2)
+        _ = try await coordinator.restoreBootstrapProjection(XCTUnwrap(reviews.first { $0.filename == ".templates.json" }))
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("library.json")), originals["library.json"])
+        reviews = try await coordinator.reviewBootstrapProjections()
+        _ = try await coordinator.restoreBootstrapProjection(XCTUnwrap(reviews.first { $0.filename == "library.json" }))
+        let remaining = try await coordinator.reviewBootstrapProjections()
+        XCTAssertTrue(remaining.isEmpty)
+        _ = try await coordinator.projectOutputs()
+    }
+
+    private actor PublicationGate {
+        var waiting = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        func wait() async { waiting = true; await withCheckedContinuation { continuation = $0 } }
+        func release() { continuation?.resume(); continuation = nil }
+    }
+    func testCleanBootstrapInspectionDoesNotRequirePublicationAuthorityDuringAnEdit() async throws {
+        let (root, initial) = try await fixture()
+        _ = try await initial.projectOutputs()
+        let gate = PublicationGate()
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: initial.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"), afterCommit: { await gate.wait() })
+        let view = try await coordinator.recording(at: "Meeting.mp3")
+        let editing = Task { try await coordinator.edit(.init(base: view, changes: [.assign(field: "metadata.mode", value: .text("\"Mee\""))])) }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !(await gate.waiting) {
+            if ContinuousClock.now >= deadline { await gate.release(); throw CancellationError() }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        do {
+            let reviews = try await coordinator.reviewBootstrapProjections()
+            XCTAssertTrue(reviews.isEmpty, "Clean marked aggregates need no mutation authority or error row")
+        } catch { await gate.release(); _ = try? await editing.value; throw error }
+        await gate.release(); _ = try await editing.value
+    }
+
     func testFirstProjectionWithExplicitPrivateTmpRootAcceptsItsCoordinatedDirectory() async throws {
         let requested = URL(fileURLWithPath: "/private/tmp/DockTapeProjectionAlias-" + UUID().uuidString + "/data")
         roots.append(requested.deletingLastPathComponent())
@@ -319,6 +416,134 @@ final class SharedLibraryProjectionWriterTests: XCTestCase {
         try unseen.write(to: url, options: .atomic)
         do { _ = try await coordinator.projectOutputs(); XCTFail("Never overwrite a file changed after acceptance") }
         catch SharedProjectionWriteError.untracked(let path) { XCTAssertEqual(path, "Meeting.transcript.json") }
+        XCTAssertEqual(try Data(contentsOf: url), unseen)
+    }
+
+    func testCompletedExternalApprovalCannotAuthorizeReappearanceOrLaterGeneration() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let entity = SharedEntityIdentity(id: try await coordinator.recording(at: "Meeting.mp3").state.id, kind: .recording)
+        let url = root.appendingPathComponent("Meeting.transcript.json")
+        let external = Data("{damaged external file requiring one review".utf8)
+        try external.write(to: url, options: .atomic)
+        let reviews = try await coordinator.reviewSidecars(entity)
+        _ = try await coordinator.recoverSidecar(XCTUnwrap(reviews.first), useChangedFile: false)
+        _ = try await coordinator.projectOutputs()
+        try external.write(to: url, options: .atomic)
+        do { _ = try await coordinator.projectOutputs(); XCTFail("Completed approval cannot silently consume a new occurrence") }
+        catch SharedProjectionWriteError.untracked(let path) { XCTAssertEqual(path, "Meeting.transcript.json") }
+        XCTAssertEqual(try Data(contentsOf: url), external)
+        let fresh = try await coordinator.read(entity)
+        let next = Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "new generation", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "A later current transcript")])
+        _ = try await coordinator.edit(.init(base: fresh, changes: [.generation(try SharedDocument(id: UUID(), json: JSONEncoder().encode(next)), component: .transcript)]))
+        try external.write(to: url, options: .atomic)
+        do { _ = try await coordinator.projectOutputs(); XCTFail("A different generation cannot inherit previous file approval") }
+        catch SharedProjectionWriteError.untracked(let path) { XCTAssertEqual(path, "Meeting.transcript.json") }
+        XCTAssertEqual(try Data(contentsOf: url), external)
+    }
+
+    func testBootstrapInputApprovalCannotBeReusedAfterCanonicalPublication() async throws {
+        let (root, coordinator) = try await fixture()
+        let paths = ["Meeting.transcript.json", "library.json", ".templates.json"]
+        let originals = try Dictionary(uniqueKeysWithValues: paths.map { ($0, try Data(contentsOf: root.appendingPathComponent($0))) })
+        _ = try await coordinator.projectOutputs()
+        let canonical = try Dictionary(uniqueKeysWithValues: paths.map { ($0, try Data(contentsOf: root.appendingPathComponent($0))) })
+        for path in paths {
+            let url = root.appendingPathComponent(path), old = originals[path]!
+            try old.write(to: url, options: .atomic)
+            do { _ = try await coordinator.projectOutputs(); XCTFail("Published bootstrap bytes need a new review: " + path) }
+            catch SharedProjectionWriteError.untracked(let rejected) { XCTAssertEqual(rejected, path) }
+            XCTAssertEqual(try Data(contentsOf: url), old)
+            try canonical[path]!.write(to: url, options: .atomic)
+        }
+    }
+
+    func testExternalApprovalSurvivesPendingProjectionBeforeSidecarWrite() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let view = try await coordinator.recording(at: "Meeting.mp3")
+        let entity = SharedEntityIdentity(id: view.state.id, kind: .recording)
+        let url = root.appendingPathComponent("Meeting.transcript.json")
+        var body = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        body["transcriptionModel"] = "Reviewed external generation"
+        let bytes = try JSONSerialization.data(withJSONObject: body, options: .sortedKeys)
+        try bytes.write(to: url, options: .atomic)
+        let inspected = try await coordinator.inspectExternal(entity, component: .transcript, at: url)
+        _ = try await coordinator.adoptExternal(XCTUnwrap(inspected), review: view)
+        do {
+            _ = try await coordinator.projectOutputs(afterOutput: { index in if index == 1 { throw CancellationError() } })
+            XCTFail("Interrupt after aggregate output but before sidecar write")
+        } catch is CancellationError { }
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        _ = try await coordinator.projectOutputs()
+        let transcript = try SharedContentCoding.decoder().decode(Transcript.self, from: Data(contentsOf: url))
+        XCTAssertEqual(transcript.transcriptionModel, "Reviewed external generation")
+        let remaining = try await coordinator.reviewSidecars(entity)
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testInterruptedSidecarWriteCannotReplayExternalOrBootstrapConsent() async throws {
+        for explicit in [false, true] {
+            let (root, coordinator) = try await fixture()
+            let url = root.appendingPathComponent("Meeting.transcript.json")
+            var original = try Data(contentsOf: url)
+            if explicit {
+                _ = try await coordinator.projectOutputs()
+                original = Data("{reviewed damaged input".utf8)
+                try original.write(to: url, options: .atomic)
+                let entity = SharedEntityIdentity(id: try await coordinator.recording(at: "Meeting.mp3").state.id, kind: .recording)
+                let reviews = try await coordinator.reviewSidecars(entity)
+                _ = try await coordinator.recoverSidecar(XCTUnwrap(reviews.first), useChangedFile: false)
+            }
+            do {
+                _ = try await coordinator.projectOutputs(afterOutput: { index in if index == 2 { throw CancellationError() } })
+                XCTFail("Interrupt after the actual sidecar write")
+            } catch is CancellationError { }
+            XCTAssertNotNil(try SharedProjectionDocument.marker(in: Data(contentsOf: url)))
+            try original.write(to: url, options: .atomic)
+            do { _ = try await coordinator.projectOutputs(); XCTFail("Interrupted sidecar write cannot reuse consent: explicit=\(explicit)") }
+            catch SharedProjectionWriteError.untracked(let path) { XCTAssertEqual(path, "Meeting.transcript.json") }
+            XCTAssertEqual(try Data(contentsOf: url), original)
+        }
+    }
+
+    func testInterruptedBeforeSidecarWriteRequiresFreshReviewAndCanRecover() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let entity = SharedEntityIdentity(id: try await coordinator.recording(at: "Meeting.mp3").state.id, kind: .recording)
+        let url = root.appendingPathComponent("Meeting.transcript.json")
+        let raw = Data("{reviewed pending input".utf8)
+        try raw.write(to: url, options: .atomic)
+        let first = try await coordinator.reviewSidecars(entity)
+        _ = try await coordinator.recoverSidecar(XCTUnwrap(first.first), useChangedFile: false)
+        do {
+            _ = try await coordinator.projectOutputs(beforeOutput: { index in if index == 2 { throw CancellationError() } })
+            XCTFail("Stop after the durable attempt but before the sidecar write")
+        } catch is CancellationError { }
+        XCTAssertEqual(try Data(contentsOf: url), raw)
+        do { _ = try await coordinator.projectOutputs(); XCTFail("Uncertain raw input needs a new review") }
+        catch SharedProjectionWriteError.untracked { }
+        let fresh = try await coordinator.reviewSidecars(entity)
+        _ = try await coordinator.recoverSidecar(XCTUnwrap(fresh.first), useChangedFile: false)
+        _ = try await coordinator.projectOutputs()
+        XCTAssertNotNil(try SharedProjectionDocument.marker(in: Data(contentsOf: url)))
+    }
+    func testSourceChangedAtOutputBoundaryCannotBeOverwritten() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let entity = SharedEntityIdentity(id: try await coordinator.recording(at: "Meeting.mp3").state.id, kind: .recording)
+        let url = root.appendingPathComponent("Meeting.transcript.json")
+        try Data("{reviewed source".utf8).write(to: url, options: .atomic)
+        let reviews = try await coordinator.reviewSidecars(entity)
+        _ = try await coordinator.recoverSidecar(XCTUnwrap(reviews.first), useChangedFile: false)
+        let unseen = Data("{unseen input arrived at the output boundary".utf8)
+        do {
+            _ = try await coordinator.projectOutputs(beforeOutput: { index in
+                if index == 2 { try unseen.write(to: url, options: .atomic) }
+            })
+            XCTFail("Unseen input must survive a change during publication")
+        } catch SharedProjectionWriteError.stale { }
         XCTAssertEqual(try Data(contentsOf: url), unseen)
     }
 

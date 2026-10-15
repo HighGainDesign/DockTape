@@ -594,6 +594,7 @@ final class SharedLibraryOperationTests: XCTestCase {
     try auth.state.assignGeneration(document, component: .transcript, writer: f.writer)
     try auth.state.assign(
       field: "externalAdoption.transcript", value: .text(fingerprint), writer: f.writer)
+    try auth.state.assign(field: "externalAdoptionGeneration.transcript", value: .text(document.id.uuidString.lowercased()), writer: f.writer)
     auth.pathOwners["new.transcript.json"] = [f.entity.id]
     await f.authority.update(auth)
     let op = try SharedLibraryOperation(

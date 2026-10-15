@@ -103,9 +103,22 @@ public struct SharedSidecarReview: Identifiable, Sendable {
   let current: SharedDocument
   let changed: SharedDocument?
 }
+/// Exact, short-lived consent to restore a bootstrap aggregate whose first
+/// publication may have been interrupted. No external metadata is adopted.
+public struct SharedBootstrapProjectionReview: Identifiable, Sendable {
+  public let id: String
+  public let filename: String
+  public let currentText: String
+  public let changedText: String
+  let root: URL
+  let libraryID: UUID
+  let fingerprint: String
+  let outputFingerprint: String
+}
 public enum SharedLibraryChange: Sendable {
   case loading(UUID, SharedEntityIdentity)
   case entity(UUID, SharedEntityIdentity, String)
+  case files(UUID)
   case failure(String)
 }
 
@@ -115,6 +128,7 @@ public enum SharedLibraryChange: Sendable {
 public actor SharedLibraryCoordinator {
   public nonisolated let root: URL
   public nonisolated let writerID: UUID
+  private var bootstrapReviewTickets: Set<String> = []
   private let bootstrap: LegacyLibraryBootstrap
   private let versionAccess: RecordingFileVersionAccess
   private let repository: SharedLibraryRepository
@@ -252,11 +266,22 @@ public actor SharedLibraryCoordinator {
     monitorRefresh?.cancel()
     monitorRefresh = Task { [weak self] in
       guard let self else { return }
-      do { try await self.refresh() } catch {
+      do {
+        try await self.refresh()
+        try Task.checkCancellation()
+        let manifest = try await self.bind()
+        await self.reportFileChange(library: manifest.libraryID)
+      } catch {
         guard !Task.isCancelled else { return }
         await self.reportRefreshError(error.localizedDescription)
       }
     }
+  }
+  private func reportFileChange(library: UUID) {
+    guard monitor != nil, !Task.isCancelled else { return }
+    // Canonical sidecar/provider changes may leave every authoritative entity
+    // unchanged. Consumers still need to inspect/review those actual files.
+    for listener in listeners.values { listener.yield(.files(library)) }
   }
   private func reportRefreshError(_ message: String) {
     guard monitor != nil else { return }
@@ -1626,9 +1651,61 @@ public actor SharedLibraryCoordinator {
     throw SharedProjectionWriteError.stale
   }
   public func projectOutputs(beforeWrite: @escaping @Sendable () async -> Void = {},
+                             beforeOutput: @escaping @Sendable (Int) throws -> Void = { _ in },
                              afterOutput: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedProjectionWriteResult {
     let context = try await projectionContext()
-    return try await SharedLibraryProjectionWriter.project(context, writer: writerID, beforeWrite: beforeWrite, afterOutput: afterOutput)
+    return try await SharedLibraryProjectionWriter.project(context, writer: writerID, beforeWrite: beforeWrite, beforeOutput: beforeOutput, afterOutput: afterOutput)
+  }
+  public func reviewBootstrapProjections() async throws -> [SharedBootstrapProjectionReview] {
+    let manifest = try await bind(force: true)
+    let inputs = try JSONDecoder().decode(SharedProjectionInputs.self,
+      from: await CoordinatedFileAccess().read(at: SharedProjectionInputs.file(in: root)))
+    try inputs.validate(manifest: manifest)
+    var candidates: [String: Data] = [:]
+    for path in [".templates.json", "library.json"] {
+      if let bytes = try await RecordingFileAccess().readDataIfPresent(at: root.appendingPathComponent(path)),
+        inputs.files[path] == SharedLibraryOperation.fingerprint(bytes) { candidates[path] = bytes }
+    }
+    // Ordinary marked outputs cannot be bootstrap recovery candidates. Reading
+    // them must not acquire mutation authority or fail during another edit.
+    guard !candidates.isEmpty else {
+      try Task.checkCancellation(); bootstrapReviewTickets.removeAll(); return []
+    }
+    let context = try await projectionContext()
+    let outputs = try SharedLibraryProjectionWriter.render(context)
+    let directory = root.appendingPathComponent(".docktape/projections")
+    var consumed: Set<String> = []
+    for file in LibraryFileDiscovery.files(in: directory, suffix: ".json") {
+      let registry = try JSONDecoder().decode(SharedProjectionRegistry.self,
+        from: await CoordinatedFileAccess().read(at: directory.appendingPathComponent(file.relativePath)))
+      try registry.validate(library: context.manifest.libraryID, writers: context.membership.cohort)
+      consumed.formUnion(registry.files.keys); consumed.formUnion((registry.attempted ?? [:]).keys)
+    }
+    var result: [SharedBootstrapProjectionReview] = []
+    for path in [".templates.json", "library.json"] where consumed.contains(path) {
+      guard let output = outputs[path],
+        let bytes = candidates[path], bytes != output else { continue }
+      result.append(.init(id: UUID().uuidString, filename: path, currentText: String(decoding: output, as: UTF8.self),
+        changedText: String(decoding: bytes, as: UTF8.self), root: root, libraryID: context.manifest.libraryID,
+        fingerprint: SharedLibraryOperation.fingerprint(bytes), outputFingerprint: SharedLibraryOperation.fingerprint(output)))
+    }
+    try Task.checkCancellation()
+    bootstrapReviewTickets = Set(result.map(\.id))
+    return result
+  }
+  public func restoreBootstrapProjection(_ review: SharedBootstrapProjectionReview) async throws -> SharedProjectionWriteResult {
+    guard review.root == root else { throw SharedLibraryCoordinatorError.differentBinding }
+    guard bootstrapReviewTickets.remove(review.id) != nil else { throw SharedLibraryCoordinatorError.staleReview }
+    var context = try await projectionContext()
+    guard context.manifest.libraryID == review.libraryID,
+      let output = try SharedLibraryProjectionWriter.render(context)[review.filename],
+      SharedLibraryOperation.fingerprint(output) == review.outputFingerprint,
+      let bytes = try await RecordingFileAccess().readDataIfPresent(at: root.appendingPathComponent(review.filename)),
+      SharedLibraryOperation.fingerprint(bytes) == review.fingerprint else { throw SharedLibraryCoordinatorError.externalChanged }
+    // This permission exists only for this call. The writer rechecks the actual
+    // input immediately before replacement and persists an attempt first.
+    context.reviewedBootstrap[review.filename] = review.fingerprint
+    return try await SharedLibraryProjectionWriter.project(context, writer: writerID, only: review.filename)
   }
   private func projectionContext() async throws -> SharedLibraryProjectionContext {
     guard transitions == 0 else { throw SharedProjectionWriteError.stale }
@@ -2149,7 +2226,8 @@ public actor SharedLibraryCoordinator {
     // generation prevents applying those edits a second time after recovery.
     return try await commit(.init(base: review.snapshot, changes: [
       .generation(document, component: review.component),
-      .assign(field: "externalAdoption." + review.component.rawValue, value: .text(review.fingerprint))
+      .assign(field: "externalAdoption." + review.component.rawValue, value: .text(review.fingerprint)),
+      .assign(field: "externalAdoptionGeneration." + review.component.rawValue, value: .text(document.id.uuidString.lowercased()))
     ]), review: true, exact: true)
   }
   private static func sidecarText(_ document: SharedDocument, component: SharedComponent) throws -> String {
@@ -2203,7 +2281,9 @@ public actor SharedLibraryCoordinator {
     guard checked.json == candidate.document.json else { throw SharedLibraryCoordinatorError.externalChanged }
     let marker = "externalAdoption." + candidate.component.rawValue
     if fresh.state.value(for: marker) == .text(candidate.fingerprint),
-      fresh.state.currentDocument(for: candidate.component)?.json == candidate.document.json
+      let selected = fresh.state.currentDocument(for: candidate.component),
+      fresh.state.value(for: "externalAdoptionGeneration." + candidate.component.rawValue) == .text(selected.id.uuidString.lowercased()),
+      selected.json == candidate.document.json
     {
       return fresh
     }
@@ -2216,6 +2296,7 @@ public actor SharedLibraryCoordinator {
         changes: [
           .generation(document, component: candidate.component),
           .assign(field: marker, value: .text(candidate.fingerprint)),
+          .assign(field: "externalAdoptionGeneration." + candidate.component.rawValue, value: .text(document.id.uuidString.lowercased())),
         ]))
   }
 

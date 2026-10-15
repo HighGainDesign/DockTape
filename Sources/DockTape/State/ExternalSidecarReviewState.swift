@@ -10,6 +10,11 @@ final class ExternalSidecarReviewState {
         let title: String
         let review: SharedSidecarReview?
         let error: String?
+        let bootstrap: SharedBootstrapProjectionReview?
+        init(id: String, title: String, review: SharedSidecarReview? = nil, error: String? = nil,
+             bootstrap: SharedBootstrapProjectionReview? = nil) {
+            self.id = id; self.title = title; self.review = review; self.error = error; self.bootstrap = bootstrap
+        }
     }
     private(set) var items: [Item] = []
     private(set) var isLoading = false
@@ -36,6 +41,16 @@ final class ExternalSidecarReviewState {
                 guard request == ticket, self.coordinator === coordinator, !Task.isCancelled else { return }
                 items = []
                 await withTaskGroup(of: [Item].self) { group in
+                    group.addTask {
+                        do {
+                            return try await coordinator.reviewBootstrapProjections().map {
+                                Item(id: $0.id, title: $0.filename == "library.json" ? "Library metadata" : "Summary templates", bootstrap: $0)
+                            }
+                        } catch {
+                            return [Item(id: "bootstrap-inspection", title: "Library metadata and templates",
+                                error: "These files could not be checked. Wait for sync, then reload.")]
+                        }
+                    }
                     for snapshot in snapshots where snapshot.state.lifecycle == .alive {
                         group.addTask {
                             let entity = SharedEntityIdentity(id: snapshot.state.id, kind: .recording)
@@ -68,7 +83,7 @@ final class ExternalSidecarReviewState {
     }
 
     func apply(_ item: Item, useChangedFile: Bool, using coordinator: SharedLibraryCoordinator) async -> Bool {
-        guard self.coordinator === coordinator, !isApplying, let review = item.review else { return false }
+        guard self.coordinator === coordinator, !isApplying, item.review != nil || (item.bootstrap != nil && !useChangedFile) else { return false }
         // Consent belongs to the completed row; an unrelated pending scan
         // cannot disable it or later restore its stale choices.
         scan?.cancel(); scan = nil
@@ -79,7 +94,11 @@ final class ExternalSidecarReviewState {
             do {
                 try Task.checkCancellation()
                 guard request == ticket, self.coordinator === coordinator else { return false }
-                _ = try await coordinator.recoverSidecar(review, useChangedFile: useChangedFile)
+                if let review = item.review {
+                    _ = try await coordinator.recoverSidecar(review, useChangedFile: useChangedFile)
+                } else if let bootstrap = item.bootstrap {
+                    _ = try await coordinator.restoreBootstrapProjection(bootstrap)
+                }
                 var publicationFailed = false
                 do { _ = try await coordinator.projectOutputs() }
                 catch { publicationFailed = true }

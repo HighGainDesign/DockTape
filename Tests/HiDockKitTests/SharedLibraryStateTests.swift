@@ -120,6 +120,33 @@ final class SharedLibraryStateTests: XCTestCase {
         XCTAssertFalse(joined.conflicts.isEmpty)
     }
 
+    func testSelectingContentClearsObservedCompetingFileApprovals() throws {
+        let alpha = try SharedDocument(id: oldGeneration, json: Data("{\"text\":\"alpha\"}".utf8))
+        let beta = try SharedDocument(id: newGeneration, json: Data("{\"text\":\"beta\"}".utf8))
+        var left = SharedEntityState(id: recording, kind: .recording)
+        var right = left
+        try left.assignGeneration(alpha, component: .transcript, writer: a)
+        try right.assignGeneration(beta, component: .transcript, writer: b)
+        for (writer, document, hash) in [(a, alpha, "alpha-hash"), (b, beta, "beta-hash")] {
+            if writer == a {
+                try left.assign(field: "externalAdoption.transcript", value: .text(hash), writer: writer)
+                try left.assign(field: "externalAdoptionGeneration.transcript", value: .text(document.id.uuidString.lowercased()), writer: writer)
+            } else {
+                try right.assign(field: "externalAdoption.transcript", value: .text(hash), writer: writer)
+                try right.assign(field: "externalAdoptionGeneration.transcript", value: .text(document.id.uuidString.lowercased()), writer: writer)
+            }
+        }
+        var joined = try left.merged(with: right)
+        XCTAssertEqual(joined.conflicts.count, 3)
+        let stale = joined
+        try joined.assignGeneration(alpha, component: .transcript, writer: a)
+        joined = try joined.merged(with: stale)
+        XCTAssertEqual(joined.currentDocument(for: .transcript), alpha)
+        XCTAssertNil(joined.value(for: "externalAdoption.transcript"))
+        XCTAssertNil(joined.value(for: "externalAdoptionGeneration.transcript"))
+        XCTAssertTrue(joined.conflicts.isEmpty, "Content selection must also resolve its observed obsolete file approvals")
+    }
+
     func testIndependentActionItemsCombineWithinTheSameGeneration() throws {
         let document = try SharedDocument(id: oldGeneration, json: Data("{\"sections\":[]}".utf8))
         var base = SharedEntityState(id: recording, kind: .recording)

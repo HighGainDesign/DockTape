@@ -27,7 +27,15 @@ struct DockTapeSharedLibraryTests {
         func release() { continuation?.resume(); continuation = nil }
     }
     @MainActor static func main() async {
-        do { try await run() }
+        do {
+            if CommandLine.arguments.contains("--refresh-notifications-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeRefresh-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await refreshStatusChecks(parent: parent)
+            } else { try await run() }
+        }
         catch { fputs("Shared AppState checks failed: \(error)\n", stderr); exit(1) }
     }
     @MainActor static func run() async throws {
@@ -92,7 +100,7 @@ struct DockTapeSharedLibraryTests {
         let before = try await peer.recording(at: "Meeting.mp3")
         _ = try await peer.edit(.init(base: before, changes: [.assign(field: "metadata.mode", value: .text("\"Mee\""))]))
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while await state.library.store.mode(for: "Meeting.mp3") != "Mee" {
+        while await state.library.store.mode(for: "Meeting.mp3") != "Mee" || state.sharedLibrary.revision <= revision {
             guard ContinuousClock.now < deadline else { throw Failure(description: "Independent coordinator edit did not refresh app metadata") }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -169,6 +177,7 @@ struct DockTapeSharedLibraryTests {
         try await mergeSelectionChecks(parent: parent, identity: identity)
         try await folderRenameChecks(parent: parent, identity: identity)
         try await folderDeleteLibraryChecks(parent: parent)
+        try await refreshStatusChecks(parent: parent)
         print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions, reconnect and ID-bound merge/original deletion and folder rename/delete.")
     }
     @MainActor static func mergeSelectionChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {
@@ -269,6 +278,125 @@ struct DockTapeSharedLibraryTests {
         try expect(state.errorMessage == nil && state.selectedView == .allRecordings && state.library.selectedFolder == nil && state.library.folders.isEmpty && state.library.recordings.isEmpty, "Actual app action must clear the removed folder and refresh descendants: " + (state.errorMessage ?? ""))
         try expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path), "Actual app action must complete acknowledged empty-directory cleanup")
         await state.sharedLibrary.close()
+    }
+
+    @MainActor static func refreshStatusChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("refresh-status")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("synthetic refresh audio".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+        try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Current synthetic transcript")]), mp3Filename: "Meeting.mp3")
+        let identityFile = parent.appendingPathComponent("refresh-identity.json")
+        let identity = try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "refresh fixture").load()
+        let witness = parent.appendingPathComponent("refresh-witnesses")
+        let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: witness)
+        _ = try await seed.enable(); try await seed.refresh(); _ = try await seed.projectOutputs()
+        let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: witness)
+        try await state.setup()
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        let held = Gate()
+        let older = Task { @MainActor in
+            await state.refreshAll(refreshShared: false, beforePublication: {
+                await held.wait()
+                throw SharedProjectionWriteError.stale
+            })
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await held.waiting) {
+            guard ContinuousClock.now < deadline else { throw Failure(description: "Old refresh did not reach publication") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let file = root.appendingPathComponent("Meeting.transcript.json")
+        let external = Data("{damaged external synthetic sidecar".utf8)
+        try external.write(to: file, options: .atomic)
+        await state.refreshAll(refreshShared: false)
+        let currentMessage = state.sharedLibrary.message
+        try expect(currentMessage?.contains("External Files") == true, "Newest refresh must report actual untracked sidecar")
+        await held.release(); await older.value
+        try expect(state.sharedLibrary.message == currentMessage, "Old refresh failure must not overwrite the newest actionable message")
+        try expect(try Data(contentsOf: file) == external, "Refresh feedback must never overwrite external bytes")
+        await state.refreshAll(refreshShared: false, beforePublication: { throw SharedProjectionWriteError.stale })
+        try expect(state.sharedLibrary.message != nil, "A current refresh failure remains visible")
+        let cancelledGate = Gate()
+        let savedMessage = state.sharedLibrary.message
+        let cancelled = Task { @MainActor in
+            await state.refreshAll(refreshShared: false, beforePublication: {
+                await cancelledGate.wait(); throw CancellationError()
+            })
+        }
+        let cancelDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await cancelledGate.waiting) {
+            guard ContinuousClock.now < cancelDeadline else { throw Failure(description: "Cancelled refresh did not reach publication") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        cancelled.cancel(); await cancelledGate.release(); await cancelled.value
+        try expect(state.sharedLibrary.message == savedMessage, "Cancelled refresh cannot replace current feedback")
+        await state.sharedLibrary.close()
+        print("Actual refresh status ordering passed: late/cancelled failures cannot overwrite current external-file review; current failures remain visible.")
+
+        let entity = SharedEntityIdentity(id: try await seed.recording(at: "Meeting.mp3").state.id, kind: .recording)
+        let reviews = try await seed.reviewSidecars(entity)
+        guard let review = reviews.first else { throw Failure(description: "Missing known synthetic damage") }
+        _ = try await seed.recoverSidecar(review, useChangedFile: false)
+        try await seed.refresh(); _ = try await seed.projectOutputs()
+        try await seed.refresh(); _ = try await seed.projectOutputs()
+        let observing = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: witness)
+        try await observing.setup()
+        try expect(observing.sharedLibrary.message == nil, "Fresh bound app starts without an external-file error")
+        let stream = await observing.sharedLibrary.coordinator!.events()
+        var observedEvents: [String] = []
+        let events = Task { @MainActor in
+            for await event in stream {
+                switch event {
+                case .files: observedEvents.append("files")
+                case .entity: observedEvents.append("entity")
+                case .failure(let error): observedEvents.append("error: " + error)
+                case .loading: break
+                }
+            }
+        }
+        defer { events.cancel() }
+        let liveExternal = Data("{new distinct external sidecar occurrence".utf8)
+        try await CoordinatedFileAccess().withWrite(at: file) { scope in
+            try scope.checkCancellation(); try liveExternal.write(to: scope.url, options: .atomic)
+        }
+        let notificationDeadline = ContinuousClock.now.advanced(by: .seconds(4))
+        while observing.sharedLibrary.message?.contains("External Files") != true {
+            guard ContinuousClock.now < notificationDeadline else { throw Failure(description: "Canonical sidecar-only change must notify the running app without Refresh or relaunch; message=\(observing.sharedLibrary.message ?? "none"); revision=\(observing.sharedLibrary.revision); events=\(observedEvents)") }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try expect(try Data(contentsOf: file) == liveExternal, "Live external detection preserves the changed file")
+        var revisions: [UInt64] = []
+        for _ in 0..<20 {
+            try await Task.sleep(for: .milliseconds(100))
+            revisions.append(observing.sharedLibrary.revision)
+        }
+        print("Post-notification revisions: \(revisions)")
+        try expect(Set(revisions.suffix(6)).count == 1, "External notifications must settle without a no-op publication loop: \(revisions)")
+        await observing.sharedLibrary.close()
+        print("Actual live sidecar notification passed without explicit refresh or relaunch.")
+        let interruptedRoot = parent.appendingPathComponent("interrupted-bootstrap")
+        try FileManager.default.createDirectory(at: interruptedRoot, withIntermediateDirectories: true)
+        try Data("synthetic bootstrap audio".utf8).write(to: interruptedRoot.appendingPathComponent("Meeting.mp3"))
+        try await TemplateStore(baseDirectory: interruptedRoot).update(TemplateStore.builtInDefaults[0])
+        let interruptedWitness = parent.appendingPathComponent("bootstrap-witness")
+        let interrupted = SharedLibraryCoordinator(root: interruptedRoot, writerID: identity.writer, witnessDirectory: interruptedWitness)
+        _ = try await interrupted.enable()
+        do { _ = try await interrupted.projectOutputs(beforeOutput: { index in if index == 1 { throw CancellationError() } }); throw Failure(description: "Expected publication interruption") }
+        catch is CancellationError {}
+        let recovering = AppState(baseDirectory: interruptedRoot, sharedIdentity: { identity }, sharedWitnessDirectory: interruptedWitness)
+        try await recovering.setup()
+        guard let recovery = recovering.sharedLibrary.coordinator else { throw Failure(description: "Missing bootstrap recovery binding") }
+        await recovery.stopMonitoring()
+        let model = recovering.sharedLibrary.externalReview
+        await model.refresh(using: recovery)
+        guard let row = model.items.first(where: { $0.bootstrap?.filename == ".templates.json" }) else { throw Failure(description: "Interrupted templates must have an actionable restore row") }
+        try expect(await model.apply(row, useChangedFile: false, using: recovery), "Actual review model must restore an interrupted aggregate")
+        await recovering.refreshAll()
+        await model.refresh(using: recovery)
+        try expect(model.items.isEmpty && recovering.sharedLibrary.message == nil, "Aggregate recovery must clear its row and app feedback")
+        await recovering.sharedLibrary.close()
+        print("Actual AppState interrupted-bootstrap review and restoration passed.")
     }
 
 }

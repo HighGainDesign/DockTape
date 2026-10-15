@@ -189,6 +189,13 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
                     try updated.write(field: field, value: .unset, writer: writer)
                 }
             }
+            // Selecting content cannot inherit permission to replace a file
+            // reviewed for another generation. Consume observed approvals too,
+            // including competing approvals from independently adopted versions.
+            for field in ["externalAdoption." + component.rawValue, "externalAdoptionGeneration." + component.rawValue]
+            where updated.fields[field]?.values.contains(where: { $0 != .unset }) == true {
+                try updated.write(field: field, value: .unset, writer: writer)
+            }
             try updated.write(field: Self.generationField(component), value: .document(document), writer: writer)
         }
     }

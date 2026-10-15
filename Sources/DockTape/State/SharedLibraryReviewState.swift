@@ -121,7 +121,9 @@ final class SharedLibraryReviewState {
         let title = text(state.value(for: state.kind == .recording ? "title" : "name"))
             ?? text(state.value(for: "initialPath")) ?? (state.kind == .template ? "Summary template" : "Library item")
         var fields: [Field] = []
-        for conflict in state.conflicts where conflict.inactiveGeneration == nil {
+        for conflict in state.conflicts where conflict.inactiveGeneration == nil
+            && !conflict.field.hasPrefix("externalAdoption.")
+            && !conflict.field.hasPrefix("externalAdoptionGeneration.") {
             let parts = conflict.field.split(separator: ".").map(String.init)
             let component = parts.first.flatMap(SharedComponent.init(rawValue:))
             let generation = parts.count >= 4 && parts[1] == "edits" ? UUID(uuidString: parts[2]) : nil

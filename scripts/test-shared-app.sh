@@ -26,4 +26,4 @@ swiftc -swift-version 5 -parse-as-library -I "$BIN_PATH/Modules" \
     -L Vendor/libusb/lib -lusb-1.0 -lc++ \
     -framework IOKit -framework Security -framework Accelerate -framework CoreML \
     "${OBJECTS[@]}" "${SOURCES[@]}" Tests/DockTapeSharedLibraryTests.swift -o "$OUTPUT"
-"$OUTPUT"
+"$OUTPUT" "$@"
