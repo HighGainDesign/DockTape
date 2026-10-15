@@ -331,8 +331,33 @@ struct DockTapeSharedLibraryTests {
         }
         cancelled.cancel(); await cancelledGate.release(); await cancelled.value
         try expect(state.sharedLibrary.message == savedMessage, "Cancelled refresh cannot replace current feedback")
+        // Returning from an older awaited request does not mean a newer
+        // request has finished publishing its feedback.
+        state.sharedLibrary.message = nil
+        let olderGate = Gate(), currentGate = Gate()
+        let superseded = Task { @MainActor in
+            await state.refreshAll(refreshShared: false, beforePublication: { await olderGate.wait() })
+        }
+        let olderDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await olderGate.waiting) {
+            guard ContinuousClock.now < olderDeadline else { throw Failure(description: "Superseded request did not reach publication") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let current = Task { @MainActor in
+            await state.refreshAll(refreshShared: false, beforePublication: { await currentGate.wait() })
+        }
+        let currentDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await currentGate.waiting) {
+            guard ContinuousClock.now < currentDeadline else { throw Failure(description: "Current request did not reach publication") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await olderGate.release(); await superseded.value
+        try expect(state.sharedLibrary.message == nil, "Older request must return without claiming the current request's result")
+        await currentGate.release(); await current.value
+        try expect(state.sharedLibrary.message?.contains("External Files") == true, "The newer request must eventually publish actionable recovery feedback")
+        try expect(try Data(contentsOf: file) == external, "Overlapping refreshes must preserve external bytes")
         await state.sharedLibrary.close()
-        print("Actual refresh status ordering passed: late/cancelled failures cannot overwrite current external-file review; current failures remain visible.")
+        print("Actual refresh status ordering passed: late/cancelled failures cannot overwrite current external-file review; current failures remain visible; superseded requests return before newer feedback.")
 
         let entity = SharedEntityIdentity(id: try await seed.recording(at: "Meeting.mp3").state.id, kind: .recording)
         let reviews = try await seed.reviewSidecars(entity)

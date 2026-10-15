@@ -84,6 +84,13 @@ import HiDockKit
         object["segments"] = segments
         try JSONSerialization.data(withJSONObject: object, options: .sortedKeys).write(to: file, options: .atomic)
         await state.refreshAll()
+        // A monitored refresh can supersede the awaited request. Observe the
+        // current request's result without issuing another refresh or write.
+        let feedbackDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while state.sharedLibrary.message?.contains("External Files") != true,
+              ContinuousClock.now < feedbackDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         try expect(state.sharedLibrary.message?.contains("External Files") == true,
             "Actual app explains where recovery lives; message=" + (state.sharedLibrary.message ?? "<nil>"))
         await model.refresh(using: coordinator)
