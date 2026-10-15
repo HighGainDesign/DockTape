@@ -26,10 +26,13 @@ struct SharedLibraryProcessFixture {
         afterCommit: { if args[1].hasSuffix("-crash") { Darwin._exit(74) } })
       if args[1] == "accept-seed" {
         _ = try await coordinator.enable()
-        if FileManager.default.fileExists(atPath: root.appendingPathComponent("Accepted.mp3").path) {
-          let base = try await coordinator.recording(at: "Accepted.mp3")
-          let fingerprint = SharedLibraryOperation.fingerprint(try Data(contentsOf: root.appendingPathComponent("Accepted.mp3")))
-          _ = try await coordinator.edit(.init(base: base, changes: [.assign(field: "audioFingerprint", value: .text(fingerprint)), .assign(field: "audioPublished", value: .text(fingerprint))]))
+        let prepared = root.appendingPathComponent("seed-input.bin")
+        if FileManager.default.fileExists(atPath: prepared.path) {
+          let bytes = try Data(contentsOf: prepared)
+          let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+          try await store.setup()
+          _ = try await store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Accepted.hda", size: UInt32(bytes.count)))
+          try FileManager.default.removeItem(at: prepared)
         }
         _ = try await coordinator.projectOutputs()
         print("seeded"); return

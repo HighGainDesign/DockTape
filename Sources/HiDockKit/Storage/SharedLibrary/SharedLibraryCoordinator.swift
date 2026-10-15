@@ -464,13 +464,17 @@ public actor SharedLibraryCoordinator {
     if case .document = base.state.value(for: audioIntentField) { changes.append(.assign(field: audioIntentField, value: .unset)) }
     return try await commit(.init(base: base, changes: changes), review: false, exact: true)
   }
-  private func reconstructAudioIntent(view: SharedLibraryViewSnapshot, materializer: SharedLibraryMaterializer) async throws {
+  private func preparedAudioIntent(view: SharedLibraryViewSnapshot) throws -> SharedPreparedAudioIntent {
     guard view.state.lifecycle == .alive, view.state.conflicts.isEmpty,
       case .document(let document)? = view.state.value(for: audioIntentField),
       let intent = try? JSONDecoder().decode(SharedPreparedAudioIntent.self, from: document.json), intent.schema == 1,
       intent.libraryID == view.libraryID, intent.entity == SharedEntityIdentity(id: view.state.id, kind: .recording) else {
       throw SharedLibraryOperationError.invalidOperation
     }
+    return intent
+  }
+  private func reconstructAudioIntent(view: SharedLibraryViewSnapshot, materializer: SharedLibraryMaterializer) async throws {
+    let intent = try preparedAudioIntent(view: view)
     let path: String, selected: String
     switch intent.step {
     case .publishAudio(let value, _, let fingerprint), .replaceAudio(let value, _, _, let fingerprint, _): path = value; selected = fingerprint
@@ -1203,9 +1207,16 @@ public actor SharedLibraryCoordinator {
     var view = try await read(entity)
     let receipts = try operationReceipts(library: view.libraryID)
     let reader = try await makeMaterializer(entity: entity, paths: [], receipts: receipts)
-    if try await reader.progress(entity: entity, libraryID: view.libraryID) == nil {
-      try await reconstructAudioIntent(view: view, materializer: reader)
-    }
+    let previous = try await reader.progress(entity: entity, libraryID: view.libraryID)
+    if case .document = view.state.value(for: audioIntentField) {
+      let intent = try preparedAudioIntent(view: view)
+      if previous?.operation.steps != [intent.step] || previous?.operation.inputRevision != intent.inputRevision ||
+         previous?.operation.inputAudioFingerprint != intent.inputAudioFingerprint {
+        // An older completed receipt is only progress for its old intent.
+        // recordIntent still refuses to supersede an unfinished physical plan.
+        try await reconstructAudioIntent(view: view, materializer: reader)
+      }
+    } else if previous == nil { throw SharedLibraryOperationError.invalidOperation }
     guard let progress = try await reader.progress(entity: entity, libraryID: view.libraryID),
           let audio = progress.operation.steps.first(where: {
             switch $0 {

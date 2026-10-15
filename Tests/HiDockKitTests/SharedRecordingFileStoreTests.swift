@@ -480,6 +480,35 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Interrupted.mp3")), bytes)
         XCTAssertTrue(LibraryFileDiscovery.files(in: root.appendingPathComponent(".docktape/staging"), suffix: ".mp3").isEmpty)
     }
+    func testCurrentIntentCannotSupersedeAnUnfinishedReceipt() async throws {
+        let (root, coordinator, _) = try await fixture()
+        let local = root.deletingLastPathComponent().appendingPathComponent("local")
+        let interrupted = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: local,
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: interrupted))
+        try await store.setup()
+        let bytes = Data([0xFF, 0xFB, 0x90, 0x64, 1, 2, 3, 4])
+        let task = Task { try await store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Intent.hda", size: UInt32(bytes.count))) }
+        do { _ = try await task.value; XCTFail() } catch is CancellationError {}
+        let base = try await coordinator.recording(at: "Intent.mp3")
+        let entity = SharedEntityIdentity(id: base.state.id, kind: .recording)
+        let receipt = local.appendingPathComponent("Operations").appendingPathComponent(base.libraryID.uuidString)
+            .appendingPathComponent(coordinator.writerID.uuidString).appendingPathComponent(entity.id.uuidString + ".json")
+        let originalReceipt = try Data(contentsOf: receipt)
+        let field = "materialization.audio." + coordinator.writerID.uuidString.lowercased()
+        let replacement = SharedPreparedAudioIntent(libraryID: base.libraryID, entity: entity, inputRevision: "new intent",
+            step: .publishAudio(path: "Intent.mp3", staged: ".docktape/staging/" + entity.id.uuidString + "/" + UUID().uuidString + ".mp3",
+                                selectedFingerprint: SharedLibraryOperation.fingerprint(bytes)))
+        _ = try await coordinator.edit(.init(base: base, changes: [.assign(field: field, value: .document(try SharedDocument(id: UUID(), json: JSONEncoder().encode(replacement))))]))
+        do { _ = try await coordinator.resumeRecordingOperation(id: entity.id); XCTFail("Unfinished accepted work cannot be replaced") }
+        catch SharedLibraryOperationError.unfinishedOperation {}
+        XCTAssertEqual(try Data(contentsOf: receipt), originalReceipt)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Intent.mp3").path))
+        let staged = LibraryFileDiscovery.files(in: root.appendingPathComponent(".docktape/staging"), suffix: ".mp3")
+        XCTAssertEqual(staged.count, 1)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(".docktape/staging/" + staged[0].relativePath)), bytes)
+    }
+
     func testMissingReceiptReconstructionRejectsChangedAndMalformedIntentWithoutConsumingInput() async throws {
         for change in ["title", "fingerprint", "library", "entity", "unsafeStage", "nonAudio", "schema"] {
             let (root, coordinator, _) = try await fixture()

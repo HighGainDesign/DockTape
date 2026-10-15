@@ -33,7 +33,7 @@ for kind in ['import','repair','replacement','merge']:
                 originals[name]=data; (root/name).write_bytes(data)
         if kind in ['repair','replacement']:
             fill=3 if kind=='repair' else 4
-            (root/'Accepted.mp3').write_bytes(bytes([0xff,0xfb,0x90,0x64])+bytes([fill])*413)
+            (root/'seed-input.bin').write_bytes(bytes([0xff,0xfb,0x90,0x64])+bytes([fill])*413)
         args=[str(root),writer,unused,str(local)]
         seeded=subprocess.run([fixture,'accept-seed',*args],capture_output=True,text=True,timeout=15)
         assert seeded.returncode==0,(seeded.returncode,seeded.stdout,seeded.stderr)
@@ -47,7 +47,13 @@ for kind in ['import','repair','replacement','merge']:
         staged=list((root/'.docktape/staging').rglob('*.mp3'))
         assert len(staged)==1,(kind,staged)
         expected=staged[0].read_bytes()
-        assert not list((local/'Operations').rglob('*.json')), 'Process must exit before local receipt creation'
+        receipts=list((local/'Operations').rglob('*.json'))
+        if kind in ['repair','replacement']:
+            assert len(receipts)==1, 'Previous import must leave its completed receipt'
+            import json
+            receipt=json.loads(receipts[0].read_text())['receipt']
+            assert receipt['completed']==len(receipt['operation']['steps']), 'New intent must not yet replace previous receipt'
+        else: assert not receipts, 'Process must exit before local receipt creation'
         if kind=='merge':
             assert expected[-834:]==originals['One.mp3']+originals['Two.mp3']
             (root/'One.mp3').write_bytes(b'later input change')
@@ -56,6 +62,9 @@ for kind in ['import','repair','replacement','merge']:
             failures.append((kind,resumed.returncode,resumed.stdout,resumed.stderr)); continue
         assert (root/'Accepted.mp3').read_bytes()==expected
         assert not list((root/'.docktape/staging').rglob('*.mp3'))
+        repeated=subprocess.run([fixture,'accept-resume',*args],capture_output=True,text=True,timeout=15)
+        assert repeated.returncode==0 and repeated.stdout.strip()=='complete',(kind,repeated.returncode,repeated.stdout,repeated.stderr)
+        assert (root/'Accepted.mp3').read_bytes()==expected
 assert not failures, failures
 print('Actual post-accept/pre-receipt process exits recovered import, repair, replacement and merge without new input.')
 PYTEST
