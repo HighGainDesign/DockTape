@@ -266,6 +266,7 @@ import HiDockKit
         guard let item = model.items.first(where: { $0.snapshot.state.kind == .folder }),
               let field = item.fields.first(where: { $0.id == "deletionRequest" }) else { throw Failure(message: "Missing competing folder request") }
         try expect(field.choices.count == 2, "Competing deletion requests need explicit choices instead of an unresolvable recovery placeholder")
+        try expect(field.choices.contains { $0.detail.contains("From: This Mac") } && field.choices.contains { $0.detail.contains("From: Folder peer") }, "Folder request scopes identify their source Macs")
         try expect(field.choices.allSatisfy { $0.detail.contains("Folder/A.mp3") }, "Every request previews its actual original child")
         guard let selected = field.choices.first(where: { $0.detail.contains("Folder/B.mp3") }) else { throw Failure(message: "Newer request must preview its additional child") }
         try expect(field.choices.filter { $0.detail.contains("Folder/B.mp3") }.count == 1, "Request previews distinguish the offline child scopes")
@@ -500,6 +501,52 @@ import HiDockKit
         print("Actual unprepared deletion passed: retry, explicit Keep, native external-file restoration and deletion again complete without fixture repair writes.")
     }
 
+    @MainActor static func sourceMacChecks(parent: URL) async throws {
+        let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right"), third = parent.appendingPathComponent("third")
+        try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
+        let template = Template.makeUserTemplate(name: "Sources", description: "Source fixture", promptText: "Initial prompt")
+        try await TemplateStore(baseDirectory: left).addUserTemplate(template)
+        let a = SharedLibraryCoordinator(root: left, writerID: UUID(uuidString: "aaaaaaaa-0000-0000-0000-000000000001")!, witnessDirectory: parent.appendingPathComponent("a-local"))
+        _ = try await a.enable(); _ = try await a.projectOutputs()
+        try FileManager.default.copyItem(at: left, to: right); try FileManager.default.copyItem(at: left, to: third)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(uuidString: "bbbbbbbb-0000-0000-0000-000000000002")!, witnessDirectory: parent.appendingPathComponent("b-local"))
+        let c = SharedLibraryCoordinator(root: third, writerID: UUID(uuidString: "cccccccc-0000-0000-0000-000000000003")!, witnessDirectory: parent.appendingPathComponent("c-local"))
+        try await b.requestEnrollment(requestID: UUID(), label: "Peer Mac")
+        try await c.requestEnrollment(requestID: UUID(), label: "Peer Mac")
+        for _ in 0..<5 {
+            try deliver(right, to: left, writer: b.writerID); try deliver(third, to: left, writer: c.writerID); try await a.refresh()
+            try deliver(left, to: right, writer: a.writerID); try deliver(third, to: right, writer: c.writerID); try await b.refresh()
+            try deliver(left, to: third, writer: a.writerID); try deliver(right, to: third, writer: b.writerID); try await c.refresh()
+        }
+        try expect(try await b.mayEdit(), "B must enroll"); try expect(try await c.mayEdit(), "C must enroll")
+        do { _ = try await a.writerLabels(libraryID: UUID()); throw Failure(message: "Foreign library must not borrow writer labels") }
+        catch SharedLibraryCoordinatorError.differentBinding { }
+        let original = try await a.snapshots(kinds: [.template]).first { $0.state.value(for: "templateID") == .text(template.id) }!
+        let entity = SharedEntityIdentity(id: original.state.id, kind: .template)
+        let baseB = try await b.read(entity), baseC = try await c.read(entity)
+        _ = try await a.edit(.init(base: original, changes: [.assign(field: "prompt", value: .text("Local prompt"))]))
+        _ = try await b.edit(.init(base: baseB, changes: [.assign(field: "prompt", value: .text("Shared peer prompt"))]))
+        _ = try await c.edit(.init(base: baseC, changes: [.assign(field: "prompt", value: .text("Shared peer prompt"))]))
+        try deliver(right, to: left, writer: b.writerID); try deliver(third, to: left, writer: c.writerID)
+        let model = SharedLibraryReviewState(); await model.refresh(using: a)
+        guard let field = model.items.first?.fields.first,
+              let own = field.choices.first(where: { $0.value == .text("Local prompt") }),
+              let peers = field.choices.first(where: { $0.value == .text("Shared peer prompt") }) else { throw Failure(message: "Missing actual three-Mac choices") }
+        try expect(own.detail.contains("This Mac"), "Local competing value identifies this Mac")
+        try expect(peers.detail.contains("Peer Mac") && peers.detail.contains("bbbbbbbb") && peers.detail.contains("cccccccc"), "Identical value must show both contributing Macs with distinguishable duplicate labels")
+        try expect(!peers.detail.contains("This Mac"), "Consumed original author is not the source of identical peer values")
+        // B observes all alternatives and resolves them, while C edits offline.
+        try deliver(left, to: right, writer: a.writerID); try deliver(third, to: right, writer: c.writerID)
+        _ = try await b.resolve(.init(base: try await b.read(entity), changes: [.assign(field: "prompt", value: .text("Resolved by B"))]))
+        _ = try await c.edit(.init(base: try await c.read(entity), changes: [.assign(field: "prompt", value: .text("Late C edit"))]))
+        try deliver(right, to: left, writer: b.writerID); try deliver(third, to: left, writer: c.writerID)
+        await model.refresh(using: a)
+        guard let resolved = model.items.first?.fields.first?.choices.first(where: { $0.value == .text("Resolved by B") }) else { throw Failure(message: "Missing new offline conflict") }
+        try expect(resolved.detail.contains("bbbbbbbb") && !resolved.detail.contains("cccccccc") && !resolved.detail.contains("This Mac"), "Current contributor excludes all consumed writers after resolution")
+        model.clear(); try expect(model.items.isEmpty, "Clearing library binding removes old attribution")
+        print("Actual source attribution passed: three independent roots, identical contributors, duplicate labels and consumed-writer exclusion.")
+    }
+
     @MainActor static func templateLifecycleChecks(parent: URL) async throws {
         for keep in [true, false] {
             let directory = parent.appendingPathComponent(keep ? "keep" : "delete"), left = directory.appendingPathComponent("left"), right = directory.appendingPathComponent("right")
@@ -529,6 +576,9 @@ import HiDockKit
             guard let item = model.items.first(where: { $0.snapshot.state.kind == .template }),
                   let field = item.fields.first(where: { $0.id == "$lifecycle" }) else { throw Failure(message: "Template lifecycle conflict must have a row") }
             try expect(field.choices.count == 2, "Template delete-versus-edit must offer explicit Keep/Delete decisions")
+            try expect(field.choices.first { $0.value == .flag(false) }?.detail.contains("From: This Mac") == true
+                && field.choices.first { $0.value == .flag(true) }?.detail.contains("From: Template editing Mac") == true, "Lifecycle choices identify their current source Macs")
+            try expect(field.choices.allSatisfy { $0.detail.contains("From: This Mac\nRetained prompt A") && $0.detail.contains("From: Template editing Mac\nRetained prompt B") }, "Retained template alternatives identify their own sources")
             try expect(field.choices.allSatisfy { $0.detail.contains("Retained prompt A") && $0.detail.contains("Retained prompt B") }, "Template lifecycle choices must preview both retained prompts")
             guard let choice = field.choices.first(where: { $0.value == .flag(keep) }) else { throw Failure(message: "Missing template decision") }
             // A new field write changes the reviewed lifecycle context too.
@@ -664,6 +714,7 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--source-macs-only") { try await sourceMacChecks(parent: parent); return }
         if arguments.contains("--template-lifecycle-only") { try await templateLifecycleChecks(parent: parent); return }
         if arguments.contains("--folder-requests-only") { try await folderRequestConflictChecks(parent: parent); return }
         if arguments.contains("--folder-rejection-only") { try await rejectedFolderRenameChecks(parent: parent); return }
@@ -675,6 +726,7 @@ import HiDockKit
             return
         }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
+        try await sourceMacChecks(parent: parent.appendingPathComponent("source-macs"))
         try await templateLifecycleChecks(parent: parent.appendingPathComponent("template-lifecycle"))
         try await folderRequestConflictChecks(parent: parent.appendingPathComponent("folder-requests"))
         try await pendingFolderChecks(parent: parent.appendingPathComponent("folders"))
@@ -716,6 +768,7 @@ import HiDockKit
         guard let field = item.fields.first, let alice = field.choices.first(where: { $0.value == .text("Alice") }) else { throw Failure(message: "Missing readable choices") }
         try expect(field.title == "Speaker name", "Do not show internal field keys")
         try expect(alice.detail.contains("Alice"), "Show the actual alternative")
+        try expect(alice.detail.contains("From: This Mac") && field.choices.first { $0.value == .text("Bob") }?.detail.contains("From: Second test Mac") == true, "Speaker choices attribute their actual source Macs")
         _ = try await a.edit(.init(base: try await a.read(entity), changes: [.assign(field: "metadata.mode", value: .text("\"Mee\""))]))
         await model.refresh(using: a)
         try expect(model.items[0].reviewSignature == item.reviewSignature, "Unrelated metadata must not reset reviewed choices")
@@ -754,6 +807,7 @@ import HiDockKit
         let versions = model.items.first { $0.id == entity.id }!
         let content = versions.fields.first { $0.id == "transcript.content" }!
         let optionA = content.choices.first { $0.value == .document(documentA) }!
+        try expect(optionA.detail.contains("From: This Mac") && content.choices.first { $0.value == .document(documentB) }?.detail.contains("From: Second test Mac") == true, "Generation choices identify their source Macs")
         try expect(optionA.detail.contains("Version A content") && optionA.isAvailable, "Typed transcript preview must show actual content")
         try expect(await model.apply(item: versions, selections: [content.id: optionA.id], using: a), "Generation review must resolve")
         // Older edits have an explicit discard decision; never apply them to a new version.
@@ -763,6 +817,7 @@ import HiDockKit
         await model.refresh(using: a)
         let older = model.items.first { $0.id == entity.id }!
         let oldField = older.fields.first { $0.isOlderEdits }!
+        try expect(oldField.choices.first?.detail.contains("From: Second test Mac\nOlder speaker edit") == true, "Retained older edits identify their source")
         try expect(oldField.choices.first?.detail.contains("Older speaker edit") == true, "Show exactly which old edits are discarded")
         try expect(await model.apply(item: older, selections: [oldField.id: oldField.choices[0].id], using: a), "Discard older-generation edits explicitly")
         try expect((try await a.read(entity)).state.currentDocument(for: .transcript)?.id == currentA.state.currentDocument(for: .transcript)?.id, "Discard must retain current generation")
@@ -782,6 +837,7 @@ import HiDockKit
         let checks = model.items.first { $0.id == entity.id }!, check = model.items.first { $0.id == entity.id }!.fields[0]
         try expect(check.title.contains("Send meeting notes"), "Checklist conflict must identify its task")
         let completed = check.choices.first { $0.value == .flag(true) }!
+        try expect(completed.detail.contains("From: This Mac") && check.choices.first { $0.value == .flag(false) }?.detail.contains("From: Second test Mac") == true, "Checklist choices identify their actual source Macs")
         try expect(await model.apply(item: checks, selections: [check.id: completed.id], using: a), "Reviewed checklist status must persist")
         // Template prompts use the same captured-context transaction.
         let templates = TemplateStore(baseDirectory: left, shared: SharedTemplateAdapter(coordinator: a))
@@ -798,6 +854,7 @@ import HiDockKit
         await model.refresh(using: a)
         let templateItem = model.items.first { $0.id == templateEntity.id }!, prompt = model.items.first { $0.id == templateEntity.id }!.fields[0]
         let selectedPrompt = prompt.choices.first { $0.value == .text("Prompt B") }!
+        try expect(selectedPrompt.detail.contains("From: Second test Mac"), "Template scalar choices identify the source Mac")
         try expect(await model.apply(item: templateItem, selections: [prompt.id: selectedPrompt.id], using: a), "Template review must persist")
         try await templates.load()
         try expect(await templates.template(forID: "review-template")?.promptText == "Prompt B", "Actual template adapter must reload the reviewed prompt")

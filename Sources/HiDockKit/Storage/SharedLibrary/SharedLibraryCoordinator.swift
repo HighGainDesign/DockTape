@@ -234,6 +234,26 @@ public actor SharedLibraryCoordinator {
     _ = try await members.commit(base: snapshot, membership: snapshot.membership)
     return true
   }
+  /// Display metadata only. This does not grant edit or cleanup permission.
+  public func writerLabels(libraryID: UUID) async throws -> [UUID: String] {
+    let manifest = try await bind(force: true)
+    guard manifest.libraryID == libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
+    let membership = try await memberRepository().load().membership
+    guard membership.libraryID == libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
+    let names = Dictionary(uniqueKeysWithValues: membership.cohort.map { writer in
+      let label = writer == writerID ? "This Mac" : membership.label(for: writer).trimmingCharacters(in: .whitespacesAndNewlines)
+      return (writer, label.isEmpty ? "Another Mac" : label)
+    })
+    return names.reduce(into: [UUID: String]()) { labels, entry in
+      let (writer, label) = entry
+      let peers = names.keys.filter { $0 != writer && names[$0] == label }
+      guard !peers.isEmpty else { labels[writer] = label; return }
+      let id = writer.uuidString.lowercased()
+      var length = 8
+      while length < id.count && peers.contains(where: { $0.uuidString.lowercased().prefix(length) == id.prefix(length) }) { length += 4 }
+      labels[writer] = label + " · " + id.prefix(length)
+    }
+  }
   public func requestEnrollment(requestID: UUID, label: String) async throws {
     beginTransition(); defer { endTransition() }
     let manifest = try await bind(force: true)

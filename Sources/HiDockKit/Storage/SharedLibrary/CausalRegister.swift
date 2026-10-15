@@ -38,6 +38,12 @@ public struct CausalRegister<Value: Codable & Hashable & Sendable>: Codable, Equ
     /// Identical concurrent values display once while retaining both dots.
     public var values: Set<Value> { Set(entries.map(\.value)) }
 
+    /// Current contributors only. Observed/consumed clocks are not authors of
+    /// the current value; identical concurrent values can have several authors.
+    public func writers(for value: Value) -> Set<UUID> {
+        Set(entries.filter { $0.value == value }.map { $0.dot.writer })
+    }
+
     public var resolvedValue: Value? {
         let current = values
         return current.count == 1 ? current.first : nil

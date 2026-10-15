@@ -7,6 +7,34 @@ final class CausalRegisterTests: XCTestCase {
     private let b = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     private let c = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
 
+    // Catches attributing consumed causal clocks to a currently displayed value.
+    func testCurrentValueWritersExcludeConsumedContext() throws {
+        var original = CausalRegister<String>(); try original.assign("old", by: a)
+        var left = original, right = original
+        try left.assign("local", by: a); try right.assign("peer", by: b)
+        try left.merge(right)
+        XCTAssertEqual(left.writers(for: "local"), [a])
+        XCTAssertEqual(left.writers(for: "peer"), [b])
+        XCTAssertEqual(left.writers(for: "old"), [])
+        try left.assign("chosen", by: c)
+        try left.merge(right)
+        XCTAssertEqual(left.writers(for: "chosen"), [c])
+        XCTAssertEqual(left.writers(for: "peer"), [])
+        XCTAssertTrue(left.causalContext.contains { $0.writer == b }, "Observed peer remains in context but is not the current author")
+    }
+    // Catches losing a contributor when identical concurrent values coalesce.
+    func testIdenticalValueWritersSurviveRoundTripAndMerge() throws {
+        var left = CausalRegister<String>(), right = CausalRegister<String>(), third = CausalRegister<String>()
+        try left.assign("same", by: a); try right.assign("same", by: b); try third.assign("different", by: c)
+        try left.merge(right); try left.merge(third); try left.merge(right)
+        let decoded = try JSONDecoder().decode(CausalRegister<String>.self, from: JSONEncoder().encode(left))
+        XCTAssertEqual(decoded.writers(for: "same"), [a, b])
+        XCTAssertEqual(decoded.writers(for: "different"), [c])
+        let compacted = try decoded.applyingCausalFloor([.init(writer: a, counter: 1)])
+        XCTAssertEqual(compacted.writers(for: "same"), [b])
+        XCTAssertEqual(compacted.writers(for: "different"), [c])
+    }
+
     // Catches retaining an overwritten local value or dropping the new assignment.
     func testSequentialAssignmentSupersedesObservedValue() throws {
         var value = CausalRegister<String>()

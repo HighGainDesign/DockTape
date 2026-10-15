@@ -108,12 +108,12 @@ private struct SharedReviewFieldView: View {
                 if !field.choices.isEmpty {
                     Picker(field.title, selection: $selection) {
                         Text("Choose a value…").tag(nil as String?)
-                        ForEach(field.choices) { choice in Text(choice.label).tag(Optional(choice.id)).disabled(!choice.isAvailable) }
+                        ForEach(field.choices) { choice in Text(choice.comparisonTitle).tag(Optional(choice.id)).disabled(!choice.isAvailable) }
                     }.labelsHidden().accessibilityLabel(field.title)
                     ForEach(field.choices) { choice in
-                        DisclosureGroup("Compare: " + choice.label) {
+                        DisclosureGroup("Compare: " + choice.comparisonTitle) {
                             Text(choice.detail).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                        }.accessibilityLabel("Read " + choice.label)
+                        }.accessibilityLabel("Read " + choice.comparisonTitle)
                     }
                 }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(4)

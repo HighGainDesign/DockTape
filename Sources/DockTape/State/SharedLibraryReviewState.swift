@@ -11,6 +11,8 @@ final class SharedLibraryReviewState {
         let label: String
         let detail: String
         let isAvailable: Bool
+        let sources: [String]
+        var comparisonTitle: String { sources.isEmpty ? label : label + " · " + sources.joined(separator: ", ") }
     }
     struct Field: Identifiable {
         let id: String
@@ -64,10 +66,16 @@ final class SharedLibraryReviewState {
         do {
             let views = try await coordinator.snapshots(kinds: [.recording, .folder, .template])
             guard request == ticket, binding === coordinator, !Task.isCancelled else { return }
+            let conflicted = views.filter { !$0.state.conflicts.isEmpty }
+            let labels: [UUID: String]
+            if let library = conflicted.first?.libraryID {
+                guard conflicted.allSatisfy({ $0.libraryID == library }) else { throw SharedLibraryCoordinatorError.differentBinding }
+                labels = try await coordinator.writerLabels(libraryID: library)
+            } else { labels = [:] }
             var loaded: [Item] = []
-            for view in views where !view.state.conflicts.isEmpty {
+            for view in conflicted {
                 let requests = view.state.kind == .folder ? try await coordinator.folderDeletionRequestChoices(view) : []
-                loaded.append(Self.item(view, folderRequests: requests))
+                loaded.append(Self.item(view, writerLabels: labels, folderRequests: requests))
             }
             guard request == ticket, binding === coordinator, !Task.isCancelled else { return }
             items = loaded.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
@@ -184,7 +192,7 @@ final class SharedLibraryReviewState {
         if binding === coordinator { isApplying = false; action = nil }
         return result
     }
-    private static func item(_ snapshot: SharedLibraryViewSnapshot, folderRequests requests: [SharedFolderDeletionRequestReview] = []) -> Item {
+    private static func item(_ snapshot: SharedLibraryViewSnapshot, writerLabels: [UUID: String], folderRequests requests: [SharedFolderDeletionRequestReview] = []) -> Item {
         let state = snapshot.state
         let requestChoices = Dictionary(uniqueKeysWithValues: requests.map { (identity($0.value), $0) })
         let title = text(state.value(for: state.kind == .recording ? "title" : "name"))
@@ -204,14 +212,16 @@ final class SharedLibraryReviewState {
             let supported = folderRequest || lifecycleChoice || (editableContent && (isContent || generation != nil || safeScalar))
             let choices = supported ? conflict.values.compactMap { value -> Choice? in
                 if isContent { guard case .document = value else { return nil } }
+                let contributors = sources(value, field: conflict.field, state: state, labels: writerLabels)
+                let origin = sourceNote(contributors)
                 if folderRequest {
                     let id = identity(value)
                     guard let request = requestChoices[id] else {
-                        return .init(id: id, value: value, label: "Unavailable deletion request", detail: "This request could not be validated. It cannot authorize cleanup.", isAvailable: false)
+                        return .init(id: id, value: value, label: "Unavailable deletion request", detail: origin + "This request could not be validated. It cannot authorize cleanup.", isAvailable: false, sources: contributors)
                     }
                     let detail = "Folder: " + request.path + "\n\n" + (request.members.isEmpty ? "No recorded children." : request.members.map(\.path).joined(separator: "\n"))
                         + "\n\nSelecting this request saves its scope. Files remain until cleanup is reviewed in Pending Folders."
-                    return .init(id: id, value: value, label: "Delete " + request.path + " (\(request.members.count) items)", detail: detail, isAvailable: true)
+                    return .init(id: id, value: value, label: "Delete " + request.path + " (\(request.members.count) items)", detail: origin + detail, isAvailable: true, sources: contributors)
                 }
                 if lifecycleChoice {
                     guard case .flag(let keep) = value else { return nil }
@@ -220,8 +230,8 @@ final class SharedLibraryReviewState {
                     let explanation = template
                         ? (keep ? "Keep this template and its retained edits. Other competing changes still need review." : "Remove this template from the catalog. Its retained competing edits remain available for review.")
                         : (keep ? "Keep this recording and the retained edits below. Other competing changes will still need review." : "Hide this recording. Original files remain until safe cleanup is approved by the participating Macs.")
-                    let detail = explanation + "\n\n" + lifecyclePreview(state)
-                    return .init(id: identity(value), value: value, label: label, detail: detail, isAvailable: true)
+                    let detail = explanation + "\n\n" + lifecyclePreview(state, labels: writerLabels)
+                    return .init(id: identity(value), value: value, label: label, detail: origin + detail, isAvailable: true, sources: contributors)
                 }
                 let detail = preview(value, field: conflict.field)
                 let label = isContent ? contentLabel(value, component: component!) : detail
@@ -229,7 +239,7 @@ final class SharedLibraryReviewState {
                 if isContent, case .document(let document) = value {
                     available = component == .transcript ? (try? document.decode(Transcript.self)) != nil : (try? document.decode(Summary.self)) != nil
                 } else { available = true }
-                return .init(id: identity(value), value: value, label: label, detail: detail, isAvailable: available)
+                return .init(id: identity(value), value: value, label: label, detail: origin + detail, isAvailable: available, sources: contributors)
             }.sorted { ($0.label, $0.id) < ($1.label, $1.id) } : []
             var heading = fieldTitle(conflict.field)
             if component == .summary, let generation, parts.count >= 4,
@@ -246,12 +256,13 @@ final class SharedLibraryReviewState {
             let old = state.conflicts.filter { $0.inactiveGeneration != nil && $0.field.hasPrefix(component.rawValue + ".") }
             guard !old.isEmpty, let document = state.currentDocument(for: component),
                   state.lifecycle == .alive || (state.kind == .recording && state.lifecycle == .deleted) else { continue }
-            let detail = old.flatMap { $0.values }.map { preview($0, field: component.rawValue) }.sorted().joined(separator: "\n")
+            let detail = old.flatMap { conflict in conflict.values.map { attributedPreview($0, field: conflict.field, state: state, labels: writerLabels) } }.sorted().joined(separator: "\n\n")
             let value = SharedFieldValue.document(document)
             fields.append(.init(id: component.rawValue + ".olderEdits", title: "Edits for an older " + component.rawValue,
                 choices: [.init(id: identity(value), value: value, label: "Keep current version and discard older edits",
-                    detail: "Current version:\n" + preview(value, field: component.rawValue) + "\n\nEdits to discard:\n" + detail,
-                    isAvailable: component == .transcript ? (try? document.decode(Transcript.self)) != nil : (try? document.decode(Summary.self)) != nil)],
+                    detail: "Current version:\n" + attributedPreview(value, field: component.rawValue + ".content", state: state, labels: writerLabels) + "\n\nEdits to discard:\n" + detail,
+                    isAvailable: component == .transcript ? (try? document.decode(Transcript.self)) != nil : (try? document.decode(Summary.self)) != nil,
+                    sources: sources(value, field: component.rawValue + ".content", state: state, labels: writerLabels))],
                 explanation: "These edits belong to a replaced version. They will not be applied to the current version.", component: component, generation: nil, isOlderEdits: true))
         }
         // Only reviewed registers/content affect a choice. Unrelated record
@@ -263,24 +274,36 @@ final class SharedLibraryReviewState {
         let signature = SharedLibraryOperation.fingerprint((try? encoder.encode(context)) ?? Data())
         return .init(title: title, snapshot: snapshot, fields: fields, reviewSignature: signature, folderRequests: requestChoices)
     }
-    private static func lifecyclePreview(_ state: SharedEntityState) -> String {
+    private static func lifecyclePreview(_ state: SharedEntityState, labels: [UUID: String]) -> String {
         var sections: [String] = []
         if state.kind == .template {
             for (field, label) in [("name", "Name"), ("description", "Description"), ("prompt", "Instructions")] {
-                let alternatives = (state.fields[field]?.values ?? []).map { preview($0, field: field) }.sorted()
+                let alternatives = (state.fields[field]?.values ?? []).map { attributedPreview($0, field: field, state: state, labels: labels) }.sorted()
                 if !alternatives.isEmpty { sections.append(label + ":\n" + alternatives.joined(separator: "\n\n")) }
             }
             return sections.joined(separator: "\n\n")
         }
         for component in [SharedComponent.transcript, .summary] {
             for document in state.generationValues(for: component).sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
-                sections.append(preview(.document(document), field: component.rawValue + ".content"))
+                sections.append(attributedPreview(.document(document), field: component.rawValue + ".content", state: state, labels: labels))
             }
-            for (_, value) in state.generationEdits(for: component).sorted(by: { $0.key < $1.key }) {
-                sections.append((component == .transcript ? "Speaker: " : "Action item: ") + preview(value, field: component.rawValue))
+            for (field, register) in state.fields.sorted(by: { $0.key < $1.key }) where field.hasPrefix(component.rawValue + ".edits.") {
+                for value in register.values.sorted(by: { identity($0) < identity($1) }) {
+                    sections.append((component == .transcript ? "Speaker:\n" : "Action item:\n") + attributedPreview(value, field: field, state: state, labels: labels))
+                }
             }
         }
         return sections.isEmpty ? "The recording and its stored edits remain associated with this item." : sections.joined(separator: "\n\n")
+    }
+
+    private static func sources(_ value: SharedFieldValue, field: String, state: SharedEntityState, labels: [UUID: String]) -> [String] {
+        (state.fields[field]?.writers(for: value) ?? []).map { labels[$0] ?? ("Unknown Mac · " + $0.uuidString.lowercased()) }.sorted()
+    }
+    private static func sourceNote(_ sources: [String]) -> String {
+        sources.isEmpty ? "" : "From: " + sources.joined(separator: ", ") + "\n"
+    }
+    private static func attributedPreview(_ value: SharedFieldValue, field: String, state: SharedEntityState, labels: [UUID: String]) -> String {
+        sourceNote(sources(value, field: field, state: state, labels: labels)) + preview(value, field: field)
     }
 
     private static func fieldTitle(_ field: String) -> String {
