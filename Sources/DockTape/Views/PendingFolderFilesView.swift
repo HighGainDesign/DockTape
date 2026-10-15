@@ -41,6 +41,12 @@ struct PendingFolderFilesView: View {
                                         .disabled(!item.canAcknowledge || disabled)
                                         .accessibilityLabel("Approve deletion of folder " + item.name + " on this Mac")
                                 }
+                                if item.canReplan {
+                                    Button("Review Updated Plan…") {
+                                        guard let coordinator = state.sharedLibrary.coordinator else { return }
+                                        Task { await model.prepareUpdatedPlan(item, using: coordinator) }
+                                    }.disabled(disabled)
+                                }
                                 Button(item.purpose == .delete ? "Continue Folder Deletion" : "Resume Folder Change") { perform(.resume, item) }
                                     .disabled(!item.canResume || disabled)
                                     .accessibilityLabel("Resume folder change for " + item.name)
@@ -56,6 +62,30 @@ struct PendingFolderFilesView: View {
             if let message = model.message { Text(message).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding([.horizontal, .top]) }
             HStack { Button("Close", action: onClose).keyboardShortcut(.cancelAction); Spacer() }.padding()
         }.frame(minWidth: 640, minHeight: 420)
+        .sheet(item: Binding(get: { model.updatedPlan }, set: { if $0 == nil { model.dismissUpdatedPlan() } })) { plan in
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Review Updated Folder Plan").font(.title2)
+                Text(plan.source == plan.destination ? "Keep the available directory at the selected location after verifying its files. Child recordings keep their identities." : "Move the available directory and its files to the selected folder location. Child recordings keep their identities.")
+                Text("Current folder").font(.headline)
+                Text(plan.source).textSelection(.enabled)
+                Text("Selected location").font(.headline)
+                Text(plan.destination).textSelection(.enabled)
+                ScrollView { VStack(alignment: .leading, spacing: 4) {
+                    ForEach(plan.files, id: \.self) { Text($0).textSelection(.enabled) }
+                }.frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 180)
+                if let message = model.message { Text(message).foregroundStyle(.secondary) }
+                HStack {
+                    Button("Cancel") { model.dismissUpdatedPlan() }.keyboardShortcut(.cancelAction).disabled(model.isWorking)
+                    Spacer()
+                    if model.isWorking { ProgressView().controlSize(.small) }
+                    Button("Apply Updated Plan") {
+                        guard let coordinator = state.sharedLibrary.coordinator else { return }
+                        Task { if await model.applyUpdatedPlan(using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
+                    }.keyboardShortcut(.defaultAction).disabled(model.isWorking || model.isLoading)
+                        .accessibilityLabel("Apply reviewed folder location " + plan.destination)
+                }
+            }.padding(24).frame(width: 500).interactiveDismissDisabled(model.isWorking)
+        }
         .task(id: state.sharedLibrary.revision) { await reload() }
         .onChange(of: model.items.map(\.id)) { _, ids in if !ids.contains(where: { $0 == selected }) { selected = ids.first } }
     }

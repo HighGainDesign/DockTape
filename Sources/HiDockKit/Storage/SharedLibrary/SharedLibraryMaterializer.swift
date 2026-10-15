@@ -394,7 +394,7 @@ public actor SharedLibraryMaterializer {
     case .moveDirectory(_, let destination, _):
       removing = false
       guard current.state.lifecycle == .alive, current.directoryScopeMatches,
-            current.state.value(for: "physicalPath") == .text(destination), current.state.value(for: "name") == .text(destination) else { throw SharedLibraryOperationError.staleAuthority }
+            current.state.value(for: "physicalPath") == .text(destination), (current.resolvedFolderPath ?? current.state.value(for: "name").flatMap { if case .text(let value) = $0 { return value }; return nil }) == destination else { throw SharedLibraryOperationError.staleAuthority }
     case .removeEmptyDirectory(let path):
       removing = true
       guard current.state.lifecycle == .deleted, current.pathOwners[path] == [operation.entity.id],
@@ -755,8 +755,10 @@ public actor SharedLibraryMaterializer {
   {
     let paths: [(String, CoordinatedFileAccess.WriteMode)]
     switch step {
-    case .move(let source, let destination, _), .moveDirectory(let source, let destination, _):
+    case .move(let source, let destination, _):
       paths = [(source, .moving), (destination, .replacing)]
+    case .moveDirectory(let source, let destination, _):
+      paths = source == destination ? [(source, .merging)] : [(source, .moving), (destination, .replacing)]
     case .write(let path, _, _): paths = [(path, .replacing)]
     case .trash(let path, _): paths = [(path, .deleting)]
     case .removeEmptyDirectory(let path): paths = [(path, .deleting)]
@@ -835,6 +837,14 @@ public actor SharedLibraryMaterializer {
       return .init(changed: true, pending: nil)
     case .moveDirectory(let source, let destination, let expected):
       try owner(source, authority: authority, required: true)
+      if source == destination {
+        // Explicit reviewed retention of a proven directory. This phase writes
+        // only its receipt; it never creates, replaces or moves the directory.
+        guard fm.fileExists(atPath: files[0].url.path) else { return .init(changed: false, pending: .waitingForFile(source)) }
+        guard try SharedDirectoryInventory.capture(at: files[0].url) == expected else { throw SharedLibraryOperationError.contentChanged(source) }
+        try files[0].checkCancellation(); try beforeMutation()
+        return .init(changed: false, pending: nil)
+      }
       try owner(destination, authority: authority, required: false)
       let hasSource = fm.fileExists(atPath: files[0].url.path)
       let hasDestination = fm.fileExists(atPath: files[1].url.path)

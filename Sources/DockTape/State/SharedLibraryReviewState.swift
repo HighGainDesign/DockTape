@@ -31,12 +31,13 @@ final class SharedLibraryReviewState {
         let reviewSignature: String
         let folderRequests: [String: SharedFolderDeletionRequestReview]
         let recordingPaths: [String: SharedRecordingPathReview]
+        let folderPaths: [String: SharedFolderPathReview]
 
         func visibleFields(selections: [String: String]) -> [Field] {
             if snapshot.state.lifecycle == .conflicted {
                 return fields.filter { $0.id == "$lifecycle" }
             }
-            if let path = fields.first(where: { $0.id == "recording.path" }) { return [path] }
+            if let path = fields.first(where: { $0.id == "recording.path" || $0.id == "folder.path" }) { return [path] }
             return fields.filter { field in
                 guard let component = field.component, let generation = field.generation else { return true }
                 let content = fields.first { $0.id == component.rawValue + ".content" }
@@ -78,7 +79,8 @@ final class SharedLibraryReviewState {
             for view in conflicted {
                 let requests = view.state.kind == .folder ? try await coordinator.folderDeletionRequestChoices(view) : []
                 let paths = view.state.kind == .recording ? try await coordinator.recordingPathChoices(view) : []
-                loaded.append(Self.item(view, writerLabels: labels, folderRequests: requests, recordingPaths: paths))
+                let folders = view.state.kind == .folder ? try await coordinator.folderPathChoices(view) : []
+                loaded.append(Self.item(view, writerLabels: labels, folderRequests: requests, recordingPaths: paths, folderPaths: folders))
             }
             guard request == ticket, binding === coordinator, !Task.isCancelled else { return }
             items = loaded.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
@@ -93,6 +95,10 @@ final class SharedLibraryReviewState {
         if let field = fields.first(where: { $0.id == "recording.path" }) {
             guard let selected = selections[field.id], let review = item.recordingPaths[selected], fields.count == 1 else { return false }
             return await applyRecordingPath(review, using: coordinator)
+        }
+        if let field = fields.first(where: { $0.id == "folder.path" }) {
+            guard let selected = selections[field.id], let review = item.folderPaths[selected], fields.count == 1 else { return false }
+            return await applyFolderPath(review, using: coordinator)
         }
         if let field = fields.first(where: { $0.id == "deletionRequest" }), item.snapshot.state.kind == .folder {
             guard let selected = selections[field.id], let review = item.folderRequests[selected], fields.count == 1 else { return false }
@@ -196,6 +202,29 @@ final class SharedLibraryReviewState {
         if binding === coordinator { isApplying = false; action = nil }
         return result
     }
+    private func applyFolderPath(_ review: SharedFolderPathReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
+        let ticket = request
+        isApplying = true; message = nil
+        let task = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                _ = try await coordinator.resolveFolderPath(review)
+                guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
+                await self.refresh(using: coordinator)
+                guard self.binding === coordinator, !Task.isCancelled else { return true }
+                self.message = "Folder location selected. Existing files are preserved. Open Pending Folders to review the updated plan."
+                return true
+            } catch {
+                guard let self, self.binding === coordinator, self.request == ticket else { return false }
+                if !(error is CancellationError) { self.message = "The folder, its children or participating Macs changed. Reload the folder location choices before deciding." }
+                return false
+            }
+        }
+        action = task
+        let result = await task.value
+        if binding === coordinator { isApplying = false; action = nil }
+        return result
+    }
     private func applyFolderRequest(_ review: SharedFolderDeletionRequestReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
         let ticket = request
         isApplying = true; message = nil
@@ -223,13 +252,28 @@ final class SharedLibraryReviewState {
         if binding === coordinator { isApplying = false; action = nil }
         return result
     }
-    private static func item(_ snapshot: SharedLibraryViewSnapshot, writerLabels: [UUID: String], folderRequests requests: [SharedFolderDeletionRequestReview] = [], recordingPaths: [SharedRecordingPathReview] = []) -> Item {
+    private static func item(_ snapshot: SharedLibraryViewSnapshot, writerLabels: [UUID: String], folderRequests requests: [SharedFolderDeletionRequestReview] = [], recordingPaths: [SharedRecordingPathReview] = [], folderPaths: [SharedFolderPathReview] = []) -> Item {
         let state = snapshot.state
         let requestChoices = Dictionary(uniqueKeysWithValues: requests.map { (identity($0.value), $0) })
         let title = text(state.value(for: state.kind == .recording ? "title" : "name"))
             ?? text(state.value(for: "initialPath")) ?? (state.kind == .template ? "Summary template" : "Library item")
         var fields: [Field] = []
         let pathChoices = Dictionary(recordingPaths.map { (identity(.text($0.destination)), $0) }, uniquingKeysWith: { first, _ in first })
+        let folderChoices = Dictionary(folderPaths.map { (identity(.text($0.destination)), $0) }, uniquingKeysWith: { first, _ in first })
+        let folderConflict = state.kind == .folder && (state.fields["name"]?.isConflicted == true || state.fields["parent"]?.isConflicted == true)
+        if folderConflict, state.lifecycle == .alive {
+            let choices = folderPaths.map { review -> Choice in
+                let contributors = Set(review.values.flatMap { sources($0.value, field: $0.key, state: state, labels: writerLabels) }).sorted()
+                let name = review.values["name"].map { attributedPreview($0, field: "name", state: state, labels: writerLabels) } ?? ""
+                let parents = review.values["parent"].map { sources($0, field: "parent", state: state, labels: writerLabels) } ?? []
+                let parent = (review.destination as NSString).deletingLastPathComponent
+                let detail = "Selected folder: " + review.destination + "\n\nName:\n" + name + "\n\nParent:\n" + sourceNote(parents) + (parent.isEmpty ? "Library root" : parent)
+                    + "\n\nSelecting a location does not move or remove files. Review the updated directory plan in Pending Folders."
+                return .init(id: identity(.text(review.destination)), value: .text(review.destination), label: review.destination, detail: detail, isAvailable: true, sources: contributors)
+            }
+            fields.append(.init(id: "folder.path", title: "Folder name and location", choices: choices,
+                explanation: choices.isEmpty ? "The candidate folder locations conflict with another owner or an unavailable ancestor. Resolve the affected folders before choosing a location." : "Choose the complete folder location. Directory changes require a separate reviewed plan.", component: nil, generation: nil, isOlderEdits: false))
+        }
         let pathConflict = state.kind == .recording && (state.fields["title"]?.isConflicted == true || state.fields["folder"]?.isConflicted == true)
         if pathConflict, state.lifecycle != .conflicted {
             let choices = recordingPaths.map { review -> Choice in
@@ -248,7 +292,8 @@ final class SharedLibraryReviewState {
         for conflict in state.conflicts where conflict.inactiveGeneration == nil
             && !conflict.field.hasPrefix("externalAdoption.")
             && !conflict.field.hasPrefix("externalAdoptionGeneration.")
-            && !(pathConflict && ["title", "folder"].contains(conflict.field)) {
+            && !(pathConflict && ["title", "folder"].contains(conflict.field))
+            && !(folderConflict && ["name", "parent"].contains(conflict.field)) {
             let parts = conflict.field.split(separator: ".").map(String.init)
             let component = parts.first.flatMap(SharedComponent.init(rawValue:))
             let generation = parts.count >= 4 && parts[1] == "edits" ? UUID(uuidString: parts[2]) : nil
@@ -320,8 +365,9 @@ final class SharedLibraryReviewState {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         for key in keys { if let register = state.fields[key] { context[key] = (try? encoder.encode(register))?.base64EncodedString() } }
         for (id, review) in pathChoices { context["recording.path." + id] = review.contextFingerprint }
+        for (id, review) in folderChoices { context["folder.path." + id] = review.contextFingerprint }
         let signature = SharedLibraryOperation.fingerprint((try? encoder.encode(context)) ?? Data())
-        return .init(title: title, snapshot: snapshot, fields: fields, reviewSignature: signature, folderRequests: requestChoices, recordingPaths: pathChoices)
+        return .init(title: title, snapshot: snapshot, fields: fields, reviewSignature: signature, folderRequests: requestChoices, recordingPaths: pathChoices, folderPaths: folderChoices)
     }
     private static func lifecyclePreview(_ state: SharedEntityState, labels: [UUID: String]) -> String {
         var sections: [String] = []

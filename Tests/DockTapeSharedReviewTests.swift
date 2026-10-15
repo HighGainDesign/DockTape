@@ -501,6 +501,75 @@ import HiDockKit
         print("Actual unprepared deletion passed: retry, explicit Keep, native external-file restoration and deletion again complete without fixture repair writes.")
     }
 
+    @MainActor static func folderPathChecks(parent: URL) async throws {
+        for stage in ["unstarted", "attempted", "published"] {
+            let directory = parent.appendingPathComponent(stage), left = directory.appendingPathComponent("left"), right = directory.appendingPathComponent("right")
+            for path in ["Folder/Nested", "Target"] { try FileManager.default.createDirectory(at: left.appendingPathComponent(path), withIntermediateDirectories: true) }
+            let audio = Data("Synthetic folder conversation".utf8), nested = Data("Synthetic nested conversation".utf8), notes = Data("Preserve ordinary hidden notes".utf8)
+            try audio.write(to: left.appendingPathComponent("Folder/A.mp3")); try nested.write(to: left.appendingPathComponent("Folder/Nested/B.mp3")); try notes.write(to: left.appendingPathComponent("Folder/.notes"))
+            try await TranscriptStore(baseDirectory: left).save(Transcript(recordingFilename: "Folder/A.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: "Folder conversation")]), mp3Filename: "Folder/A.mp3")
+            let writer = UUID(), local = directory.appendingPathComponent("a-local")
+            let seed = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local)
+            _ = try await seed.enable(); _ = try await seed.projectOutputs()
+            let views = try await seed.snapshots(kinds: [.folder])
+            guard let original = views.first(where: { $0.state.value(for: "name") == .text("Folder") }), let target = views.first(where: { $0.state.value(for: "name") == .text("Target") }) else { throw Failure(message: "Missing seeded folders") }
+            let entity = SharedEntityIdentity(id: original.state.id, kind: .folder)
+            let child = try await seed.reference(to: "Folder/A.mp3"), nestedChild = try await seed.reference(to: "Folder/Nested/B.mp3")
+            try FileManager.default.copyItem(at: left, to: right)
+            let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: directory.appendingPathComponent("b-local"), afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+            try await b.requestEnrollment(requestID: UUID(), label: "Folder peer")
+            for _ in 0..<3 { try deliver(right, to: left, writer: b.writerID); try await seed.refresh(); try deliver(left, to: right, writer: seed.writerID); try await b.refresh() }
+            let a = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local, afterCommit: { if stage == "unstarted" { withUnsafeCurrentTask { $0?.cancel() } } })
+            let own = Task { try await a.renameFolder(from: "Folder", to: "Local", afterMutation: { _ in if stage == "attempted" { throw CancellationError() } }) }
+            do { _ = try await own.value; try expect(stage == "published", "Expected interrupted local folder move") } catch is CancellationError { }
+            do { _ = try await Task { try await b.renameFolder(from: "Folder", to: "Peer") }.value; throw Failure(message: "Expected interrupted peer folder move") } catch is CancellationError { }
+            // A parent change is independent of the competing names; the chosen
+            // complete destination must honor that stable parent ID.
+            do { _ = try await Task { try await b.edit(.init(base: try await b.read(entity), changes: [.assign(field: "parent", value: .text(target.state.id.uuidString))])) }.value } catch is CancellationError { }
+            try deliver(right, to: left, writer: b.writerID)
+            let pending = FolderFileReviewState(), pause = SavePause()
+            let current = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local, afterPublishedLibraryRead: {
+                if stage == "unstarted", await MainActor.run(body: { pending.isWorking && pending.isLoading }) { await pause.pauseOnce() }
+            })
+            let model = SharedLibraryReviewState(); await model.refresh(using: current)
+            guard let item = model.items.first(where: { $0.id == entity.id }), let field = item.fields.first(where: { $0.id == "folder.path" }),
+                  let selected = field.choices.first(where: { $0.value == .text("Target/Peer") }) else { throw Failure(message: "Competing folder names must offer a complete validated location; stage=" + stage) }
+            try expect(selected.detail.contains("Folder peer"), "Folder choice identifies contributing Mac")
+            try expect(await model.apply(item: item, selections: [field.id: selected.id], using: current), "Actual folder review saves exact selected name/parent")
+            let source = stage == "unstarted" ? "Folder" : "Local"
+            try expect(try Data(contentsOf: left.appendingPathComponent(source + "/A.mp3")) == audio, "Semantic folder choice preserves original bytes before physical review")
+            try expect(child.entityID != nestedChild.entityID, "Distinct child identities remain available")
+            await pending.refresh(using: current)
+            guard let row = pending.items.first(where: { $0.id == entity.id }), row.canReplan else { throw Failure(message: "Selected folder path needs an actionable updated plan; stage=" + stage + "; feedback=" + (pending.message ?? "nil")) }
+            await pending.prepareUpdatedPlan(row, using: current)
+            guard let plan = pending.updatedPlan else { throw Failure(message: "Folder updated plan must be inspectable; stage=" + stage + "; feedback=" + (pending.message ?? "nil")) }
+            try expect(plan.source == source && plan.destination == "Target/Peer", "Reviewed directory plan uses actual source and complete selected path")
+            if stage == "unstarted" {
+                let action = Task { await pending.applyUpdatedPlan(using: current) }
+                for _ in 0..<500 { if await pause.entered { break }; try await Task.sleep(for: .milliseconds(20)) }
+                guard await pause.entered else { action.cancel(); await pause.release(); _ = await action.value; throw Failure(message: "Updated folder plan did not reach held feedback refresh") }
+                pending.clear()
+                let otherRoot = directory.appendingPathComponent("other-library")
+                try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
+                let other = SharedLibraryCoordinator(root: otherRoot, writerID: UUID(), witnessDirectory: directory.appendingPathComponent("other-local"))
+                _ = try await other.enable(); await pending.refresh(using: other)
+                await pause.release(); _ = await action.value
+                try expect(pending.message == nil && pending.items.isEmpty && !pending.isWorking && !pending.isLoading, "Old updated-plan feedback must not cross a library switch during refresh")
+            } else { try expect(await pending.applyUpdatedPlan(using: current), "Actual reviewed folder plan finishes") }
+            try expect(try Data(contentsOf: left.appendingPathComponent("Target/Peer/A.mp3")) == audio, "Original child audio preserved exactly")
+            try expect(try Data(contentsOf: left.appendingPathComponent("Target/Peer/Nested/B.mp3")) == nested, "Nested child audio preserved exactly")
+            try expect(try Data(contentsOf: left.appendingPathComponent("Target/Peer/.notes")) == notes, "Ordinary hidden file moves without replacement")
+            try expect(!FileManager.default.fileExists(atPath: left.appendingPathComponent("Folder").path) && !FileManager.default.fileExists(atPath: left.appendingPathComponent("Local").path), "Completed folder recovery leaves no source directory duplicate")
+            try expect(try await current.reference(to: "Target/Peer/A.mp3") == child, "First child retains stable identity")
+            try expect(try await current.reference(to: "Target/Peer/Nested/B.mp3") == nestedChild, "Nested child retains stable identity")
+            let transcript = try await TranscriptStore(baseDirectory: left).loadTranscript(for: "Target/Peer/A.mp3")
+            try expect(transcript?.segments.first?.text == "Folder conversation", "Transcript follows the selected directory path")
+            try expect((try await current.read(entity)).state.conflicts.isEmpty, "Physical bookkeeping conflicts resolve through reviewed continuation")
+            print("Actual folder path recovery stage passed: " + stage)
+        }
+    }
+
     @MainActor static func recordingPathChecks(parent: URL) async throws {
         let stages = CommandLine.arguments.contains("--recording-path-deleted-published-only") ? ["deleted-published"] : CommandLine.arguments.contains("--recording-path-published-only") ? ["published"] : ["unstarted", "partial", "published", "deleted-unstarted", "deleted-partial", "deleted-published"]
         for stage in stages {
@@ -843,6 +912,7 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--folder-paths-only") { try await folderPathChecks(parent: parent); return }
         if arguments.contains("--recording-paths-only") || arguments.contains("--recording-path-published-only") || arguments.contains("--recording-path-deleted-published-only") { try await recordingPathChecks(parent: parent); return }
         if arguments.contains("--source-macs-only") { try await sourceMacChecks(parent: parent); return }
         if arguments.contains("--template-lifecycle-only") { try await templateLifecycleChecks(parent: parent); return }
@@ -856,6 +926,7 @@ import HiDockKit
             return
         }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
+        try await folderPathChecks(parent: parent.appendingPathComponent("folder-paths"))
         try await recordingPathChecks(parent: parent.appendingPathComponent("recording-paths"))
         try await sourceMacChecks(parent: parent.appendingPathComponent("source-macs"))
         try await templateLifecycleChecks(parent: parent.appendingPathComponent("template-lifecycle"))

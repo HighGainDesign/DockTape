@@ -13,10 +13,19 @@ public struct SharedFolderOperationReview: Identifiable, Sendable {
     public let needsReplanning: Bool
     public let canAcknowledge: Bool
     public let canResume: Bool
+    public var canReplan: Bool {
+        guard purpose == .rename, needsReplanning, !hasActiveWork,
+              base.state.lifecycle == .alive, base.state.value(for: "deletionRequest") == nil,
+              base.state.fields["name"]?.isConflicted != true, base.state.fields["parent"]?.isConflicted != true,
+              base.state.conflicts.allSatisfy({ ["physicalPath", "moveScope"].contains($0.field) }) else { return false }
+        if case .moveDirectory? = operation?.steps.first { return true }
+        return false
+    }
     let base: SharedLibraryViewSnapshot
     let cohort: String
     public var isDeletionRequest: Bool { deletionRequest }
     let deletionRequest: Bool
     let operation: SharedLibraryOperation?
     let intentWriter: UUID?
+    let localOperation: SharedLibraryOperation?
 }

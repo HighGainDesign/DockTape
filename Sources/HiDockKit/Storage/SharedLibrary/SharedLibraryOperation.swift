@@ -81,6 +81,7 @@ public struct SharedMaterializationAuthority: Sendable {
   var releasedRecordingPaths: Set<String> = []
   /// Frozen child placements must still match an accepted directory move.
   public var directoryScopeMatches: Bool = true
+  public var resolvedFolderPath: String? = nil
   /// Exact owners from the current identity/path index plus retained operation
   /// claims. An empty set is unowned, multiple IDs is a path conflict.
   public var pathOwners: [String: Set<UUID>]
@@ -185,6 +186,7 @@ struct SharedPreparedAudioIntent: Codable, Sendable {
 public struct SharedLibraryOperation: Codable, Equatable, Sendable {
   public enum Step: Codable, Equatable, Sendable {
     case move(source: String, destination: String, fingerprint: String)
+    /// Equal paths explicitly verify an existing inventory without moving files.
     case moveDirectory(source: String, destination: String, inventory: SharedDirectoryInventory)
     case write(path: String, expectedFingerprint: String?, bytes: Data)
     case trash(path: String, fingerprint: String)
@@ -259,7 +261,7 @@ public struct SharedLibraryOperation: Codable, Equatable, Sendable {
         paths = [source, destination]
         hashes = [hash]
       case .moveDirectory(let source, let destination, let inventory):
-        guard entity.kind == .folder, source != destination,
+        guard entity.kind == .folder,
               !destination.hasPrefix(source + "/"), !source.hasPrefix(destination + "/") else { throw SharedLibraryOperationError.invalidOperation }
         try inventory.validate()
         paths = [source, destination]; hashes = []

@@ -10,6 +10,7 @@ import HiDockKit
     private(set) var isWorking = false
     private(set) var inspectionFailed = false
     private(set) var message: String?
+    private(set) var updatedPlan: SharedFolderReplanReview?
     private var binding: SharedLibraryCoordinator?
     private var request = UUID()
     private var action: Task<Bool, Never>?
@@ -17,7 +18,7 @@ import HiDockKit
 
     func clear() {
         request = UUID(); workID = UUID(); action?.cancel(); action = nil
-        binding = nil; items = []; message = nil; isLoading = false; isWorking = false; inspectionFailed = false
+        binding = nil; items = []; message = nil; updatedPlan = nil; isLoading = false; isWorking = false; inspectionFailed = false
     }
     func refresh(using coordinator: SharedLibraryCoordinator) async {
         if binding !== coordinator { clear(); binding = coordinator }
@@ -41,6 +42,46 @@ import HiDockKit
                 inspectionFailed = true; message = "Folder changes could not be loaded. Reload when the library is available."
             }
         }
+    }
+    func dismissUpdatedPlan() { guard !isWorking else { return }; updatedPlan = nil }
+    func prepareUpdatedPlan(_ review: SharedFolderOperationReview, using coordinator: SharedLibraryCoordinator) async {
+        guard binding === coordinator, !isLoading, !isWorking, review.canReplan else { return }
+        let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
+        defer { if binding === coordinator, workID == work { isWorking = false } }
+        do {
+            let prepared = try await coordinator.prepareFolderReplan(review)
+            guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
+            updatedPlan = prepared
+        } catch {
+            if binding === coordinator, request == ticket, !(error is CancellationError) { message = "The directory plan could not be prepared. Reload after sync finishes; existing folders and files are preserved." }
+        }
+    }
+    @discardableResult func applyUpdatedPlan(using coordinator: SharedLibraryCoordinator) async -> Bool {
+        guard binding === coordinator, !isLoading, !isWorking, let prepared = updatedPlan else { return false }
+        let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
+        let task = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                let outcome = try await coordinator.applyFolderReplan(prepared)
+                guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
+                self.updatedPlan = nil
+                await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
+                self.message = outcome.result == .complete && outcome.projectionError == nil ? "Updated folder plan completed." : "Updated folder plan accepted. Review remaining folder changes."
+                return true
+            } catch {
+                guard let self, self.binding === coordinator, self.request == ticket else { return false }
+                self.updatedPlan = nil
+                await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return false }
+                if !(error is CancellationError) { self.message = "The directory plan could not finish. Reload before trying again; existing files are preserved." }
+                return false
+            }
+        }
+        action = task
+        let result = await task.value
+        if binding === coordinator, workID == work { isWorking = false; action = nil }
+        return result
     }
     @discardableResult func perform(_ choice: Action, review: SharedFolderOperationReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
         guard binding === coordinator, !isLoading, !isWorking, items.contains(where: { $0.id == review.id }) else { return false }
