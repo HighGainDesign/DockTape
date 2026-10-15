@@ -15,6 +15,8 @@ import SwiftUI
                     .tabItem { Text("Competing Edits") }
                 PendingRecordingFilesView(state: state, onClose: { [weak window] in window?.close() })
                     .tabItem { Text("Pending Files") }
+                ExternalSidecarReviewView(state: state, onClose: { [weak window] in window?.close() })
+                    .tabItem { Text("External Files") }
             })
         window.setFrameAutosaveName("SharedLibraryReview")
         window.center()

@@ -88,6 +88,21 @@ public struct SharedExternalContent: Equatable, Sendable {
   public let fingerprint: String
   public let document: SharedDocument
 }
+/// Opaque consent for one actual sidecar and the exact state shown beside it.
+/// Damaged/foreign JSON may be replaced with reviewed current content, never adopted.
+public struct SharedSidecarReview: Identifiable, Sendable {
+  public var id: String { entity.id.uuidString + component.rawValue + fingerprint }
+  public let filename: String
+  public let component: SharedComponent
+  public let currentText: String
+  public let changedText: String?
+  let entity: SharedEntityIdentity
+  let snapshot: SharedLibraryViewSnapshot
+  let url: URL
+  let fingerprint: String
+  let current: SharedDocument
+  let changed: SharedDocument?
+}
 public enum SharedLibraryChange: Sendable {
   case loading(UUID, SharedEntityIdentity)
   case entity(UUID, SharedEntityIdentity, String)
@@ -2083,6 +2098,75 @@ public actor SharedLibraryCoordinator {
     return try SharedStateFingerprint.of(
       state.value(for: "audioFingerprint") ?? state.value(for: "legacyMetadata"))
   }
+  /// Inspect only a recording's current canonical sidecars. A missing or cold
+  /// file is not a deletion, and inspection never changes authoritative state.
+  public func reviewSidecars(_ entity: SharedEntityIdentity) async throws -> [SharedSidecarReview] {
+    let view = try await read(entity)
+    guard entity.kind == .recording, view.state.lifecycle == .alive,
+      view.state.conflicts.isEmpty else { throw SharedSidecarError.conflictedContent }
+    let filename = try await currentPath(view)
+    let manifest = try await bind(force: true)
+    let membership = try await memberRepository().load().membership
+    let published = try await SharedPublishedLocations.load(root: root, manifest: manifest,
+      membership: membership, afterLibraryRead: afterPublishedLibraryRead)
+    let currentFiles = try SharedLibraryReadableExport.files(view: view, recordingPath: filename)
+    var result: [SharedSidecarReview] = []
+    for component in [SharedComponent.transcript, .summary] {
+      let path = (filename as NSString).deletingPathExtension + "." + component.rawValue + ".json"
+      let url = root.appendingPathComponent(path)
+      guard FileManager.default.fileExists(atPath: url.path) else { continue }
+      guard url.resolvingSymlinksInPath().path == url.path else { throw SharedLibraryRepositoryError.invalidPath }
+      let bytes = try await CoordinatedFileAccess().read(at: url)
+      if (try? published.validateCompanion(path: path, bytes: bytes, entity: entity.id,
+          library: view.libraryID, kind: component.rawValue)) != nil { continue }
+      guard let currentBytes = currentFiles[path] else { throw SharedSidecarError.invalidContent }
+      let current = try SharedDocument(id: UUID(), json: externalBody(currentBytes, snapshot: view, component: component))
+      let changed: SharedDocument?
+      if let body = try? externalBody(bytes, snapshot: view, component: component),
+         let document = try? SharedDocument(id: UUID(), json: body),
+         (try? Self.sidecarText(document, component: component)) != nil { changed = document }
+      else { changed = nil }
+      result.append(.init(filename: filename, component: component,
+        currentText: try Self.sidecarText(current, component: component),
+        changedText: try changed.map { try Self.sidecarText($0, component: component) },
+        entity: entity, snapshot: view, url: url, fingerprint: try SharedStateFingerprint.of(bytes),
+        current: current, changed: changed))
+    }
+    guard try await read(entity).fingerprint == view.fingerprint,
+      try await currentPath(view) == filename else { throw SharedLibraryCoordinatorError.staleReview }
+    return result
+  }
+  public func recoverSidecar(_ review: SharedSidecarReview, useChangedFile: Bool) async throws -> SharedLibraryViewSnapshot {
+    let fresh = try await read(review.entity)
+    guard fresh.libraryID == review.snapshot.libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
+    guard fresh.fingerprint == review.snapshot.fingerprint,
+      try await currentPath(fresh) == review.filename else { throw SharedLibraryCoordinatorError.staleReview }
+    let bytes = try await CoordinatedFileAccess().read(at: review.url)
+    guard try SharedStateFingerprint.of(bytes) == review.fingerprint else { throw SharedLibraryCoordinatorError.externalChanged }
+    guard let document = useChangedFile ? review.changed : review.current else { throw SharedSidecarError.invalidContent }
+    // The writer checks this exact external hash again before replacing bytes.
+    // Effective current content includes speaker/checklist edits; a fresh content
+    // generation prevents applying those edits a second time after recovery.
+    return try await commit(.init(base: review.snapshot, changes: [
+      .generation(document, component: review.component),
+      .assign(field: "externalAdoption." + review.component.rawValue, value: .text(review.fingerprint))
+    ]), review: true, exact: true)
+  }
+  private static func sidecarText(_ document: SharedDocument, component: SharedComponent) throws -> String {
+    if component == .transcript {
+      let transcript = try document.decode(Transcript.self)
+      guard transcript.segments.allSatisfy({ $0.startTime.isFinite && $0.endTime.isFinite && $0.startTime >= 0
+        && $0.endTime >= $0.startTime && $0.endTime <= Double(Int32.max) }) else { throw SharedSidecarError.invalidContent }
+      return transcript.plainText()
+    }
+    let summary = try document.decode(Summary.self)
+    let ids = summary.sections.flatMap { $0.items ?? [] }.map(\.id)
+    guard Set(ids).count == ids.count else { throw SharedSidecarError.invalidContent }
+    return summary.sections.map { section in
+      ([section.heading, section.content] + (section.items ?? []).map { ($0.isCompleted ? "☑ " : "☐ ") + $0.text }).joined(separator: "\n")
+    }.joined(separator: "\n\n")
+  }
+
   /// Explicitly accept the reviewed external document. Materialization and
   /// provider-version cleanup follow a durable operation receipt, not this read.
   public func adoptExternal(_ candidate: SharedExternalContent, review: SharedLibraryViewSnapshot)

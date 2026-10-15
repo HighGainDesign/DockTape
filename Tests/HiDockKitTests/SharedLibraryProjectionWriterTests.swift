@@ -229,6 +229,99 @@ final class SharedLibraryProjectionWriterTests: XCTestCase {
         XCTAssertFalse(markdown.contains("Right competing content"))
     }
 
+    func testSidecarReviewAdoptsChangedFileAndPublishesReadableText() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let entity = SharedEntityIdentity(id: try await coordinator.recording(at: "Meeting.mp3").state.id, kind: .recording)
+        let cleanReviews = try await coordinator.reviewSidecars(entity)
+        XCTAssertTrue(cleanReviews.isEmpty)
+        let url = root.appendingPathComponent("Meeting.transcript.json")
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        var segments = try XCTUnwrap(object["segments"] as? [[String: Any]])
+        segments[0]["text"] = "Changed on another computer"
+        object["segments"] = segments
+        try JSONSerialization.data(withJSONObject: object, options: .sortedKeys).write(to: url, options: .atomic)
+        let reviews = try await coordinator.reviewSidecars(entity)
+        let review = try XCTUnwrap(reviews.first)
+        XCTAssertEqual(review.currentText, "[s] Readable fixture")
+        XCTAssertTrue(review.changedText?.contains("Changed on another computer") == true)
+        _ = try await coordinator.recoverSidecar(review, useChangedFile: true)
+        _ = try await coordinator.projectOutputs()
+        XCTAssertTrue(String(decoding: try Data(contentsOf: root.appendingPathComponent("Meeting.transcript.md")), as: UTF8.self).contains("Changed on another computer"))
+        let remainingReviews = try await coordinator.reviewSidecars(entity)
+        XCTAssertTrue(remainingReviews.isEmpty)
+    }
+    func testDamagedSidecarRestoresCurrentContentIncludingSpeakerEdits() async throws {
+        let (root, coordinator) = try await fixture()
+        let original = try await coordinator.recording(at: "Meeting.mp3")
+        var body = try JSONSerialization.jsonObject(with: original.state.currentDocument(for: .transcript)!.json) as! [String: Any]
+        body["futureExtension"] = ["keep": "unknown content"]
+        _ = try await coordinator.edit(.init(base: original, changes: [.generation(try SharedDocument(id: UUID(), json: JSONSerialization.data(withJSONObject: body)), component: .transcript)]))
+        let store = TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: coordinator))
+        _ = try await store.loadTranscript(for: "Meeting.mp3")
+        try await store.updateSpeakerNames(for: "Meeting.mp3", names: ["s": "Alice"])
+        _ = try await coordinator.projectOutputs()
+        let entity = SharedEntityIdentity(id: try await coordinator.recording(at: "Meeting.mp3").state.id, kind: .recording)
+        let url = root.appendingPathComponent("Meeting.transcript.json")
+        try Data("{damaged sync file".utf8).write(to: url, options: .atomic)
+        let reviews = try await coordinator.reviewSidecars(entity)
+        let review = try XCTUnwrap(reviews.first)
+        XCTAssertNil(review.changedText)
+        XCTAssertTrue(review.currentText.contains("Alice"))
+        do { _ = try await coordinator.recoverSidecar(review, useChangedFile: true); XCTFail("Damaged content cannot become a generation") }
+        catch SharedSidecarError.invalidContent { }
+        _ = try await coordinator.recoverSidecar(review, useChangedFile: false)
+        _ = try await coordinator.projectOutputs()
+        let recovered = try SharedContentCoding.decoder().decode(Transcript.self, from: Data(contentsOf: url))
+        XCTAssertEqual(recovered.speakerNames["s"], "Alice")
+        let restoredBody = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        XCTAssertEqual((restoredBody["futureExtension"] as? [String: String])?["keep"], "unknown content")
+        XCTAssertEqual(recovered.segments.first?.text, "Readable fixture")
+        let remainingReviews = try await coordinator.reviewSidecars(entity)
+        XCTAssertTrue(remainingReviews.isEmpty)
+    }
+    func testSidecarRecoveryRefusesChangedFileAndChangedReview() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let first = try await coordinator.recording(at: "Meeting.mp3")
+        let entity = SharedEntityIdentity(id: first.state.id, kind: .recording)
+        let url = root.appendingPathComponent("Meeting.transcript.json")
+        try Data("first damaged file".utf8).write(to: url, options: .atomic)
+        let firstReviews = try await coordinator.reviewSidecars(entity)
+        let firstReview = try XCTUnwrap(firstReviews.first)
+        let second = Data("new unseen changed file".utf8)
+        try second.write(to: url, options: .atomic)
+        do { _ = try await coordinator.recoverSidecar(firstReview, useChangedFile: false); XCTFail("Never replace unseen bytes") }
+        catch SharedLibraryCoordinatorError.externalChanged { }
+        XCTAssertEqual(try Data(contentsOf: url), second)
+        let secondReviews = try await coordinator.reviewSidecars(entity)
+        let secondReview = try XCTUnwrap(secondReviews.first)
+        _ = try await coordinator.edit(.init(base: first, changes: [.assign(field: "title", value: .text("Changed title"))]))
+        do { _ = try await coordinator.recoverSidecar(secondReview, useChangedFile: false); XCTFail("Reload a changed review") }
+        catch SharedLibraryCoordinatorError.staleReview { }
+        XCTAssertEqual(try Data(contentsOf: url), second)
+    }
+
+    func testSidecarRecoveryCannotAdoptInvalidTimesOrOverwriteUnseenPostAcceptanceBytes() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let entity = SharedEntityIdentity(id: try await coordinator.recording(at: "Meeting.mp3").state.id, kind: .recording)
+        let url = root.appendingPathComponent("Meeting.transcript.json")
+        var object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        var segments = object["segments"] as! [[String: Any]]
+        segments[0]["startTime"] = -1; object["segments"] = segments
+        try JSONSerialization.data(withJSONObject: object).write(to: url, options: .atomic)
+        let reviews = try await coordinator.reviewSidecars(entity)
+        let review = try XCTUnwrap(reviews.first)
+        XCTAssertNil(review.changedText)
+        _ = try await coordinator.recoverSidecar(review, useChangedFile: false)
+        let unseen = Data("new cloud bytes after reviewed choice".utf8)
+        try unseen.write(to: url, options: .atomic)
+        do { _ = try await coordinator.projectOutputs(); XCTFail("Never overwrite a file changed after acceptance") }
+        catch SharedProjectionWriteError.untracked(let path) { XCTAssertEqual(path, "Meeting.transcript.json") }
+        XCTAssertEqual(try Data(contentsOf: url), unseen)
+    }
+
     func testOwnPublicationIncludingSpeakerEditsIsNotAnExternalCandidate() async throws {
         let (root, coordinator) = try await fixture()
         let store = TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: coordinator))

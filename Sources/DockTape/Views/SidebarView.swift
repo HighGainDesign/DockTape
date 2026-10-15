@@ -179,6 +179,11 @@ struct SidebarView: View {
             Text("Library")
             Spacer()
             if state.sharedLibrary.coordinator != nil {
+                if state.sharedLibrary.message != nil {
+                    Button("Needs Review") { state.sharedLibrary.showsReview = true }
+                        .font(.caption).buttonStyle(.borderless)
+                        .help(state.sharedLibrary.message ?? "Review shared library")
+                }
                 Button { state.sharedLibrary.showsReview = true } label: { Image(systemName: "arrow.triangle.branch") }
                     .buttonStyle(.borderless).help("Review Shared Library")
                     .accessibilityLabel("Review Shared Library")

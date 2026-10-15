@@ -13,6 +13,16 @@ import HiDockKit
         }
         func release() { continuation?.resume(); continuation = nil }
     }
+    actor PauseSecondRead {
+        var count = 0
+        private(set) var entered = false
+        var continuation: CheckedContinuation<Void, Never>?
+        func visit() async {
+            count += 1
+            if count == 2 { entered = true; await withCheckedContinuation { continuation = $0 } }
+        }
+        func release() { continuation?.resume(); continuation = nil }
+    }
     struct Failure: Error { let message: String }
     static func expect(_ condition: Bool, _ message: String) throws { if !condition { throw Failure(message: message) } }
     static func deliver(_ source: URL, to destination: URL, writer: UUID) throws {
@@ -45,6 +55,86 @@ import HiDockKit
         }
         NSApp.run()
     }
+    @MainActor static func externalReviewChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("external-files")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in ["Changed.mp3", "Unrelated.mp3"] {
+            try Data("synthetic fixture".utf8).write(to: root.appendingPathComponent(name))
+            try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: name, transcriptionModel: "fixture", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: "Current " + name)]), mp3Filename: name)
+        }
+        UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+        let identityFile = parent.appendingPathComponent("external-identity.json")
+        let state = AppState(baseDirectory: root, sharedIdentity: {
+            try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "external fixture").load()
+        }, sharedWitnessDirectory: parent.appendingPathComponent("external-witnesses"))
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable actual AppState external-file fixture")
+        await state.refreshAll() // Finish initial shared-state publication before capturing unrelated bytes.
+        guard let coordinator = state.sharedLibrary.coordinator else { throw Failure(message: "Missing binding") }
+        let model = state.sharedLibrary.externalReview
+        await model.refresh(using: coordinator)
+        try expect(model.items.isEmpty && model.message == nil, "Own files are not external changes")
+        let unrelated = root.appendingPathComponent("Unrelated.transcript.json")
+        let unrelatedBytes = try Data(contentsOf: unrelated)
+        let file = root.appendingPathComponent("Changed.transcript.json")
+        var object = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+        var segments = object["segments"] as! [[String: Any]]
+        segments[0]["text"] = "Changed by another computer"
+        object["segments"] = segments
+        try JSONSerialization.data(withJSONObject: object, options: .sortedKeys).write(to: file, options: .atomic)
+        await state.refreshAll()
+        try expect(state.sharedLibrary.message?.contains("External Files") == true, "Actual app explains where recovery lives")
+        await model.refresh(using: coordinator)
+        try expect(model.items.count == 1 && model.items[0].review?.changedText?.contains("another computer") == true, "Comparison shows actual external content")
+        let stale = model.items[0]
+        try Data("damaged sync content".utf8).write(to: file, options: .atomic)
+        try expect(!(await model.apply(stale, useChangedFile: true, using: coordinator)), "Unseen bytes refuse old decision")
+        try expect(model.message?.contains("changed during review") == true, "Stale decision gives actionable message")
+        await model.refresh(using: coordinator)
+        try expect(model.items.count == 1 && model.items[0].review?.changedText == nil, "Damaged file offers restoration only")
+        try expect(await model.apply(model.items[0], useChangedFile: false, using: coordinator), "Restore current via actual app review")
+        await state.refreshAll()
+        let restored = try await state.transcription.transcriptStore.loadTranscript(for: "Changed.mp3")
+        try expect(restored?.plainText().contains("Current Changed.mp3") == true, "Actual app cache reads restored current content")
+        try expect(try Data(contentsOf: unrelated) == unrelatedBytes, "Unrelated resident recording is byte-identical")
+        object = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+        segments = object["segments"] as! [[String: Any]]; segments[0]["text"] = "Accepted external transcript"; object["segments"] = segments
+        try JSONSerialization.data(withJSONObject: object, options: .sortedKeys).write(to: file, options: .atomic)
+        await model.refresh(using: coordinator)
+        try expect(await model.apply(model.items[0], useChangedFile: true, using: coordinator), "Use changed content via app review")
+        await state.refreshAll()
+        let adopted = try await state.transcription.transcriptStore.loadTranscript(for: "Changed.mp3")
+        try expect(adopted?.plainText().contains("Accepted external transcript") == true, "Actual app invalidates cached transcript after choice")
+        // Suspend one actual publication read while another external row is ready.
+        for name in ["Changed", "Unrelated"] {
+            let file = root.appendingPathComponent(name + ".transcript.json")
+            var body = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+            var rows = body["segments"] as! [[String: Any]]
+            rows[0]["text"] = "Independent external " + name; body["segments"] = rows
+            try JSONSerialization.data(withJSONObject: body, options: .sortedKeys).write(to: file, options: .atomic)
+        }
+        let pause = PauseSecondRead()
+        let delayed = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID,
+            witnessDirectory: parent.appendingPathComponent("external-witnesses"), afterPublishedLibraryRead: { await pause.visit() })
+        let independent = ExternalSidecarReviewState()
+        let scan = Task { @MainActor in await independent.refresh(using: delayed) }
+        for _ in 0..<300 {
+            if await pause.entered, !independent.items.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try expect(await pause.entered && independent.isLoading && independent.items.count == 1, "Resident row must appear while unrelated read is pending")
+        let resident = independent.items[0]
+        let applied = await independent.apply(resident, useChangedFile: true, using: delayed)
+        await pause.release(); await scan.value
+        try expect(applied, "Resident external file remains actionable while unrelated read waits")
+        try expect(!independent.items.contains(where: { $0.id == resident.id }), "Late canceled scan cannot restore old consent")
+        independent.clear()
+        model.clear()
+        try expect(model.items.isEmpty && model.message == nil, "Changing libraries clears external consent")
+        await state.sharedLibrary.close()
+        print("Actual external-file AppState checks passed: changed/corrupt/stale file, comparison, restoration, adoption, cache refresh and unrelated-file preservation.")
+    }
     @MainActor static func run() async throws {
         _ = NSApplication.shared
         let arguments = CommandLine.arguments
@@ -60,6 +150,7 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        try await externalReviewChecks(parent: parent)
         let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right")
         try FileManager.default.createDirectory(at: left, withIntermediateDirectories: true)
         try Data("synthetic audio".utf8).write(to: left.appendingPathComponent("Meeting.mp3"))

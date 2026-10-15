@@ -240,6 +240,8 @@ final class AppState {
                 if sharedLibrary.phase == .ready { _ = try await bound.projectOutputs() }
                 guard stillBound() else { return }
                 sharedLibrary.message = nil
+            } catch SharedProjectionWriteError.untracked {
+                if stillBound() { sharedLibrary.message = "A file changed outside DockTape. Open Shared Library Review → External Files to compare and recover it." }
             } catch { if stillBound() { sharedLibrary.message = error.localizedDescription } }
         }
         await currentLibrary.refresh()
