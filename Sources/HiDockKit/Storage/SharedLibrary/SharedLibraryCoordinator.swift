@@ -1670,7 +1670,7 @@ public actor SharedLibraryCoordinator {
     let delays = Self.projectionRetryDelays
     for attempt in 0...delays.count {
       do {
-        let context = try await projectionContext()
+        let context = try await projectionContext(for: entity)
         guard entity.kind == .recording, context.views.contains(where: { $0.state.id == entity.id && $0.state.kind == entity.kind && $0.state.lifecycle == .alive }) else { throw SharedSidecarError.conflictedContent }
         let outputs = try SharedLibraryProjectionWriter.render(context)
         let json = try outputs.compactMap { path, bytes -> String? in
@@ -1742,7 +1742,7 @@ public actor SharedLibraryCoordinator {
     context.reviewedBootstrap[review.filename] = review.fingerprint
     return try await SharedLibraryProjectionWriter.project(context, writer: writerID, only: [review.filename])
   }
-  private func projectionContext() async throws -> SharedLibraryProjectionContext {
+  private func projectionContext(for selected: SharedEntityIdentity? = nil) async throws -> SharedLibraryProjectionContext {
     guard transitions == 0 else { throw SharedProjectionWriteError.stale }
     let manifest = try await bind(force: true)
     guard try await mayEdit(), let gate, let directory = witnessDirectory else { throw SharedLibraryCoordinatorError.enrollmentPending }
@@ -1760,14 +1760,25 @@ public actor SharedLibraryCoordinator {
     }
     let reservations = try published.reservations(states: pathStates, library: manifest.libraryID)
     let index = try SharedLibraryPathIndex(states: pathStates, caseSensitive: false, retainedLocations: reservations)
+    // Selected content keeps the complete namespace and authority proof, but
+    // needs physical readiness only for its recording and ancestor folders.
+    // A retained original elsewhere must not prevent publishing these bytes.
+    let selectedPath = selected.flatMap { index.resolvedPaths[$0.id] }
+    func requiresPhysicalProof(_ view: SharedLibraryViewSnapshot) -> Bool {
+      guard let selected else { return true }
+      if view.state.kind == .recording { return view.state.id == selected.id }
+      guard view.state.kind == .folder, let selectedPath,
+            let folderPath = index.resolvedPaths[view.state.id] else { return false }
+      return selectedPath.hasPrefix(folderPath + "/")
+    }
     var absentPaths: [String] = []
     var physicalInputs: [URL: String] = [:]
     var completedIntents = published.completedFileIntents
-    for view in views where view.state.kind == .folder && view.state.lifecycle == .alive {
+    for view in views where view.state.kind == .folder && view.state.lifecycle == .alive && requiresPhysicalProof(view) {
       if let physical = view.state.fields["physicalPath"],
          physical.isConflicted || physical.resolvedValue != index.resolvedPaths[view.state.id].map(SharedFieldValue.text) { throw SharedLibraryOperationError.unfinishedOperation }
     }
-    for view in views where view.state.kind == .recording && view.state.lifecycle == .alive {
+    for view in views where view.state.kind == .recording && view.state.lifecycle == .alive && requiresPhysicalProof(view) {
       if let published = view.state.fields["audioPublished"],
          published.isConflicted || published.resolvedValue != view.state.value(for: "audioFingerprint") { throw SharedLibraryOperationError.unfinishedOperation }
       guard let destination = index.resolvedPaths[view.state.id] else { continue }
@@ -1783,7 +1794,7 @@ public actor SharedLibraryCoordinator {
         }
       }
     }
-    for view in views where view.state.kind == .recording && view.state.lifecycle == .alive && view.state.conflicts.isEmpty {
+    for view in views where view.state.kind == .recording && view.state.lifecycle == .alive && view.state.conflicts.isEmpty && requiresPhysicalProof(view) {
       let intents = try SharedPublishedLocations.fileIntents(state: view.state, library: manifest.libraryID).filter { owner, document, _ in
         owner == writerID.uuidString.lowercased() && completedIntents[view.state.id]?[owner] != SharedLibraryOperation.fingerprint(document.json)
       }

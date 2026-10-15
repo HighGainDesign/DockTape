@@ -5,12 +5,17 @@ import XCTest
 final class SharedLibraryProjectionWriterTests: XCTestCase {
     private var roots: [URL] = []
     override func tearDown() { for root in roots { try? FileManager.default.removeItem(at: root) } }
-    private func fixture() async throws -> (URL, SharedLibraryCoordinator) {
+    private func fixture(additionalAudio: [String] = []) async throws -> (URL, SharedLibraryCoordinator) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         roots.append(directory)
         let root = directory.appendingPathComponent("library")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try Data("synthetic".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+        for path in additionalAudio {
+            let url = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("unrelated synthetic original".utf8).write(to: url)
+        }
         let recording = RecordingStore(baseDirectory: root)
         try await recording.setup()
         try await recording.setMeta(mode: "Rec", deviceFilename: "device.hda", for: "Meeting.mp3")
@@ -118,6 +123,56 @@ final class SharedLibraryProjectionWriterTests: XCTestCase {
             XCTAssertTrue(reviews.isEmpty, "Clean marked aggregates need no mutation authority or error row")
         } catch { await gate.release(); _ = try? await editing.value; throw error }
         await gate.release(); _ = try await editing.value
+    }
+
+    func testScopedPublicationDoesNotWaitForUnrelatedAcceptedRename() async throws {
+        try await checkScopedPublicationWithPendingMove(folder: false)
+    }
+    func testScopedPublicationDoesNotWaitForUnrelatedAcceptedFolderRename() async throws {
+        try await checkScopedPublicationWithPendingMove(folder: true)
+    }
+    private func checkScopedPublicationWithPendingMove(folder: Bool) async throws {
+        let source = folder ? "Moving/Pending.mp3" : "Pending.mp3"
+        let destination = folder ? "Moved/Pending.mp3" : "Renamed.mp3"
+        let (root, coordinator) = try await fixture(additionalAudio: [source])
+        _ = try await coordinator.projectOutputs()
+        let pending = try await coordinator.reference(to: source)
+        let cancelled = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"),
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let rename = Task {
+            if folder { _ = try await cancelled.renameFolder(from: "Moving", to: "Moved") }
+            else { _ = try await cancelled.relocateRecording(filename: source, title: "Renamed") }
+        }
+        do { _ = try await rename.value; XCTFail("Fixture must stop after semantic acceptance") }
+        catch is CancellationError {}
+        let accepted = try await coordinator.read(.init(id: pending.entityID, kind: .recording))
+        if folder {
+            let folders = try await coordinator.snapshots(kinds: [.folder])
+            XCTAssertTrue(folders.contains { $0.state.value(for: "name") == .text("Moved") && $0.state.value(for: "physicalPath") == .text("Moving") })
+        } else { XCTAssertEqual(accepted.state.value(for: "title"), .text("Renamed")) }
+        let held = try Data(contentsOf: root.appendingPathComponent(source))
+        let library = try Data(contentsOf: root.appendingPathComponent("library.json"))
+        let store = TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: coordinator))
+        _ = try await store.loadTranscript(for: "Meeting.mp3")
+        let transcript = Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture", hasSpeakerLabels: true,
+            segments: [.init(startTime: 0, endTime: 1, text: "Resident B remains editable", speakerID: "s")])
+        try await store.save(transcript, mp3Filename: "Meeting.mp3")
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        do { _ = try await coordinator.projectOutputs(); XCTFail("Full publication must still refuse unfinished relocation") }
+        catch SharedLibraryOperationError.unfinishedOperation {}
+        do {
+            _ = try await coordinator.projectOutputs(for: .init(id: pending.entityID, kind: .recording), component: .transcript)
+            XCTFail("Selected recording's own unfinished move or ancestor folder must still refuse publication")
+        } catch SharedLibraryOperationError.unfinishedOperation {}
+        let output = try await coordinator.projectOutputs(for: entity, component: .transcript)
+        XCTAssertEqual(output.written, 3)
+        for name in ["Meeting.transcript.md", "Meeting.txt"] {
+            XCTAssertTrue(try String(contentsOf: root.appendingPathComponent(name), encoding: .utf8).contains("Resident B remains editable"))
+        }
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(source)), held)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("library.json")), library)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(destination).path))
     }
 
     func testScopedContentPublicationPreservesUnrelatedExternalFilesAndUpdatesExports() async throws {

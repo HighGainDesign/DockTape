@@ -201,7 +201,29 @@ import HiDockKit
             try expect(try Data(contentsOf: heldFile) == heldBytes, "Held unrelated output remains byte-identical")
             model.clear()
         }
-        print("Actual independent publication passed: resident transcript JSON/Markdown/TXT recovery finishes with unrelated recording or same-recording summary held.")
+        let originalA = try Data(contentsOf: root.appendingPathComponent("A.mp3"))
+        let cancelled = SharedLibraryCoordinator(root: root, writerID: writer,
+            witnessDirectory: parent.appendingPathComponent("publication-witnesses"),
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let moving = Task { try await cancelled.relocateRecording(filename: "A.mp3", title: "Pending A") }
+        do { _ = try await moving.value; throw Failure(message: "Fixture must leave A's accepted rename pending") }
+        catch is CancellationError {}
+        let changedText = "Resident B while A rename is pending"
+        var body = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+        var segments = body["segments"] as! [[String: Any]]; segments[0]["text"] = changedText; body["segments"] = segments
+        try JSONSerialization.data(withJSONObject: body).write(to: file)
+        let pendingModel = ExternalSidecarReviewState()
+        await pendingModel.refresh(using: coordinator)
+        guard let pendingRow = pendingModel.items.first(where: { $0.review?.filename == "B.mp3" }) else { throw Failure(message: "Missing B recovery during pending A rename") }
+        try expect(await pendingModel.apply(pendingRow, useChangedFile: true, using: coordinator), "B recovery must remain actionable with pending A rename")
+        try expect(pendingModel.message == "Changed file accepted.", "B recovery must publish, not leave an unfinished-operation export error")
+        for suffix in [".transcript.md", ".txt"] {
+            try expect(try String(contentsOf: root.appendingPathComponent("B" + suffix), encoding: .utf8).contains(changedText), "B readable export updated during pending A rename")
+        }
+        try expect(try Data(contentsOf: root.appendingPathComponent("A.mp3")) == originalA, "Pending A original must remain unchanged")
+        try expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("Pending A.mp3").path), "B recovery must not materialize A's pending rename")
+        pendingModel.clear()
+        print("Actual independent publication passed: resident transcript JSON/Markdown/TXT recovery finishes with unrelated recording/same-recording summary held and accepted A rename pending.")
     }
     @MainActor static func run() async throws {
         _ = NSApplication.shared
