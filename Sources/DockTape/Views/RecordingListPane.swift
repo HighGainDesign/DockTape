@@ -24,6 +24,31 @@ struct RecordingListPane: View {
 
     // MARK: - Recordings Content
 
+    @ViewBuilder private var metadataLoadStatus: some View {
+        if state.library.isLoadingMetadata || state.library.refreshError != nil || state.library.metadataLoadState == .stopped {
+            Divider()
+            HStack {
+                if state.library.isLoadingMetadata {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting for library files…")
+                    Spacer()
+                    Button("Stop Loading") { state.library.cancelMetadataLoad() }
+                        .accessibilityLabel("Stop loading the recording library")
+                } else {
+                    Text(state.library.metadataLoadState == .stopped
+                        ? "Loading stopped. Available recordings are still shown."
+                        : "Some recordings could not be loaded. Check your cloud drive and retry.")
+                        .help(state.library.refreshError ?? "")
+                    Spacer()
+                    Button("Retry") { Task { await state.retryLibraryLoad() } }
+                        .accessibilityLabel("Retry loading the recording library")
+                }
+            }
+            .font(.caption)
+            .padding(8)
+        }
+    }
+
     private var recordingsContent: some View {
         VStack(spacing: 0) {
             let recs = filteredRecordings
@@ -47,7 +72,15 @@ struct RecordingListPane: View {
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
             .overlay {
-                if state.library.recordings.isEmpty {
+                if state.library.recordings.isEmpty && state.library.isLoadingMetadata {
+                    ContentUnavailableView {
+                        Label("Loading Recordings", systemImage: "icloud.and.arrow.down")
+                    } description: { Text("Waiting for library files. Available recordings will appear here.") }
+                } else if state.library.recordings.isEmpty && (state.library.refreshError != nil || state.library.metadataLoadState == .stopped) {
+                    ContentUnavailableView {
+                        Label("Recordings Not Loaded", systemImage: "icloud.slash")
+                    } description: { Text("Check your cloud drive, then retry loading the library.") }
+                } else if state.library.recordings.isEmpty {
                     ContentUnavailableView {
                         Label("No Recordings", systemImage: "waveform.slash")
                     } description: {
@@ -63,6 +96,7 @@ struct RecordingListPane: View {
             }
             .searchable(text: $state.library.searchText, prompt: "Search recordings")
             .modifier(SearchFocusModifier(trigger: $state.library.isSearchFocused))
+            metadataLoadStatus
         }
         .navigationTitle(recordingTitle)
         .onChange(of: state.selectedView) { _, _ in

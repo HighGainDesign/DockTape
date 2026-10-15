@@ -20,6 +20,13 @@ final class LibraryState {
     let transcriptStore: TranscriptStore
     let sharedCoordinator: SharedLibraryCoordinator?
     var refreshError: String?
+    enum MetadataLoadState { case idle, loading, stopped }
+    private(set) var metadataLoadState: MetadataLoadState = .idle
+    var isLoadingMetadata: Bool { metadataLoadState == .loading }
+    private var contentRevisions: [String: String] = [:]
+    private var metadataRequest = UUID()
+    private var metadataTask: Task<Void, Error>?
+
 
     init(store: RecordingStore, transcriptStore: TranscriptStore, sharedCoordinator: SharedLibraryCoordinator? = nil) {
         self.sharedCoordinator = sharedCoordinator
@@ -27,29 +34,77 @@ final class LibraryState {
         self.transcriptStore = transcriptStore
     }
 
-    func setup() async throws {
-        try await store.setup()
-        try await transcriptStore.loadAll()
-        await refresh()
-    }
+    func setup() async throws { _ = try await loadMetadata(initial: true) }
 
     /// Set of device filenames that have been imported (from library.json).
     var importedDeviceFilenames: Set<String> = []
 
-    func refresh() async {
-        if sharedCoordinator != nil {
-            do { try await store.loadLibraryMeta(); refreshError = nil }
-            catch { refreshError = error.localizedDescription }
+    @discardableResult
+    func refresh(afterMetadata: @escaping @MainActor () async -> Void = {}, onFailure: @MainActor (Error) -> Void = { _ in }) async -> Bool {
+        do { return try await loadMetadata(initial: false, afterMetadata: afterMetadata) }
+        catch { if !(error is CancellationError) { onFailure(error) }; return false }
+    }
+
+    func cancelMetadataLoad() {
+        metadataRequest = UUID()
+        metadataTask?.cancel(); metadataTask = nil
+        metadataLoadState = .stopped
+        refreshError = nil
+    }
+
+    private func loadMetadata(initial: Bool, afterMetadata: @escaping @MainActor () async -> Void = {}) async throws -> Bool {
+        metadataTask?.cancel()
+        let request = UUID(); metadataRequest = request
+        metadataLoadState = .loading; refreshError = nil
+        let task = Task { @MainActor [self] in
+            do {
+                try await transcriptStore.loadAll()
+                let progress: @Sendable () async -> Void = { [weak self] in await self?.publishCatalog(request: request) }
+                if initial { try await store.setup(onProgress: sharedCoordinator == nil ? nil : progress) }
+                else if sharedCoordinator != nil { try await store.loadLibraryMeta(onProgress: progress) }
+                try Task.checkCancellation()
+                await publishCatalog(request: request)
+                await afterMetadata()
+                try Task.checkCancellation()
+            } catch {
+                if metadataRequest == request, !(error is CancellationError) { refreshError = error.localizedDescription }
+                throw error
+            }
         }
-        recordings = await store.allRecordings()
-        downloadedFilenames = Set(recordings.map(\.filename))
+        metadataTask = task
+        defer {
+            if metadataRequest == request { metadataTask = nil; metadataLoadState = .idle }
+        }
+        do {
+            try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
+            return metadataRequest == request && !Task.isCancelled
+        } catch {
+            // A stopped/superseded task cannot report a late provider error
+            // into the newer load, even if the provider uses its own error type.
+            if Task.isCancelled { throw CancellationError() }
+            if metadataRequest != request { return false }
+            throw error
+        }
+    }
+
+    private func publishCatalog(request: UUID) async {
+        guard metadataRequest == request, !Task.isCancelled else { return }
+        let entries = await store.allRecordings()
+        let imported = await store.allImportedDeviceFilenames()
+        let names = await store.folders()
+        let revisions = await store.contentRevisions()
+        guard metadataRequest == request, !Task.isCancelled else { return }
+        recordings = entries
+        downloadedFilenames = Set(entries.map(\.filename))
         selectedRecordings.formIntersection(downloadedFilenames)
-        if let selectedRecording, !downloadedFilenames.contains(selectedRecording) {
-            self.selectedRecording = nil
-        }
-        importedDeviceFilenames = await store.allImportedDeviceFilenames()
-        folders = await store.folders()
-        try? await transcriptStore.loadAll()
+        if let selectedRecording, !downloadedFilenames.contains(selectedRecording) { self.selectedRecording = nil }
+        importedDeviceFilenames = imported; folders = names
+        contentRevisions = revisions
+    }
+
+    func contentID(for filename: String, fallbackRevision: UInt64) -> String {
+        let revision = contentRevisions[filename] ?? "legacy-\(fallbackRevision)"
+        return store.baseDirectory.appendingPathComponent(filename).absoluteString + "|" + revision
     }
 
     func isDownloaded(_ filename: String) -> Bool {

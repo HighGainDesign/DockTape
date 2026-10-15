@@ -95,6 +95,7 @@ final class AppState {
     private(set) var playbackTranscriptTask: Task<Void, Never>?
     private var playbackTranscriptRequestID = UUID()
     private var libraryRefreshRequest = UUID()
+    private var librarySetupRequest = UUID()
 
     init(baseDirectory: URL? = nil,
          sharedIdentity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity = { try await SharedWriterIdentityFactory().load() },
@@ -189,6 +190,7 @@ final class AppState {
             return .init(validate: { try await coordinator.validateJob(token) }, release: { await coordinator.finishJob(token) })
         }
         let previous = library
+        previous.cancelMetadataLoad()
         let store = RecordingStore(baseDirectory: coordinator.root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
         let transcripts = TranscriptStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator))
         library = LibraryState(store: store, transcriptStore: transcripts, sharedCoordinator: coordinator)
@@ -202,37 +204,96 @@ final class AppState {
     }
 
     func setup() async throws {
-        if let coordinator = try await sharedLibrary.connect(root: library.store.baseDirectory), library.sharedCoordinator !== coordinator {
-            attachSharedStores(coordinator)
+        let request = UUID(); librarySetupRequest = request
+        let requestedLibrary = library
+        let coordinator: SharedLibraryCoordinator?
+        do { coordinator = try await sharedLibrary.connect(root: requestedLibrary.store.baseDirectory) }
+        catch {
+            guard librarySetupRequest == request, library === requestedLibrary else { return }
+            throw error
         }
-        try await library.setup()
-        try await summarization.summaryStore.loadAll()
-        try await templateStore.load()
-        if sharedLibrary.coordinator == nil { try await templateStore.migrateFromUserDefaults(.standard) }
+        guard librarySetupRequest == request, library === requestedLibrary else { return }
+        if let coordinator, requestedLibrary.sharedCoordinator !== coordinator { attachSharedStores(coordinator) }
+        let currentLibrary = library, currentTranscription = transcription, currentSummary = summarization
+        let currentTemplates = templateStore, bound = sharedLibrary.coordinator
+        func stillBound() -> Bool { !Task.isCancelled && librarySetupRequest == request && library === currentLibrary && sharedLibrary.coordinator === bound }
 
-        // Populate transcript statuses for recordings that already have transcripts on disk
-        let transcribedFiles = await transcription.transcriptStore.allTranscribedFilenames()
-        for filename in transcribedFiles {
-            if transcription.statuses[filename] == nil {
-                transcription.statuses[filename] = .done
+        do {
+            // Existence-only sidecar scans can populate resident badges while an
+            // unrelated authoritative recording head is still being prepared.
+            try await currentLibrary.transcriptStore.loadAll()
+            try await currentSummary.summaryStore.loadAll()
+            guard stillBound() else { return }
+            let transcribedFiles = await currentTranscription.transcriptStore.allTranscribedFilenames()
+            let summarizedFiles = await currentSummary.summaryStore.allSummarizedFilenames()
+            guard stillBound() else { return }
+            for filename in transcribedFiles where currentTranscription.statuses[filename] == nil {
+                currentTranscription.statuses[filename] = .done
             }
+            currentSummary.hasSummary = Set(summarizedFiles)
+            try await currentLibrary.setup()
+            guard stillBound() else { return }
+            try await currentTemplates.load()
+            guard stillBound() else { return }
+            if bound != nil { sharedLibrary.revision &+= 1 }
+            if bound == nil { try await currentTemplates.migrateFromUserDefaults(.standard) }
+            guard stillBound() else { return }
+            try await sharedLibrary.listen { [weak self] in await self?.refreshAll(refreshShared: false, monitored: true) }
+        } catch {
+            guard stillBound() else { return }
+            currentLibrary.refreshError = error.localizedDescription
+            throw error
         }
+    }
 
-        // Populate summary existence set
-        let summarizedFiles = await summarization.summaryStore.allSummarizedFilenames()
-        summarization.hasSummary = Set(summarizedFiles)
-        try await sharedLibrary.listen { [weak self] in await self?.refreshAll(refreshShared: false) }
+    @discardableResult
+    func retryLibraryLoad() async -> Bool {
+        let root = library.store.baseDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        func stillRoot() -> Bool { library.store.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() == root }
+        do {
+            try await setup()
+            guard stillRoot(), library.metadataLoadState == .idle, library.refreshError == nil, !sharedLibrary.isBusy else { return false }
+            statusMessage = "Library loaded."
+            return true
+        } catch {
+            guard stillRoot(), !Task.isCancelled else { return false }
+            library.refreshError = error.localizedDescription
+            return false
+        }
     }
 
     /// Refresh library, transcript statuses, and summary statuses from disk.
     /// Called on app activate to pick up external filesystem changes.
-    func refreshAll(refreshShared: Bool = true, beforePublication: @MainActor () async throws -> Void = {}) async {
+    func refreshAll(refreshShared: Bool = true, monitored: Bool = false, beforePublication: @escaping @MainActor () async throws -> Void = {}) async {
         guard !Task.isCancelled else { return }
+        // File-watcher work must not cancel the complete catalog refresh an
+        // interactive action is awaiting. Debounced watchers remain cancellable
+        // and use the current binding only after the active load has finished.
+        let waitingLibrary = library
+        if monitored {
+            while waitingLibrary.isLoadingMetadata {
+                do { try await Task.sleep(for: .milliseconds(25)) } catch { return }
+                guard library === waitingLibrary else { return }
+            }
+            guard waitingLibrary.metadataLoadState != .stopped else { return }
+        }
+        guard !Task.isCancelled, library === waitingLibrary else { return }
         let request = UUID(); libraryRefreshRequest = request
         let currentLibrary = library, currentTranscription = transcription, currentSummary = summarization
         let currentTemplates = templateStore, bound = sharedLibrary.coordinator
         func stillBound() -> Bool { !Task.isCancelled && libraryRefreshRequest == request && library === currentLibrary && sharedLibrary.coordinator === bound }
-        if let bound {
+        func report(_ error: Error) {
+            guard stillBound() else { return }
+            switch error {
+            case SharedProjectionWriteError.untracked:
+                sharedLibrary.message = "A file changed outside DockTape. Open Shared Library Review → External Files to compare and recover it."
+            case SharedProjectionWriteError.stale:
+                sharedLibrary.message = "The library changed while refreshing. Refresh again after sync settles."
+            default: sharedLibrary.message = error.localizedDescription
+            }
+        }
+        let completed = await currentLibrary.refresh(afterMetadata: { [self] in
+            guard stillBound(), let bound else { return }
             do {
                 if refreshShared { try await bound.refresh() }
                 guard stillBound() else { return }
@@ -247,13 +308,9 @@ final class AppState {
                 }
                 guard stillBound() else { return }
                 sharedLibrary.message = nil
-            } catch SharedProjectionWriteError.untracked {
-                if stillBound() { sharedLibrary.message = "A file changed outside DockTape. Open Shared Library Review → External Files to compare and recover it." }
-            } catch SharedProjectionWriteError.stale {
-                if stillBound() { sharedLibrary.message = "The library changed while refreshing. Refresh again after sync settles." }
-            } catch { if stillBound() { sharedLibrary.message = error.localizedDescription } }
-        }
-        await currentLibrary.refresh()
+            } catch { report(error) }
+        }, onFailure: { report($0) })
+        guard completed else { return }
         guard stillBound() else { return }
         if bound != nil { sharedLibrary.revision &+= 1 }
         try? await currentTranscription.transcriptStore.loadAll()
@@ -278,6 +335,8 @@ final class AppState {
             errorMessage = "Wait for the current operation to finish before changing storage."
             return false
         }
+        librarySetupRequest = UUID()
+        library.cancelMetadataLoad()
         // A pending cloud playback request belongs to the old library.
         playbackTranscriptRequestID = UUID()
         playbackTranscriptTask?.cancel()

@@ -18,6 +18,157 @@ final class SharedMetadataStoreTests: XCTestCase {
         _ = try await coordinator.enable()
         return (root, coordinator)
     }
+    private actor CatalogObservation {
+        var latest: [RecordingMetadata] = []
+        var callbacks = 0
+        var finished = false
+        func accept(_ entries: [RecordingMetadata]) { latest = entries; callbacks += 1 }
+        func entries() -> [RecordingMetadata] { latest }
+        func count() -> Int { callbacks }
+        func finish() { finished = true }
+        func isFinished() -> Bool { finished }
+    }
+    func testProgressiveCatalogExposesResidentNestedRecordingBeforeUnrelatedHead() async throws {
+        try await checkProgressiveCatalog(deleted: false)
+    }
+    func testProgressiveCatalogDoesNotExposeRetainedDeletedOrUnknownAudio() async throws {
+        try await checkProgressiveCatalog(deleted: true)
+    }
+    private func checkProgressiveCatalog(deleted: Bool) async throws {
+        let (root, coordinator) = try await fixture()
+        let a = try await coordinator.recording(at: "One.mp3")
+        if deleted { _ = try await coordinator.edit(.init(base: a, changes: [.delete])) }
+        try Data("unknown raw audio".utf8).write(to: root.appendingPathComponent("Unknown.mp3"))
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        let unopened = await store.allRecordings()
+        XCTAssertTrue(unopened.isEmpty, "An uninitialized shared catalog must not infer identities/lifecycle from physical audio")
+        let head = root.appendingPathComponent(".docktape/records/" + a.state.id.uuidString.lowercased() + "/" + coordinator.writerID.uuidString.lowercased() + ".json")
+        let started = expectation(description: "A owner head held")
+        let release = DispatchSemaphore(value: 0)
+        let holder = Task {
+            try await CoordinatedFileAccess().withWrite(at: head) { _ in
+                started.fulfill()
+                _ = release.wait(timeout: .now() + 8)
+            }
+        }
+        await fulfillment(of: [started], timeout: 1)
+        let observation = CatalogObservation()
+        let loading = Task { try await store.setup(onProgress: { await observation.accept(await store.allRecordings()) }) }
+        for _ in 0..<150 {
+            if await observation.entries().contains(where: { $0.filename == "Folder/One.mp3" }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let partial = await observation.entries()
+        release.signal(); try await holder.value; try await loading.value
+        XCTAssertEqual(partial.map(\.filename), ["Folder/One.mp3"], "Only resident B with its available ancestor graph belongs in the partial catalog")
+        XCTAssertNotNil(partial.first?.reference)
+        let final = await store.allRecordings()
+        XCTAssertEqual(final.contains { $0.filename == "One.mp3" }, !deleted)
+        XCTAssertTrue(final.contains { $0.filename == "Unknown.mp3" }, "A complete catalog retains established raw-audio discovery")
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("One.mp3")), Data("synthetic".utf8))
+    }
+
+    func testProgressiveCatalogPreservesResidentEntriesWhenAnotherHeadIsInvalid() async throws {
+        let (root, coordinator) = try await fixture()
+        let a = try await coordinator.recording(at: "One.mp3")
+        let head = root.appendingPathComponent(".docktape/records/" + a.state.id.uuidString.lowercased() + "/" + coordinator.writerID.uuidString.lowercased() + ".json")
+        let original = try Data(contentsOf: head)
+        defer { try? original.write(to: head, options: .atomic) }
+        try Data("Invalid authoritative fixture".utf8).write(to: head, options: .atomic)
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        let observation = CatalogObservation()
+        var failed = false
+        do { try await store.setup(onProgress: { await observation.accept(await store.allRecordings()) }) }
+        catch { failed = true }
+        XCTAssertTrue(failed, "An invalid head remains a real error, never an empty-success catalog")
+        let visible = await observation.entries()
+        XCTAssertEqual(visible.map(\.filename), ["Folder/One.mp3"], "A per-entity failure must not cancel resident B before progress delivery")
+        XCTAssertNotNil(visible.first?.reference)
+    }
+    func testProgressiveCatalogCancellationStopsBeforeHeldHeadAndRetryLoadsIt() async throws {
+        let (root, coordinator) = try await fixture()
+        let a = try await coordinator.recording(at: "One.mp3")
+        let head = root.appendingPathComponent(".docktape/records/" + a.state.id.uuidString.lowercased() + "/" + coordinator.writerID.uuidString.lowercased() + ".json")
+        let started = expectation(description: "A owner head held for cancellation")
+        let release = DispatchSemaphore(value: 0)
+        let holder = Task {
+            try await CoordinatedFileAccess().withWrite(at: head) { _ in
+                started.fulfill()
+                _ = release.wait(timeout: .now() + 8)
+            }
+        }
+        await fulfillment(of: [started], timeout: 1)
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        let observation = CatalogObservation()
+        let loading = Task {
+            var cancelled = false
+            do { try await store.setup(onProgress: { await observation.accept(await store.allRecordings()) }) }
+            catch { cancelled = error is CancellationError }
+            await observation.finish()
+            return cancelled
+        }
+        for _ in 0..<150 {
+            if await observation.entries().contains(where: { $0.filename == "Folder/One.mp3" }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        loading.cancel()
+        for _ in 0..<100 {
+            if await observation.isFinished() { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let finishedWhileHeld = await observation.isFinished()
+        let count = await observation.count()
+        release.signal(); try await holder.value
+        let cancelled = await loading.value
+        XCTAssertTrue(finishedWhileHeld && cancelled, "Cancel must finish without waiting for the provider's held file")
+        let callbacksAfterRelease = await observation.count()
+        XCTAssertEqual(callbacksAfterRelease, count, "Cancelled progress cannot publish a late A entry")
+        let retained = await store.allRecordings()
+        XCTAssertEqual(retained.map(\.filename), ["Folder/One.mp3"])
+        try await store.setup()
+        let retried = await store.allRecordings()
+        XCTAssertEqual(Set(retried.map(\.filename)), ["One.mp3", "Folder/One.mp3"])
+    }
+
+    func testProgressiveRetryNeverRevivesAnObservedDeletionAfterAnotherHeadFailed() async throws {
+        let (root, coordinator) = try await fixture()
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        try await store.setup()
+        let a = try await coordinator.recording(at: "One.mp3")
+        _ = try await coordinator.edit(.init(base: a, changes: [.delete]))
+        let folders = try await coordinator.snapshots(kinds: [.folder])
+        let folder = try XCTUnwrap(folders.first)
+        let folderHead = root.appendingPathComponent(".docktape/folders/" + folder.state.id.uuidString.lowercased() + "/" + coordinator.writerID.uuidString.lowercased() + ".json")
+        let folderBytes = try Data(contentsOf: folderHead)
+        try Data("Malformed unrelated head".utf8).write(to: folderHead, options: .atomic)
+        do { try await store.loadLibraryMeta(onProgress: {}); XCTFail("Fixture must retain the actual head error") }
+        catch {}
+        let observed = await store.allRecordings()
+        XCTAssertFalse(observed.contains { $0.filename == "One.mp3" }, "The first partial refresh observed A's deletion")
+        try folderBytes.write(to: folderHead, options: .atomic)
+        let head = root.appendingPathComponent(".docktape/records/" + a.state.id.uuidString.lowercased() + "/" + coordinator.writerID.uuidString.lowercased() + ".json")
+        let started = expectation(description: "Previously observed deleted A held for retry")
+        let release = DispatchSemaphore(value: 0)
+        let holder = Task {
+            try await CoordinatedFileAccess().withWrite(at: head) { _ in
+                started.fulfill()
+                _ = release.wait(timeout: .now() + 8)
+            }
+        }
+        await fulfillment(of: [started], timeout: 1)
+        let observation = CatalogObservation()
+        let retry = Task { try await store.loadLibraryMeta(onProgress: { await observation.accept(await store.allRecordings()) }) }
+        for _ in 0..<150 {
+            if await observation.count() > 0 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let duringRetry = await observation.entries()
+        release.signal(); try await holder.value; try await retry.value
+        XCTAssertFalse(duringRetry.contains { $0.filename == "One.mp3" }, "A retry must retain the latest observed tombstone instead of seeding an older alive edit baseline")
+        XCTAssertTrue(duringRetry.contains { $0.filename == "Folder/One.mp3" })
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("One.mp3")), Data("synthetic".utf8))
+    }
+
     func testAcceptedDeletionHidesRetainedAudioUntilExplicitRestore() async throws {
         let (root, coordinator) = try await fixture()
         let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
@@ -152,13 +303,80 @@ final class SharedMetadataStoreTests: XCTestCase {
         func release() { continuation?.resume(); continuation = nil }
         func isPaused() -> Bool { paused }
     }
+    func testLoadStartedDuringMetadataEditCannotReplaceAcceptedResultOrBaseline() async throws {
+        try await checkLoadDuringEdit(progressive: false)
+    }
+    func testProgressiveLoadStartedDuringMetadataEditCannotReplaceAcceptedResultOrBaseline() async throws {
+        try await checkLoadDuringEdit(progressive: true)
+    }
+    private func checkLoadDuringEdit(progressive: Bool) async throws {
+        let (root, original) = try await fixture()
+        let witnesses = root.deletingLastPathComponent().appendingPathComponent(root.lastPathComponent + "-edit-witnesses")
+        roots.append(witnesses)
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: original.writerID, witnessDirectory: witnesses)
+        let writable = try await coordinator.mayEdit()
+        XCTAssertTrue(writable)
+        guard case .ready(let manifest) = try await LegacyLibraryBootstrap(root: root, writerID: coordinator.writerID).publishedManifest() else {
+            return XCTFail("Missing existing fixture manifest")
+        }
+        let pause = PausedLoad()
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator, beforeLoadReturn: { await pause.run() }))
+        try await store.setup()
+        let gate = witnesses.appendingPathComponent("Gates/" + manifest.libraryID.uuidString + "/" + coordinator.writerID.uuidString + ".lock")
+        let started = expectation(description: "Local commit gate held while metadata reads remain available")
+        let release = DispatchSemaphore(value: 0)
+        let holder = Task {
+            try await CoordinatedFileAccess().withWrite(at: gate) { _ in
+                started.fulfill()
+                _ = release.wait(timeout: .now() + 8)
+            }
+        }
+        await fulfillment(of: [started], timeout: 1)
+        let edit = Task { try await store.setMeta(mode: "Mee", deviceFilename: "first.hda", for: "One.mp3") }
+        for _ in 0..<100 {
+            if await store.mode(for: "One.mp3") == "Mee" { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let began = await store.mode(for: "One.mp3") == "Mee"
+        let load = Task {
+            if progressive { try await store.loadLibraryMeta(onProgress: {}) }
+            else { try await store.loadLibraryMeta() }
+        }
+        for _ in 0..<150 {
+            if await pause.isPaused() { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let capturedBeforeCommit = await pause.isPaused()
+        release.signal(); try await holder.value
+        do { try await edit.value }
+        catch { await pause.release(); _ = try? await load.value; throw error }
+        let acceptedBeforeReturn = await store.mode(for: "One.mp3")
+        await pause.release(); try await load.value
+        XCTAssertTrue(began && capturedBeforeCommit, "The load must begin during an already-entered edit and capture state before commit")
+        XCTAssertEqual(acceptedBeforeReturn, "Mee")
+        let mode = await store.mode(for: "One.mp3")
+        XCTAssertEqual(mode, "Mee", "A load that started during a pending edit must not overwrite the accepted result")
+        try await store.setMeta(mode: "Wip", deviceFilename: "first.hda", for: "One.mp3")
+        let latest = await store.mode(for: "One.mp3")
+        XCTAssertEqual(latest, "Wip", "The accepted edit baseline must also survive the older captured result")
+    }
+
     func testAnOlderMetadataLoadCannotOverwriteAnAcceptedEdit() async throws {
+        try await checkOlderLoad(progressive: false)
+    }
+    func testAnOlderProgressiveMetadataLoadCannotOverwriteAnAcceptedEdit() async throws {
+        try await checkOlderLoad(progressive: true)
+    }
+    private func checkOlderLoad(progressive: Bool) async throws {
         let (root, coordinator) = try await fixture()
         let pause = PausedLoad()
         let adapter = SharedRecordingMetadataAdapter(coordinator: coordinator, beforeLoadReturn: { await pause.run() })
         let store = RecordingStore(baseDirectory: root, shared: adapter)
         try await store.setup()
-        let load = Task { try await store.loadLibraryMeta() }
+        let load = Task {
+            if progressive { try await store.loadLibraryMeta(onProgress: {}) }
+            else { try await store.loadLibraryMeta() }
+        }
         let deadline = Date().addingTimeInterval(3)
         while !(await pause.isPaused()), Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
         let reached = await pause.isPaused()

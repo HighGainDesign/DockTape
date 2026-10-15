@@ -28,7 +28,7 @@ struct SummaryTabView: View {
     }
 
     private var contentID: String {
-        state.library.store.baseDirectory.appendingPathComponent(recording.filename).absoluteString + "|\(state.sharedLibrary.revision)"
+        state.library.contentID(for: recording.filename, fallbackRevision: state.sharedLibrary.revision)
     }
 
     var body: some View {
@@ -64,6 +64,9 @@ struct SummaryTabView: View {
         .task(id: "\(contentID)|\(summaryRetry)") {
             await reloadSummary()
         }
+        .task(id: "\(contentID)|templates-\(state.sharedLibrary.revision)") {
+            await refreshTemplateChoices()
+        }
         .onChange(of: state.summarization.summarizingFile) { old, new in
             if old == recording.filename && new != recording.filename {
                 summaryRetry += 1
@@ -88,6 +91,21 @@ struct SummaryTabView: View {
            let template = await state.templateStore.template(forID: mapLegacyTemplateID(existing.templateUsed)) {
             guard !Task.isCancelled, state.library.selectedRecording == filename, contentID == identity else { return }
             selectedTemplate = template
+        }
+    }
+
+    /// Refresh shared template choices without replacing this view or discarding
+    /// a custom prompt draft. A deleted selection falls back to the mode default.
+    private func refreshTemplateChoices() async {
+        let identity = contentID, revision = state.sharedLibrary.revision
+        let store = state.templateStore
+        let choices = await store.allTemplates()
+        let fallback = await store.defaultTemplate(forMode: recording.mode)
+        guard !Task.isCancelled, state.templateStore === store,
+              contentID == identity, state.sharedLibrary.revision == revision else { return }
+        templates = choices
+        if let selected = selectedTemplate {
+            selectedTemplate = choices.first { $0.id == selected.id } ?? fallback
         }
     }
 

@@ -16,7 +16,6 @@ struct DetailPane: View {
     @State private var renamingRecording: RecordingMetadata?
     @State private var renameText: String = ""
     @State private var confirmRetranscribe: RecordingMetadata?
-    @State private var userTemplates: [Template] = []
     @State private var customPromptText: String = ""
     @State private var showCustomPromptSheet: Bool = false
     @State private var customPromptRecording: RecordingMetadata?
@@ -126,7 +125,6 @@ struct DetailPane: View {
         }
         .task(id: "\(contentID(for: rec.filename))|\(transcriptRetry)") {
             guard await reloadTranscript(for: rec.filename) else { return }
-            userTemplates = await state.templateStore.userCreatedTemplates()
             guard !Task.isCancelled, state.library.selectedRecording == rec.filename else { return }
 
             if !userHasPickedTab {
@@ -248,7 +246,7 @@ struct DetailPane: View {
     /// Track the requested file separately from legacy sidecar identity fields.
     /// A late read or editor callback must not display another recording's text.
     private func contentID(for filename: String) -> String {
-        state.library.store.baseDirectory.appendingPathComponent(filename).absoluteString + "|\(state.sharedLibrary.revision)"
+        state.library.contentID(for: filename, fallbackRevision: state.sharedLibrary.revision)
     }
 
     private func reloadTranscript(for filename: String) async -> Bool {

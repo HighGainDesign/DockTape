@@ -29,10 +29,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             do {
                 try await appState.setup()
-                appState.startMonitoring()
             } catch {
-                appState.statusMessage = "Storage error: \(error.localizedDescription)"
+                if !(error is CancellationError) {
+                    appState.statusMessage = "Storage error: \(error.localizedDescription)"
+                    appState.library.refreshError = error.localizedDescription
+                }
             }
+            appState.startMonitoring()
 
             if appState.showMigrationPrompt {
                 appState.showMigrationPrompt = false

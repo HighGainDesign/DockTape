@@ -28,7 +28,40 @@ struct DockTapeSharedLibraryTests {
     }
     @MainActor static func main() async {
         do {
-            if CommandLine.arguments.contains("--delete-selection-only") {
+            if CommandLine.arguments.contains("--background-metadata-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeBackgroundMetadata-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await backgroundMetadataChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--folder-rename-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeFolderRename-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = { try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "rename fixture").load() }
+                for index in 0..<8 { try await folderRenameChecks(parent: parent.appendingPathComponent(String(index)), identity: identity) }
+            } else if CommandLine.arguments.contains("--cold-metadata-retry-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeColdMetadataRetry-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await coldMetadataRetryChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--cold-metadata-refresh-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeColdMetadataRefresh-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await coldMetadataRefreshChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--cold-metadata-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeColdMetadata-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                for action in [ColdMetadataAction.complete, .stop, .switchLibrary] {
+                    try await coldMetadataStartupChecks(parent: parent.appendingPathComponent(String(describing: action)), deletedOnly: CommandLine.arguments.contains("--deleted-only"), action: action)
+                }
+            } else if CommandLine.arguments.contains("--delete-selection-only") {
                 _ = NSApplication.shared
                 UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
                 let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeDeleteSelection-" + UUID().uuidString)
@@ -210,8 +243,240 @@ struct DockTapeSharedLibraryTests {
         try await retainedDeletionVisibilityChecks(parent: parent, identity: identity)
         try await deleteSelectionChecks(parent: parent.appendingPathComponent("delete-selection"))
         try await publicationOverlapChecks(parent: parent.appendingPathComponent("publication-overlap"))
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-metadata"))
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-stop"), action: .stop)
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-switch"), action: .switchLibrary)
+        try await coldMetadataRefreshChecks(parent: parent.appendingPathComponent("cold-refresh"))
+        try await coldMetadataRetryChecks(parent: parent.appendingPathComponent("cold-retry"))
+        try await backgroundMetadataChecks(parent: parent.appendingPathComponent("background-metadata"))
+        try await backgroundMetadataChecks(parent: parent.appendingPathComponent("background-stop"), stop: true)
         print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions, reconnect and ID-bound merge/original deletion and folder rename/delete.")
     }
+    @MainActor static func backgroundMetadataChecks(parent: URL, stop: Bool = false) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("Synthetic background refresh audio".utf8).write(to: root.appendingPathComponent("B.mp3"))
+        let identity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "background fixture").load()
+        let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: parent.appendingPathComponent("witnesses"))
+        _ = try await seed.enable(); _ = try await seed.projectOutputs()
+        let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: parent.appendingPathComponent("witnesses"))
+        try await state.setup()
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        let gate = Gate()
+        var cancelled = false
+        let owner = Task { await state.library.refresh(afterMetadata: { await gate.wait(); cancelled = Task.isCancelled }) }
+        while !(await gate.waiting) { try await Task.sleep(for: .milliseconds(10)) }
+        var backgroundEntered = false
+        let background = Task { await state.refreshAll(refreshShared: false, monitored: true, beforePublication: { backgroundEntered = true }) }
+        for _ in 0..<50 {
+            if backgroundEntered { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        if stop || CommandLine.arguments.contains("--stop-background") {
+            state.library.cancelMetadataLoad()
+            await background.value
+            let stayedStopped = state.library.metadataLoadState == .stopped
+            await gate.release(); _ = await owner.value
+            await state.sharedLibrary.close()
+            try expect(stayedStopped && !backgroundEntered, "An already queued watcher must not restart loading after Stop without Retry")
+            print("Actual background stop passed: queued monitor respects Stop until explicit Retry.")
+            return
+        }
+        await gate.release()
+        let ownerCompleted = await owner.value
+        await background.value
+        await state.sharedLibrary.close()
+        try expect(!cancelled && ownerCompleted, "A monitored refresh must not supersede the metadata load awaited by an interactive action")
+        try expect(backgroundEntered && state.library.recordings.map(\.filename) == ["B.mp3"], "Queued monitor refresh must still execute after the interactive load")
+        print("Actual background metadata passed: monitor refresh waits for interactive load without cancelling it.")
+    }
+
+    @MainActor static func coldMetadataRetryChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in ["A.mp3", "B.mp3"] { try Data("Retry synthetic original".utf8).write(to: root.appendingPathComponent(name)) }
+        var template = TemplateStore.builtInDefaults[0]; template.promptText = "Resident retry template override"
+        try await TemplateStore(baseDirectory: root).update(template)
+        let identity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "retry metadata fixture").load()
+        let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: parent.appendingPathComponent("witnesses"))
+        _ = try await seed.enable(); _ = try await seed.projectOutputs()
+        let a = try await seed.reference(to: "A.mp3")
+        let head = root.appendingPathComponent(".docktape/records/" + a.entityID.uuidString.lowercased() + "/" + identity.writer.uuidString.lowercased() + ".json")
+        let original = try Data(contentsOf: head)
+        try Data("Malformed retry fixture head".utf8).write(to: head, options: .atomic)
+        let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: parent.appendingPathComponent("witnesses"))
+        var failed = false
+        do { try await state.setup() } catch { failed = true }
+        let partial = state.library.recordings.map(\.filename)
+        let errorVisible = state.library.refreshError != nil && !state.library.isLoadingMetadata
+        try original.write(to: head, options: .atomic)
+        let retried = await state.retryLibraryLoad()
+        let restored = await state.templateStore.template(forID: template.id)
+        let entries = Set(state.library.recordings.map(\.filename))
+        await state.sharedLibrary.close()
+        try expect(failed && errorVisible && partial == ["B.mp3"], "Invalid A metadata must report a real failure and preserve usable B")
+        try expect(retried && entries == ["A.mp3", "B.mp3"], "Retry restores the complete recording list")
+        try expect(restored?.promptText == template.promptText, "Retry must finish app setup, including the shared templates skipped by the failed startup")
+        print("Actual cold metadata retry passed: corrupt A preserves B/error state; retry restores full app setup.")
+    }
+
+    @MainActor static func coldMetadataRefreshChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in ["A.mp3", "B.mp3"] { try Data("Refresh synthetic original".utf8).write(to: root.appendingPathComponent(name)) }
+        let identity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "refresh metadata fixture").load()
+        let witnesses = parent.appendingPathComponent("witnesses")
+        let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: witnesses)
+        _ = try await seed.enable(); _ = try await seed.projectOutputs()
+        let a = try await seed.reference(to: "A.mp3")
+        let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: witnesses)
+        try await state.setup()
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        let head = root.appendingPathComponent(".docktape/records/" + a.entityID.uuidString.lowercased() + "/" + identity.writer.uuidString.lowercased() + ".json")
+        let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let holder = Task {
+            try await CoordinatedFileAccess().withWrite(at: head) { _ in
+                started.signal()
+                guard release.wait(timeout: .now() + 15) == .success else { throw Failure(description: "Refresh head hold timed out") }
+            }
+        }
+        let acquired = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async { continuation.resume(returning: started.wait(timeout: .now() + 2) == .success) }
+        }
+        guard acquired else { release.signal(); _ = try? await holder.value; throw Failure(description: "Missing refresh head hold") }
+        var finished = false
+        let refreshing = Task { await state.refreshAll(); finished = true }
+        for _ in 0..<100 {
+            if state.library.isLoadingMetadata { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let waitingVisible = state.library.isLoadingMetadata
+        let residentB = state.library.recordings.contains { $0.filename == "B.mp3" && $0.reference != nil }
+        state.library.cancelMetadataLoad()
+        for _ in 0..<100 {
+            if finished { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let cancelledBeforeRelease = finished
+        release.signal(); try await holder.value; await refreshing.value
+        await state.sharedLibrary.close()
+        try expect(waitingVisible, "An explicit app Refresh must show cancellable loading while A authority is held")
+        try expect(residentB, "Existing verified B remains available during a refresh")
+        try expect(cancelledBeforeRelease, "Stop Loading must cancel the entire refresh before held metadata is released")
+        try expect(state.library.metadataLoadState == .stopped, "Late refresh completion must not clear the user's stopped state")
+        print("Actual cold metadata refresh passed: waiting feedback, resident B and stop-before-release.")
+    }
+
+    enum ColdMetadataAction { case complete, stop, switchLibrary }
+    @MainActor static func coldMetadataStartupChecks(parent: URL, deletedOnly: Bool = false, action: ColdMetadataAction = .complete) async throws {
+        for deleted in deletedOnly ? [true] : [false, true] {
+            let folder = parent.appendingPathComponent(deleted ? "deleted" : "alive")
+            let root = folder.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            for name in ["A.mp3", "B.mp3"] {
+                try Data("synthetic cold metadata original".utf8).write(to: root.appendingPathComponent(name))
+                try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: name, transcriptionModel: "fixture", hasSpeakerLabels: false,
+                    segments: [.init(startTime: 0, endTime: 1, text: "Resident " + name)]), mp3Filename: name)
+            }
+            try await SummaryStore(baseDirectory: root).save(Summary(recordingFilename: "B.mp3", model: "fixture", provider: "fixture", templateUsed: "fixture",
+                sections: [.init(heading: "Summary", content: "Resident B summary")]), mp3Filename: "B.mp3")
+            let identity = try await SharedLibraryWriterIdentityStore(file: folder.appendingPathComponent("identity.json"), installationAnchor: "cold metadata fixture").load()
+            let witnesses = folder.appendingPathComponent("witnesses")
+            let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: witnesses)
+            _ = try await seed.enable()
+            let a = try await seed.recording(at: "A.mp3")
+            if deleted { _ = try await seed.edit(.init(base: a, changes: [.delete])) }
+            _ = try await seed.projectOutputs()
+            let audioA = try Data(contentsOf: root.appendingPathComponent("A.mp3"))
+            let head = root.appendingPathComponent(".docktape/records/" + a.state.id.uuidString.lowercased() + "/" + identity.writer.uuidString.lowercased() + ".json")
+            let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+            let holding = Task {
+                try await CoordinatedFileAccess().withWrite(at: head) { _ in
+                    started.signal()
+                    guard release.wait(timeout: .now() + 15) == .success else { throw Failure(description: "Cold metadata fixture hold timed out") }
+                }
+            }
+            let acquired = await withCheckedContinuation { continuation in
+                DispatchQueue.global().async { continuation.resume(returning: started.wait(timeout: .now() + 2) == .success) }
+            }
+            guard acquired else { release.signal(); _ = try? await holding.value; throw Failure(description: "Fixture did not acquire A owner head") }
+            let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: witnesses,
+                sharedTrash: { _ in throw Failure(description: "Cold metadata fixture must never dispose an original") })
+            var setupFinished = false
+            let setup = Task { try await state.setup(); setupFinished = true }
+            for _ in 0..<150 {
+                if state.library.recordings.contains(where: { $0.filename == "B.mp3" }) { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let residentB = state.library.recordings.first { $0.filename == "B.mp3" }
+            let unknownAVisible = state.library.recordings.contains { $0.filename == "A.mp3" }
+            let templatesBefore = state.sharedLibrary.revision
+            let bContentID = state.library.contentID(for: "B.mp3", fallbackRevision: 0)
+            let loadingVisible = state.library.isLoadingMetadata
+            let badgesReady = state.transcription.statuses["B.mp3"] == .done && state.summarization.hasSummary.contains("B.mp3")
+            var residentText: String?
+            if residentB != nil { residentText = try await state.transcription.transcriptStore.loadTranscript(for: "B.mp3")?.segments.first?.text }
+            var finishedBeforeRelease = true
+            var switched = true
+            var switchTask: Task<Bool, Never>?
+            let other = folder.appendingPathComponent("other-library")
+            if action == .stop {
+                state.library.cancelMetadataLoad()
+                for _ in 0..<100 {
+                    if setupFinished { break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                finishedBeforeRelease = setupFinished
+                await state.sharedLibrary.coordinator?.stopMonitoring()
+            } else if action == .switchLibrary {
+                try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+                try Data("Other library original".utf8).write(to: other.appendingPathComponent("Other.mp3"))
+                var switchFinished = false
+                switchTask = Task { let result = await state.switchStorageLocation(to: .custom, customURL: other); switchFinished = true; return result }
+                for _ in 0..<100 {
+                    if switchFinished { break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                finishedBeforeRelease = switchFinished
+            }
+            release.signal(); try await holding.value; try await setup.value
+            if let switchTask { switched = await switchTask.value }
+            let templatesReadyRevision = state.sharedLibrary.revision
+            await state.sharedLibrary.close()
+            if action == .complete {
+                try expect(templatesReadyRevision > templatesBefore, "Completing shared template setup must notify existing B views without resetting their content identity")
+                try expect(state.library.contentID(for: "B.mp3", fallbackRevision: 0) == bContentID, "Unrelated A catalog arrival must preserve B editor identity and its unsaved state")
+                try expect(state.library.contentID(for: "B.mp3", fallbackRevision: 100) == bContentID, "Unrelated global refresh must preserve shared B editor identity")
+                let b = try await seed.recording(at: "B.mp3")
+                guard let generation = b.state.currentDocument(for: .transcript) else { throw Failure(description: "Missing B transcript generation") }
+                _ = try await seed.edit(.init(base: b, changes: [.generationEdit(component: .transcript, generation: generation.id, key: "fixture-speaker", value: .text("Alice"))]))
+                await state.library.refresh()
+                try expect(state.library.contentID(for: "B.mp3", fallbackRevision: 0) != bContentID, "An actual B transcript change must invalidate B content")
+                let otherRoot = LibraryState(store: RecordingStore(baseDirectory: folder.appendingPathComponent("different-root")), transcriptStore: TranscriptStore(baseDirectory: root))
+                try expect(otherRoot.contentID(for: "B.mp3", fallbackRevision: 0) != bContentID, "Storage bindings must have distinct content identities")
+            }
+            try expect(residentB?.reference != nil, "First launch must expose resident B with stable identity while unrelated A metadata remains held (deleted=\(deleted))")
+            try expect(residentText == "Resident B.mp3", "B transcript must be usable while A metadata remains held")
+            try expect(loadingVisible && badgesReady, "Waiting feedback and resident transcript/summary badges appear before A is available")
+            try expect(!unknownAVisible, "Unknown lifecycle must not expose A's retained raw audio while metadata is pending")
+            try expect(finishedBeforeRelease, "Stop/switch must complete without waiting for the held owner head")
+            if action == .switchLibrary {
+                try expect(switched && state.library.store.baseDirectory == other && state.library.recordings.map(\.filename) == ["Other.mp3"], "Late old setup must not overwrite the new library")
+                try expect(!state.summarization.hasSummary.contains("B.mp3") && state.transcription.statuses["B.mp3"] == nil, "Old setup must not copy its badges into the new binding")
+            } else {
+                if action == .stop {
+                    try expect(state.library.metadataLoadState == .stopped && !state.library.recordings.contains { $0.filename == "A.mp3" }, "Canceled load cannot publish A after release")
+                    await state.retryLibraryLoad()
+                    await state.sharedLibrary.close()
+                    try expect(state.library.metadataLoadState == .idle && state.library.refreshError == nil, "Retry completes a fresh metadata request")
+                }
+                try expect(state.library.recordings.contains { $0.filename == "A.mp3" } == !deleted, "After metadata arrives/retries, respect A's accepted lifecycle")
+            }
+            try expect(try Data(contentsOf: root.appendingPathComponent("A.mp3")) == audioA, "Cold metadata must never mutate A original")
+        }
+        print("Actual cold metadata startup passed (\(action)): resident B/badges/loading independent; stop/retry/binding and retained-deletion safety.")
+    }
+
     @MainActor static func publicationOverlapChecks(parent: URL) async throws {
         let root = parent.appendingPathComponent("library")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -410,7 +675,7 @@ struct DockTapeSharedLibraryTests {
         state.library.selectedFolder = "Folder"
         await state.renameFolder(from: "Folder", to: "Renamed")
         try expect(state.errorMessage == nil && state.selectedView == .folder("Renamed") && state.library.selectedFolder == "Renamed", "Actual folder action must retarget sidebar selection: " + (state.errorMessage ?? ""))
-        try expect(Set(state.library.recordings.map(\.filename)) == ["Renamed/A.mp3", "Renamed/Nested/B.mp3"], "Actual app must refresh all renamed descendant paths")
+        try expect(Set(state.library.recordings.map(\.filename)) == ["Renamed/A.mp3", "Renamed/Nested/B.mp3"], "Actual app must refresh all renamed descendant paths; paths=\(state.library.recordings.map(\.filename)), error=\(state.library.refreshError ?? "none"), loading=\(state.library.isLoadingMetadata)")
         try expect(try await shared.reference(to: "Renamed/A.mp3") == reference, "App folder action must preserve child IDs")
         let transcript = await state.transcription.transcriptStore.transcript(for: "Renamed/A.mp3")
         try expect(transcript?.recordingFilename == "Renamed/A.mp3", "Actual transcript adapter must read the relocated companion")

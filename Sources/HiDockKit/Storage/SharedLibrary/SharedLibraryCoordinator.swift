@@ -337,6 +337,36 @@ public actor SharedLibraryCoordinator {
     }
   }
 
+  /// Progressive display reads retain per-entity errors until resident entries
+  /// have had a chance to arrive. They never confer namespace mutation authority.
+  func snapshots(kinds: Set<SharedEntityKind>, onSnapshot: @escaping @Sendable (SharedLibraryViewSnapshot) async -> Void) async throws -> [SharedLibraryViewSnapshot] {
+    _ = try await bind(force: true)
+    let entities = try await repository.scan().filter { kinds.contains($0.kind) }
+    return try await withThrowingTaskGroup(of: Result<SharedLibraryViewSnapshot, Error>.self) { group in
+      for entity in entities {
+        group.addTask {
+          do {
+            let view = try await self.read(entity)
+            try Task.checkCancellation()
+            await onSnapshot(view)
+            return .success(view)
+          } catch { return .failure(error) }
+        }
+      }
+      var result: [SharedLibraryViewSnapshot] = []
+      var failure: Error?
+      for try await entry in group {
+        switch entry {
+        case .success(let view): result.append(view)
+        case .failure(let error): if failure == nil { failure = error }
+        }
+      }
+      try Task.checkCancellation()
+      if let failure { throw failure }
+      return result.sorted { ($0.state.kind.rawValue, $0.state.id.uuidString) < ($1.state.kind.rawValue, $1.state.id.uuidString) }
+    }
+  }
+
   /// Resolve an existing identity, never derive a new ID from an unfamiliar
   /// filename. Initial-path hits read only that recording and its ancestors,
   /// so a cold unrelated recording cannot block a resident one.

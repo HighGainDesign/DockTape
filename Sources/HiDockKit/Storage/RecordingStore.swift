@@ -29,10 +29,10 @@ public actor RecordingStore {
     }
 
     /// Ensure the storage directory exists and load persisted metadata.
-    public func setup() async throws {
+    public func setup(onProgress: (@Sendable () async -> Void)? = nil) async throws {
         try shared?.requireRoot(baseDirectory)
         try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
-        try await loadLibraryMeta()
+        try await loadLibraryMeta(onProgress: onProgress)
     }
 
     // MARK: - Folder CRUD
@@ -194,6 +194,7 @@ public actor RecordingStore {
     // MARK: - Private helpers
 
     private func scanRecordings(in directory: URL, relativeTo base: URL) -> [RecordingMetadata] {
+        if shared != nil && sharedVisibility == nil { return [] }
         var results: [RecordingMetadata] = []
         for file in LibraryFileDiscovery.files(in: directory, relativeTo: base, suffix: ".mp3") {
             let relativePath = file.relativePath
@@ -590,16 +591,24 @@ public actor RecordingStore {
     private var meta: [String: RecordingMeta] = [:]
     private var metaBaseline: [String: RecordingMeta] = [:]
     private var recordingReferences: [String: SharedRecordingReference] = [:]
+    private var recordingContentRevisions: [String: String] = [:]
+    /// Semantic revisions for independently loaded shared recordings. Maintenance
+    /// acknowledgments and unrelated entity progress do not invalidate editors.
+    public func contentRevisions() -> [String: String] { recordingContentRevisions }
     private var sharedVisibility: SharedRecordingMetadataAdapter.Visibility?
     private var metadataTicket: UInt64 = 0
 
     /// Load library.json from disk. Also migrates modes.json if present.
-    public func loadLibraryMeta() async throws {
+    public func loadLibraryMeta(onProgress: (@Sendable () async -> Void)? = nil) async throws {
         if let shared {
             try shared.requireRoot(baseDirectory)
             metadataTicket += 1; let ticket = metadataTicket
-            let loaded = try await shared.loadCatalog()
-            if metadataTicket == ticket { meta = loaded.metadata; metaBaseline = loaded.metadata; recordingReferences = loaded.references; sharedVisibility = loaded.visibility }
+            let progress: (@Sendable (SharedRecordingMetadataAdapter.Catalog) async -> Void)?
+            if let onProgress {
+                progress = { catalog in await self.acceptProgress(catalog, ticket: ticket, onProgress: onProgress) }
+            } else { progress = nil }
+            let loaded = try await shared.loadCatalog(onProgress: progress)
+            if metadataTicket == ticket { meta = loaded.metadata; metaBaseline = loaded.metadata; recordingReferences = loaded.references; sharedVisibility = loaded.visibility; recordingContentRevisions = loaded.revisions }
             return
         }
         let url = baseDirectory.appendingPathComponent("library.json")
@@ -621,6 +630,13 @@ public actor RecordingStore {
         }
     }
 
+    private func acceptProgress(_ catalog: SharedRecordingMetadataAdapter.Catalog, ticket: UInt64, onProgress: @Sendable () async -> Void) async {
+        guard metadataTicket == ticket, !Task.isCancelled else { return }
+        meta = catalog.metadata; metaBaseline = catalog.metadata
+        recordingReferences = catalog.references; sharedVisibility = catalog.visibility; recordingContentRevisions = catalog.revisions
+        await onProgress()
+    }
+
     /// Only changed fields/paths enter the coordinated read-modify-write. Raw
     /// unknown fields and unrelated edits from another local store stay intact.
     private func saveLibraryMeta() async throws {
@@ -632,6 +648,9 @@ public actor RecordingStore {
                 for key in changes {
                     guard let desired = meta[key] else { throw SharedSidecarError.invalidContent }
                     let accepted = try await shared.save(filename: key, before: metaBaseline[key], after: desired)
+                    // A read can start while this edit waits for commit authority.
+                    // Its pre-commit result must not replace the accepted cache.
+                    metadataTicket += 1
                     meta[key] = accepted; metaBaseline[key] = accepted
                 }
             } catch {
