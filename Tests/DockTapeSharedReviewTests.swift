@@ -133,7 +133,67 @@ import HiDockKit
         model.clear()
         try expect(model.items.isEmpty && model.message == nil, "Changing libraries clears external consent")
         await state.sharedLibrary.close()
+        try await independentPublicationChecks(parent: parent, writer: coordinator.writerID)
         print("Actual external-file AppState checks passed: changed/corrupt/stale file, comparison, restoration, adoption, cache refresh and unrelated-file preservation.")
+    }
+    @MainActor static func independentPublicationChecks(parent: URL, writer: UUID) async throws {
+        let root = parent.appendingPathComponent("independent-publication")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in ["A.mp3", "B.mp3"] {
+            try Data("synthetic publication audio".utf8).write(to: root.appendingPathComponent(name))
+            try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: name, transcriptionModel: "fixture", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: "Current " + name)]), mp3Filename: name)
+        }
+        try await SummaryStore(baseDirectory: root).save(Summary(recordingFilename: "B.mp3", model: "fixture", provider: "fixture", templateUsed: "fixture",
+            sections: [.init(heading: "Summary", content: "Unchanged B summary")]), mp3Filename: "B.mp3")
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: writer, witnessDirectory: parent.appendingPathComponent("publication-witnesses"))
+        _ = try await coordinator.enable(); _ = try await coordinator.projectOutputs()
+        let file = root.appendingPathComponent("B.transcript.json")
+        for (index, heldPath) in ["A.transcript.json", "B.summary.json"].enumerated() {
+            var body = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+            var segments = body["segments"] as! [[String: Any]]
+            let changedText = "Independent recovery trial " + String(index)
+            segments[0]["text"] = changedText; body["segments"] = segments
+            try JSONSerialization.data(withJSONObject: body).write(to: file, options: .atomic)
+            let model = ExternalSidecarReviewState()
+            await model.refresh(using: coordinator)
+            guard let row = model.items.first(where: { $0.review?.filename == "B.mp3" }) else { throw Failure(message: "Missing resident recovery row") }
+            let heldFile = root.appendingPathComponent(heldPath)
+            let heldBytes = try Data(contentsOf: heldFile)
+            let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+            let holding = Task {
+                try await CoordinatedFileAccess().withWrite(at: heldFile) { _ in
+                    started.signal()
+                    guard release.wait(timeout: .now() + 8) == .success else { throw Failure(message: "Fixture coordination hold timed out") }
+                }
+            }
+            let acquired = await withCheckedContinuation { continuation in
+                DispatchQueue.global().async { continuation.resume(returning: started.wait(timeout: .now() + 2) == .success) }
+            }
+            guard acquired else { release.signal(); _ = try? await holding.value; throw Failure(message: "Fixture did not acquire its one-file lease") }
+            var completed = false
+            let applying = Task { @MainActor in
+                let result = await model.apply(row, useChangedFile: true, using: coordinator)
+                completed = true
+                return result
+            }
+            for _ in 0..<150 {
+                if completed { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let independent = completed
+            release.signal(); try await holding.value
+            let applied = await applying.value
+            try expect(independent, "Resident transcript recovery must finish while " + heldPath + " remains held")
+            try expect(applied && model.message == "Changed file accepted.", "Recovery must publish its selected output successfully")
+            let output = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+            try expect((output["segments"] as? [[String: Any]])?.first?["text"] as? String == changedText, "Selected JSON reflects accepted content")
+            try expect(try String(contentsOf: root.appendingPathComponent("B.transcript.md"), encoding: .utf8).contains(changedText), "Selected Markdown is updated")
+            try expect(try String(contentsOf: root.appendingPathComponent("B.txt"), encoding: .utf8).contains(changedText), "Selected TXT is updated")
+            try expect(try Data(contentsOf: heldFile) == heldBytes, "Held unrelated output remains byte-identical")
+            model.clear()
+        }
+        print("Actual independent publication passed: resident transcript JSON/Markdown/TXT recovery finishes with unrelated recording or same-recording summary held.")
     }
     @MainActor static func run() async throws {
         _ = NSApplication.shared

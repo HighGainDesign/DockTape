@@ -75,7 +75,7 @@ struct SharedLibraryProjectionWriter {
             return result
         }
     }
-    static func project(_ context: SharedLibraryProjectionContext, writer: UUID, only selectedPath: String? = nil,
+    static func project(_ context: SharedLibraryProjectionContext, writer: UUID, only selectedPaths: Set<String>? = nil,
                         beforeWrite: @escaping @Sendable () async -> Void = {},
                         beforeOutput: @escaping @Sendable (Int) throws -> Void = { _ in },
                         afterOutput: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedProjectionWriteResult {
@@ -85,7 +85,7 @@ struct SharedLibraryProjectionWriter {
         }
         let inputs = try JSONDecoder().decode(SharedProjectionInputs.self, from: seedBytes)
         try inputs.validate(manifest: context.manifest)
-        let outputs = try render(context).filter { selectedPath == nil || $0.key == selectedPath }
+        let outputs = try render(context).filter { selectedPaths == nil || selectedPaths!.contains($0.key) }
         let registryDir = root.appendingPathComponent(".docktape/projections")
         guard SharedLibraryMaterializer.contained(registryDir, in: root) else { throw SharedLibraryOperationError.unsafePath }
         try FileManager.default.createDirectory(at: registryDir, withIntermediateDirectories: true)
@@ -205,7 +205,7 @@ struct SharedLibraryProjectionWriter {
             var proposed: [String: SharedProjectionMarker] = [:]
             for (path, bytes) in outputs where path.hasSuffix(".json") { proposed[path] = try SharedProjectionDocument.marker(in: bytes) }
             let previousFiles = known
-            let pending = selectedPath == nil ? proposed : previousPending.merging(proposed, uniquingKeysWith: { _, new in new })
+            let pending = selectedPaths == nil ? proposed : previousPending.merging(proposed, uniquingKeysWith: { _, new in new })
             let intent = try SharedProjectionRegistry(library: context.manifest.libraryID, writer: writer, files: previousFiles, pending: pending, attempted: attempted.isEmpty ? nil : attempted).encoded()
             known.merge(proposed, uniquingKeysWith: { _, new in new })
             // Once the same entity/component is published at its new path,
@@ -218,10 +218,10 @@ struct SharedLibraryProjectionWriter {
                 let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
                 return FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path)
             }
-            // A restore updates only the reviewed aggregate. Keep unrelated
+            // A scoped publication updates only its selected outputs. Keep unrelated
             // interrupted-publication evidence until those outputs complete.
-            let remainingPending = selectedPath == nil ? [:] : previousPending.filter { outputs[$0.key] == nil }
-            let remainingAttempts = selectedPath == nil ? [:] : attempted.filter { outputs[$0.key] == nil }
+            let remainingPending = selectedPaths == nil ? [:] : previousPending.filter { outputs[$0.key] == nil }
+            let remainingAttempts = selectedPaths == nil ? [:] : attempted.filter { outputs[$0.key] == nil }
             let registry = try SharedProjectionRegistry(library: context.manifest.libraryID, writer: writer, files: known,
                 pending: remainingPending.isEmpty ? nil : remainingPending,
                 attempted: remainingAttempts.isEmpty ? nil : remainingAttempts).encoded()

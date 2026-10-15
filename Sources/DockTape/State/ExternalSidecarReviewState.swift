@@ -94,14 +94,14 @@ final class ExternalSidecarReviewState {
             do {
                 try Task.checkCancellation()
                 guard request == ticket, self.coordinator === coordinator else { return false }
+                var publicationFailed = false
                 if let review = item.review {
-                    _ = try await coordinator.recoverSidecar(review, useChangedFile: useChangedFile)
+                    let accepted = try await coordinator.recoverSidecar(review, useChangedFile: useChangedFile)
+                    do { _ = try await coordinator.projectOutputs(for: .init(id: accepted.state.id, kind: accepted.state.kind), component: review.component) }
+                    catch { publicationFailed = true }
                 } else if let bootstrap = item.bootstrap {
                     _ = try await coordinator.restoreBootstrapProjection(bootstrap)
                 }
-                var publicationFailed = false
-                do { _ = try await coordinator.projectOutputs() }
-                catch { publicationFailed = true }
                 guard request == ticket, self.coordinator === coordinator else { return true }
                 items.removeAll { $0.id == item.id }
                 message = publicationFailed

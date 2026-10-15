@@ -120,6 +120,51 @@ final class SharedLibraryProjectionWriterTests: XCTestCase {
         await gate.release(); _ = try await editing.value
     }
 
+    func testScopedContentPublicationPreservesUnrelatedExternalFilesAndUpdatesExports() async throws {
+        let (root, coordinator) = try await fixture()
+        let summaries = SummaryStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: coordinator))
+        try await summaries.save(Summary(recordingFilename: "Meeting.mp3", model: "fixture", provider: "fixture", templateUsed: "fixture",
+            sections: [.init(heading: "Summary", content: "Selected summary")]), mp3Filename: "Meeting.mp3")
+        _ = try await coordinator.projectOutputs()
+        let entity = SharedEntityIdentity(id: try await coordinator.recording(at: "Meeting.mp3").state.id, kind: .recording)
+        let transcript = root.appendingPathComponent("Meeting.transcript.json")
+        let summary = root.appendingPathComponent("Meeting.summary.json")
+        let templates = root.appendingPathComponent(".templates.json")
+        let library = try Data(contentsOf: root.appendingPathComponent("library.json"))
+        let damaged = Data("{unrelated external file".utf8)
+        try damaged.write(to: summary); try damaged.write(to: templates)
+        var body = try JSONSerialization.jsonObject(with: Data(contentsOf: transcript)) as! [String: Any]
+        var segments = body["segments"] as! [[String: Any]]; segments[0]["text"] = "Scoped accepted transcript"; body["segments"] = segments
+        try JSONSerialization.data(withJSONObject: body).write(to: transcript)
+        let reviews = try await coordinator.reviewSidecars(entity)
+        _ = try await coordinator.recoverSidecar(XCTUnwrap(reviews.first { $0.component == .transcript }), useChangedFile: true)
+        let written = try await coordinator.projectOutputs(for: entity, component: .transcript)
+        XCTAssertEqual(written.written, 3)
+        XCTAssertEqual(try Data(contentsOf: summary), damaged)
+        XCTAssertEqual(try Data(contentsOf: templates), damaged)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("library.json")), library)
+        for path in ["Meeting.transcript.md", "Meeting.txt"] { XCTAssertTrue(try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8).contains("Scoped accepted transcript")) }
+        let transcriptBytes = try Data(contentsOf: transcript)
+        let next = try await coordinator.reviewSidecars(entity)
+        _ = try await coordinator.recoverSidecar(XCTUnwrap(next.first { $0.component == .summary }), useChangedFile: false)
+        let restored = try await coordinator.projectOutputs(for: entity, component: .summary)
+        XCTAssertEqual(restored.written, 2)
+        XCTAssertEqual(try Data(contentsOf: transcript), transcriptBytes)
+        XCTAssertEqual(try Data(contentsOf: templates), damaged)
+        XCTAssertTrue(try String(contentsOf: root.appendingPathComponent("Meeting.summary.md"), encoding: .utf8).contains("Selected summary"))
+        let remaining = try await coordinator.reviewSidecars(entity)
+        XCTAssertTrue(remaining.isEmpty)
+    }
+    func testScopedPublicationRejectsMissingContentWithoutTouchingOutputs() async throws {
+        let (root, coordinator) = try await fixture()
+        _ = try await coordinator.projectOutputs()
+        let before = try Data(contentsOf: root.appendingPathComponent("library.json"))
+        let entity = SharedEntityIdentity(id: try await coordinator.recording(at: "Meeting.mp3").state.id, kind: .recording)
+        do { _ = try await coordinator.projectOutputs(for: entity, component: .summary); XCTFail("No summary is not a successful summary publication") }
+        catch SharedSidecarError.invalidContent {}
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("library.json")), before)
+    }
+
     func testFirstProjectionWithExplicitPrivateTmpRootAcceptsItsCoordinatedDirectory() async throws {
         let requested = URL(fileURLWithPath: "/private/tmp/DockTapeProjectionAlias-" + UUID().uuidString + "/data")
         roots.append(requested.deletingLastPathComponent())

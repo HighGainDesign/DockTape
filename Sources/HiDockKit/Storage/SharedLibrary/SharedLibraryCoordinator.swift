@@ -1639,8 +1639,9 @@ public actor SharedLibraryCoordinator {
 
   /// Ordinary publication can rebuild a stale proof after a brief refresh.
   /// Explicit preparation/mutation hooks retain one-shot rejection semantics.
+  private static var projectionRetryDelays: [Duration] { [.milliseconds(25), .milliseconds(100), .milliseconds(400), .milliseconds(800)] }
   public func projectOutputs() async throws -> SharedProjectionWriteResult {
-    let delays: [Duration] = [.milliseconds(25), .milliseconds(100), .milliseconds(400), .milliseconds(800)]
+    let delays = Self.projectionRetryDelays
     for attempt in 0...delays.count {
       do { return try await projectOutputs(beforeWrite: {}, afterOutput: { _ in }) }
       catch SharedProjectionWriteError.stale {
@@ -1655,6 +1656,34 @@ public actor SharedLibraryCoordinator {
                              afterOutput: @escaping @Sendable (Int) throws -> Void = { _ in }) async throws -> SharedProjectionWriteResult {
     let context = try await projectionContext()
     return try await SharedLibraryProjectionWriter.project(context, writer: writerID, beforeWrite: beforeWrite, beforeOutput: beforeOutput, afterOutput: afterOutput)
+  }
+  /// Publish one content component and its readable exports. Authority and
+  /// namespace proofs remain library-wide; unrelated canonical output bytes
+  /// are neither hydrated nor included in this physical access request.
+  public func projectOutputs(for entity: SharedEntityIdentity, component: SharedComponent) async throws -> SharedProjectionWriteResult {
+    let delays = Self.projectionRetryDelays
+    for attempt in 0...delays.count {
+      do {
+        let context = try await projectionContext()
+        guard entity.kind == .recording, context.views.contains(where: { $0.state.id == entity.id && $0.state.kind == entity.kind && $0.state.lifecycle == .alive }) else { throw SharedSidecarError.conflictedContent }
+        let outputs = try SharedLibraryProjectionWriter.render(context)
+        let json = try outputs.compactMap { path, bytes -> String? in
+          guard path.hasSuffix("." + component.rawValue + ".json"),
+            let marker = try SharedProjectionDocument.marker(in: bytes),
+            marker.libraryID == context.manifest.libraryID, marker.entities == [entity.id], marker.kind == component.rawValue else { return nil }
+          return path
+        }
+        guard json.count == 1, let path = json.first else { throw SharedSidecarError.invalidContent }
+        let stem = String(path.dropLast(("." + component.rawValue + ".json").count))
+        var paths: Set<String> = [path, stem + "." + component.rawValue + ".md"]
+        if component == .transcript { paths.insert(stem + ".txt") }
+        return try await SharedLibraryProjectionWriter.project(context, writer: writerID, only: paths)
+      } catch SharedProjectionWriteError.stale {
+        guard attempt < delays.count else { throw SharedProjectionWriteError.stale }
+        try await Task.sleep(for: delays[attempt])
+      }
+    }
+    throw SharedProjectionWriteError.stale
   }
   public func reviewBootstrapProjections() async throws -> [SharedBootstrapProjectionReview] {
     let manifest = try await bind(force: true)
@@ -1705,7 +1734,7 @@ public actor SharedLibraryCoordinator {
     // This permission exists only for this call. The writer rechecks the actual
     // input immediately before replacement and persists an attempt first.
     context.reviewedBootstrap[review.filename] = review.fingerprint
-    return try await SharedLibraryProjectionWriter.project(context, writer: writerID, only: review.filename)
+    return try await SharedLibraryProjectionWriter.project(context, writer: writerID, only: [review.filename])
   }
   private func projectionContext() async throws -> SharedLibraryProjectionContext {
     guard transitions == 0 else { throw SharedProjectionWriteError.stale }
