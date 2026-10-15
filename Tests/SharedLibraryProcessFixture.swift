@@ -40,6 +40,16 @@ struct SharedLibraryProcessFixture {
         _ = try await coordinator.enable(); _ = try await coordinator.projectOutputs(); print("seeded"); return
       }
       switch args[1] {
+      case "path-replan-prepare":
+        enum Stop: Error { case afterAudio }
+        do { _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Intermediate", afterMutation: { _ in throw Stop.afterAudio }) } catch Stop.afterAudio {}
+        let reference = try await coordinator.reference(to: "Intermediate.mp3")
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(.init(id: reference.entityID, kind: .recording)), changes: [.assign(field: "title", value: .text("Final"))]))
+        print("prepared"); return
+      case "path-replan-crash":
+        guard let review = try await coordinator.reviewRecordingOperation(id: id) else { throw FixtureError.arguments }
+        let plan = try await coordinator.prepareRecordingReplan(review)
+        _ = try await coordinator.applyRecordingReplan(plan)
       case "path-rename-crash": _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Renamed")
       case "path-move-crash": _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", toFolder: "Folder", changeFolder: true)
       case "path-delete-crash": _ = try await coordinator.deleteSharedRecording(filename: "Meeting.mp3")

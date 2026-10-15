@@ -23,6 +23,13 @@ struct SharedPublishedLocations: Sendable {
         for state in recordings {
             for (writer, document, intent) in try Self.fileIntents(state: state, library: library) {
                 guard completedFileIntents[state.id]?[writer] != SharedLibraryOperation.fingerprint(document.json) else { continue }
+                for (path, hash) in intent.retainedFiles ?? [:] {
+                    _ = try SharedLibraryIdentity.normalized(path)
+                    guard SharedLibraryOperation.validHash(hash) else { throw SharedLibraryOperationError.invalidReceipt }
+                    let suffixes = [".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".mp3", ".txt"]
+                    guard let suffix = suffixes.first(where: { path.hasSuffix($0) }) else { throw SharedLibraryOperationError.invalidOperation }
+                    result[state.id, default: []].insert(String(path.dropLast(suffix.count)) + ".mp3")
+                }
                 for step in intent.steps {
                     let paths: [String]
                     switch step {

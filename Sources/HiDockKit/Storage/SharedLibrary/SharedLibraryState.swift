@@ -82,8 +82,13 @@ public struct SharedEntityState: Codable, Equatable, Sendable {
         guard plan.steps.allSatisfy({ step in
             switch step { case .move, .moveDirectory, .trash, .createDirectory, .removeEmptyDirectory: return true; default: return false }
         }) else { throw SharedLibraryOperationError.invalidOperation }
-        let intent = SharedAcceptedFileIntent(schema: 1, libraryID: plan.libraryID, entity: plan.entity,
+        var intent = SharedAcceptedFileIntent(schema: 1, libraryID: plan.libraryID, entity: plan.entity,
             inputRevision: plan.inputRevision, guardRevision: revision, steps: plan.steps)
+        guard plan.retainedFiles.count <= 256 else { throw SharedLibraryOperationError.invalidOperation }
+        for (path, hash) in plan.retainedFiles { _ = try SharedLibraryIdentity.normalized(path); guard SharedLibraryOperation.validHash(hash) else { throw SharedLibraryOperationError.invalidOperation } }
+        intent.replacesOperationID = plan.replacesOperationID
+        intent.retainedFiles = plan.retainedFiles.isEmpty ? nil : plan.retainedFiles
+        intent.reviewedExistingDestinations = plan.reviewedExistingDestinations
         try write(field: Self.fileIntentField(writer: writer), value: .document(try SharedDocument(id: UUID(), json: JSONEncoder().encode(intent))), writer: writer)
         // Preserve lifecycle value and its established last-write causal bound.
         try write(field: Self.lifecycleField, value: lifecycleValue, writer: writer)

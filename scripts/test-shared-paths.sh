@@ -54,5 +54,21 @@ for kind in ['rename','move','delete','create','folder-rename','folder-delete','
         elif kind=='folder-rename': assert (root/'Renamed folder/Nested.mp3').read_bytes()==nested and not (root/'Folder').exists()
         else: assert not (root/'Folder').exists() and (parent/'disposed/Nested.mp3').read_bytes()==nested
 assert not failures, failures
-print('8 actual accepted-path process-exit scenarios and repeated replay passed; only fixture disposal used.')
+with tempfile.TemporaryDirectory(prefix='docktape-reviewed-replan-') as temporary:
+    parent=pathlib.Path(temporary); root=parent/'library'; root.mkdir(); local=parent/'local'
+    audio=b'synthetic replan original'; (root/'Meeting.mp3').write_bytes(audio)
+    args=[str(root),writer,unused,str(local)]
+    subprocess.run([fixture,'path-seed',*args],check=True,capture_output=True,text=True,timeout=15)
+    ids=json.loads(subprocess.check_output([fixture,'path-ids',*args],text=True,timeout=15))
+    entity=next(item['id'] for item in ids if item['path']=='Meeting.mp3')
+    subprocess.run([fixture,'path-replan-prepare',*args],check=True,capture_output=True,text=True,timeout=20)
+    record_args=[str(root),writer,entity,str(local)]
+    crash=subprocess.run([fixture,'path-replan-crash',*record_args],capture_output=True,text=True,timeout=20)
+    assert crash.returncode==74,(crash.returncode,crash.stdout,crash.stderr)
+    assert (root/'Intermediate.mp3').read_bytes()==audio and not (root/'Final.mp3').exists()
+    for _ in range(2):
+        resumed=subprocess.run([fixture,'path-record-resume',*record_args],capture_output=True,text=True,timeout=20)
+        assert resumed.returncode==0 and resumed.stdout.strip()=='complete',(resumed.returncode,resumed.stdout,resumed.stderr)
+    assert (root/'Final.mp3').read_bytes()==audio and not (root/'Intermediate.mp3').exists()
+print('9 actual accepted-path/replan process-exit scenarios and repeated replay passed; only fixture disposal used.')
 PYTEST

@@ -52,11 +52,30 @@ public struct SharedRecordingOperationReview: Identifiable, Sendable {
   public let waitingForMacs: [String]
   public let canResume: Bool
   public let canAcknowledge: Bool
+  public var canReplan: Bool {
+    isLocal && needsReplanning && !hasActiveWork && base.state.lifecycle == .alive && base.state.conflicts.isEmpty
+      && operation.steps.allSatisfy { if case .move = $0 { return true }; return false }
+  }
   let base: SharedLibraryViewSnapshot
   let operation: SharedLibraryOperation
   let cohort: String
   let isLocal: Bool
   public let purpose: SharedDestructivePurpose?
+}
+
+public struct SharedRecordingReplanReview: Identifiable, Sendable {
+  public var id: UUID { original.id }
+  public let destination: String
+  public let sources: [String]
+  let original: SharedRecordingOperationReview
+  let steps: [SharedLibraryOperation.Step]
+  let witnesses: [SharedFilePathWitness]
+  let retainedFiles: [String: String]
+  let reviewedExistingDestinations: [String]
+}
+struct SharedFilePathWitness: Sendable {
+  let path: String
+  let fingerprint: String?
 }
 
 public struct SharedExternalContent: Equatable, Sendable {
@@ -818,10 +837,17 @@ public actor SharedLibraryCoordinator {
       switch step { case .move, .moveDirectory, .trash, .createDirectory, .removeEmptyDirectory: return true; default: return false }
     }) else { throw SharedLibraryOperationError.invalidOperation }
     let previous = try await reader.progress(entity: intent.entity, libraryID: intent.libraryID)
-    if previous?.operation.steps == intent.steps && previous?.operation.inputRevision == intent.inputRevision { return true }
-    let operation = try SharedLibraryOperation(libraryID: intent.libraryID, entity: intent.entity,
+    if previous?.operation.steps == intent.steps && previous?.operation.inputRevision == intent.inputRevision,
+       previous?.operation.reviewedExistingDestinations == intent.reviewedExistingDestinations { return true }
+    var operation = try SharedLibraryOperation(libraryID: intent.libraryID, entity: intent.entity,
       inputRevision: intent.inputRevision, outputRevision: SharedLibraryOperation.revision(for: view.state), steps: intent.steps)
-    try await Task.detached { try await reader.recordIntent(operation) }.value
+    operation.reviewedExistingDestinations = intent.reviewedExistingDestinations
+    if let previous, previous.completedSteps < previous.operation.steps.count {
+      guard intent.replacesOperationID == previous.operation.id, intent.inputRevision == previous.operation.outputRevision else { return false }
+      let materializer = try await makeMaterializer(entity: intent.entity, paths: Array(operation.canonicalPaths), receipts: operationReceipts(library: intent.libraryID))
+      do { try await Task.detached { try await materializer.replan(operation, replacing: previous.operation.id) }.value }
+      catch SharedLibraryOperationError.unfinishedOperation { return false }
+    } else { try await Task.detached { try await reader.recordIntent(operation) }.value }
     return true
   }
   private struct FolderMoveMember: Codable, Sendable {
@@ -1308,7 +1334,31 @@ public actor SharedLibraryCoordinator {
       try await reconstructAudioIntent(view: view, materializer: reader)
       progress = try await reader.progress(entity: entity, libraryID: view.libraryID)
     }
-    if let progress, progress.completedSteps == progress.operation.steps.count { return nil }
+    var survivingAliases: [String] = []
+    var retainedPaths: [String] = []
+    if let progress, progress.completedSteps == progress.operation.steps.count {
+      guard progress.operation.steps.allSatisfy({ if case .move = $0 { return true }; return false }),
+            case .document(let document)? = view.state.value(for: fileIntentField) else { return nil }
+      let manifest = try await bind(force: true)
+      let membership = try await memberRepository().load().membership
+      let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership)
+      if published.completedFileIntents[id]?[writerID.uuidString.lowercased()] == SharedLibraryOperation.fingerprint(document.json) { return nil }
+      let destination = try await currentPath(view)
+      let locations = try published.reservations(states: [view.state], library: view.libraryID)
+      for source in locations[id] ?? [] where source != destination {
+        let stem = (source as NSString).deletingPathExtension
+        for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+          let path = stem + suffix
+          let url = root.appendingPathComponent(path)
+          let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+          if FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path) { survivingAliases.append(path) }
+        }
+      }
+    }
+    if case .document(let document)? = view.state.value(for: fileIntentField) {
+      let intent = try JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json)
+      retainedPaths = intent.retainedFiles.map { Array($0.keys) } ?? []
+    }
     var operation = progress?.operation
     var planGuardMatches = fileGuardMatches
     if operation == nil {
@@ -1337,14 +1387,14 @@ public actor SharedLibraryCoordinator {
       if try await acknowledgedRemovalIsPresent(paths: Array(operation.canonicalPaths), permission: removal) { return nil }
     }
     let revisionMatches = try SharedLibraryOperation.matchesRevision(operation.outputRevision, state: view.state)
-    let needsReplanning = !planGuardMatches || !view.state.conflicts.isEmpty || !revisionMatches
+    let needsReplanning = !planGuardMatches || !view.state.conflicts.isEmpty || !revisionMatches || !survivingAliases.isEmpty
     let revision = try SharedStateFingerprint.of(permission.state)
     let approved = Set(permission.acknowledgments.filter { $0.entity == id && $0.purpose == purpose && $0.revision == revision && $0.cohort == permission.membership.fingerprint }.map(\.writer))
     let stable = permission.membership.pendingWriters.isEmpty && !permission.membership.hasConcurrentEnrollment
     let canAcknowledge = purpose != nil && !needsReplanning && !permission.hasPendingWork && !permission.hasLiveDescendants && stable && !approved.contains(writerID)
     let waiting = purpose == nil ? [] : permission.membership.cohort.subtracting(approved).map { $0 == writerID ? "This Mac" : permission.membership.label(for: $0) }.sorted()
     let name = view.state.value(for: "title").flatMap { if case .text(let name) = $0 { return name }; return nil } ?? "Recording"
-    return .init(title: name, paths: operation.canonicalPaths.sorted(), completedSteps: progress?.completedSteps ?? 0,
+    return .init(title: name, paths: Set(Array(operation.canonicalPaths) + retainedPaths).sorted(), completedSteps: progress?.completedSteps ?? 0,
       totalSteps: operation.steps.count, needsReplanning: needsReplanning, hasActiveWork: permission.hasPendingWork, waitingForMacs: waiting,
       canResume: progress != nil && !needsReplanning && !permission.hasPendingWork && (purpose.map { permission.mayDestroy($0) } ?? true),
       canAcknowledge: canAcknowledge, base: view, operation: operation, cohort: permission.membership.fingerprint,
@@ -1356,6 +1406,96 @@ public actor SharedLibraryCoordinator {
     guard current.fingerprint == review.base.fingerprint else { throw SharedLibraryCoordinatorError.staleReview }
     guard try await memberRepository().load().membership.fingerprint == review.cohort else { throw SharedLibraryOperationError.staleAuthority }
   }
+  public func prepareRecordingReplan(_ review: SharedRecordingOperationReview) async throws -> SharedRecordingReplanReview {
+    try await validateFileReview(review)
+    guard review.isLocal, review.base.state.lifecycle == .alive, review.base.state.conflicts.isEmpty,
+          review.operation.steps.allSatisfy({ if case .move = $0 { return true }; return false }) else { throw SharedLibraryOperationError.invalidOperation }
+    let destination = try await currentPath(review.base)
+    let stem = (destination as NSString).deletingPathExtension
+    var retained: [String: String] = [:]
+    if case .document(let document)? = review.base.state.value(for: fileIntentField) {
+      let intent = try JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json)
+      retained = intent.retainedFiles ?? [:]
+    }
+    for step in review.operation.steps {
+      guard case .move(let source, let target, let hash) = step else { throw SharedLibraryOperationError.invalidOperation }
+      for path in [source, target] {
+        if let known = retained[path], known != hash { throw SharedLibraryOperationError.invalidReceipt }
+        retained[path] = hash
+      }
+    }
+    let suffixes = [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"]
+    var witnesses: [SharedFilePathWitness] = [], steps: [SharedLibraryOperation.Step] = [], existingTargets: [String] = [], sources: [String] = []
+    for suffix in suffixes {
+      let candidates = retained.keys.filter { $0.hasSuffix(suffix) }.sorted()
+      guard !candidates.isEmpty else { continue }
+      let target = stem + suffix
+      let hashes = Set(candidates.compactMap { retained[$0] })
+      guard hashes.count == 1, let expected = hashes.first else { throw SharedLibraryOperationError.invalidReceipt }
+      var present: [String] = []
+      for path in Set(candidates + [target]).sorted() {
+        let bytes = try await RecordingFileAccess().readDataIfPresent(at: root.appendingPathComponent(path))
+        let actual = bytes.map(SharedLibraryOperation.fingerprint)
+        witnesses.append(.init(path: path, fingerprint: actual))
+        if let actual {
+          guard candidates.contains(path) else { throw SharedLibraryOperationError.pathConflict(path) }
+          guard actual == expected else { throw SharedLibraryOperationError.contentChanged(path) }
+          present.append(path)
+        }
+      }
+      guard !present.isEmpty else { throw CocoaError(.fileReadNoSuchFile) }
+      if present.contains(target) { existingTargets.append(target) }
+      let moving = present.filter { $0 != target }
+      sources += present
+      if moving.isEmpty {
+        // A previous accepted phase already put this file at the selected path.
+        guard let absentSource = candidates.first(where: { $0 != target }) else { throw SharedLibraryOperationError.invalidOperation }
+        steps.append(.move(source: absentSource, destination: target, fingerprint: expected))
+      } else { for source in moving { steps.append(.move(source: source, destination: target, fingerprint: expected)) } }
+    }
+    guard steps.contains(where: { if case .move(_, let target, _) = $0 { return target == destination }; return false }) else { throw SharedLibraryOperationError.invalidOperation }
+    _ = try await operationAuthority(entity: review.operation.entity, paths: Array(Set(steps.flatMap { step -> [String] in if case .move(let source, let target, _) = step { return [source, target] }; return [] })))
+    try await validateFileReview(review)
+    return .init(destination: destination, sources: Array(Set(sources)).sorted(), original: review, steps: steps,
+      witnesses: witnesses, retainedFiles: retained, reviewedExistingDestinations: existingTargets.sorted())
+  }
+  public func applyRecordingReplan(_ prepared: SharedRecordingReplanReview,
+      beforeCommit: @escaping @Sendable () async throws -> Void = {}) async throws -> SharedRecordingFileOutcome {
+    let review = prepared.original
+    try await validateFileReview(review)
+    guard try await currentPath(review.base) == prepared.destination else { throw SharedLibraryCoordinatorError.staleReview }
+    let receipts = try operationReceipts(library: review.base.libraryID)
+    let reader = try await makeMaterializer(entity: review.operation.entity, paths: [], receipts: receipts)
+    guard try await reader.progress(entity: review.operation.entity, libraryID: review.base.libraryID)?.operation == review.operation else { throw SharedLibraryCoordinatorError.staleReview }
+    let paths = Array(Set(prepared.steps.flatMap { step -> [String] in if case .move(let source, let target, _) = step { return [source, target] }; return [] }))
+    let permission = try await operationAuthority(entity: review.operation.entity, paths: paths)
+    guard permission.membership.fingerprint == review.cohort, !permission.hasPendingWork else { throw SharedLibraryOperationError.staleAuthority }
+    guard try await currentPath(review.base) == prepared.destination else { throw SharedLibraryCoordinatorError.staleReview }
+    var bindings = permission.additionalBindings + (permission.binding.map { [$0] } ?? [])
+    for witness in prepared.witnesses {
+      if let expected = witness.fingerprint { bindings.append(.init(file: root.appendingPathComponent(witness.path)) { SharedLibraryOperation.fingerprint($0) == expected }) }
+    }
+    let root = self.root
+    let absent = prepared.witnesses.filter { $0.fingerprint == nil }.map(\.path)
+    let validate: @Sendable () throws -> Void = {
+      for path in absent {
+        let url = root.appendingPathComponent(path)
+        let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+        guard !FileManager.default.fileExists(atPath: url.path), !FileManager.default.fileExists(atPath: placeholder.path) else { throw SharedLibraryOperationError.contentChanged(path) }
+      }
+    }
+    try await beforeCommit(); try Task.checkCancellation()
+    var plan = SharedPreparedFileOperation(libraryID: review.base.libraryID, entity: review.operation.entity,
+      inputRevision: review.operation.outputRevision, steps: prepared.steps)
+    plan.replacesOperationID = review.operation.id
+    plan.retainedFiles = prepared.retainedFiles
+    plan.reviewedExistingDestinations = prepared.reviewedExistingDestinations
+    _ = try await commit(.init(base: review.base, changes: []), review: true, exact: true, bindings: bindings,
+      preparedFileOperation: plan, additionalValidation: validate)
+    try Task.checkCancellation()
+    return try await resumeRecordingOperation(id: review.id, expectedCohort: review.cohort)
+  }
+
   public func resumeReviewedRecordingOperation(_ review: SharedRecordingOperationReview) async throws -> SharedRecordingFileOutcome {
     try await validateFileReview(review)
     guard review.canResume, review.isLocal else { throw SharedLibraryOperationError.invalidOperation }
@@ -1710,7 +1850,8 @@ public actor SharedLibraryCoordinator {
     try await commit(edit, review: true)
   }
   private func commit(_ edit: SharedCoordinatorEdit, review: Bool, exact: Bool = false,
-                      bindings: [SharedMaterializationBinding] = [], preparedFileOperation: SharedPreparedFileOperation? = nil) async throws
+                      bindings: [SharedMaterializationBinding] = [], preparedFileOperation: SharedPreparedFileOperation? = nil,
+                      additionalValidation: (@Sendable () throws -> Void)? = nil) async throws
     -> SharedLibraryViewSnapshot
   {
     beginTransition(); defer { endTransition() }
@@ -1736,8 +1877,9 @@ public actor SharedLibraryCoordinator {
     if exact {
       validation = { state in
         guard try SharedStateFingerprint.of(state) == expected else { throw SharedLibraryCoordinatorError.staleReview }
+        try additionalValidation?()
       }
-    } else { validation = nil }
+    } else { validation = additionalValidation.map { extra in { _ in try extra() } } }
     var transaction = SharedLibraryEdit(base: fresh, changes: edit.changes, validation: validation, bindings: bindings)
     transaction.preparedFileOperation = preparedFileOperation
     let accepted = try await repository.commit(transaction)

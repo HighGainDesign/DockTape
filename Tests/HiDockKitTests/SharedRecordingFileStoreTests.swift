@@ -945,4 +945,179 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Moved.mp3")), changed)
     }
 
+    private func pendingChangedMove() async throws -> (URL, SharedLibraryCoordinator, SharedRecordingOperationReview) {
+        let (root, coordinator, _) = try await fixture()
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        do { _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Intermediate", afterMutation: { _ in throw ReviewStop.interrupted }); XCTFail() }
+        catch ReviewStop.interrupted {}
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.assign(field: "title", value: .text("Final"))]))
+        let value = try await coordinator.reviewRecordingOperation(id: entity.id)
+        return (root, coordinator, try XCTUnwrap(value))
+    }
+    func testExplicitUpdatedPlanMovesAllSurvivingFilesToReviewedDestination() async throws {
+        let (root, coordinator, original) = try await pendingChangedMove()
+        let prepared = try await coordinator.prepareRecordingReplan(original)
+        XCTAssertEqual(prepared.destination, "Final.mp3")
+        XCTAssertTrue(prepared.sources.contains("Intermediate.mp3"))
+        XCTAssertTrue(prepared.sources.contains("Meeting.transcript.json"))
+        let result = try await coordinator.applyRecordingReplan(prepared)
+        XCTAssertEqual(result.result, .complete); XCTAssertNil(result.projectionError)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Final.mp3")), Data("single synthetic original".utf8))
+        for name in ["Meeting.mp3", "Intermediate.mp3", "Meeting.transcript.json", "Intermediate.transcript.json"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Final.transcript.json").path))
+        let current = try await coordinator.reference(to: "Final.mp3")
+        XCTAssertEqual(current.entityID, original.id)
+    }
+    func testUpdatedPlanRefusesUnseenSemanticAndPhysicalChanges() async throws {
+        let (root, coordinator, original) = try await pendingChangedMove()
+        let prepared = try await coordinator.prepareRecordingReplan(original)
+        let changed = Data("unseen audio edit".utf8)
+        try changed.write(to: root.appendingPathComponent("Intermediate.mp3"), options: .atomic)
+        do { _ = try await coordinator.applyRecordingReplan(prepared); XCTFail("Reviewed fingerprints cannot silently change") } catch {}
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Intermediate.mp3")), changed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Final.mp3").path))
+        try Data("single synthetic original".utf8).write(to: root.appendingPathComponent("Intermediate.mp3"), options: .atomic)
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(.init(id: original.id, kind: .recording)), changes: [.assign(field: "title", value: .text("Another"))]))
+        do { _ = try await coordinator.applyRecordingReplan(prepared); XCTFail("A new destination requires another review") }
+        catch SharedLibraryCoordinatorError.staleReview {}
+    }
+    func testUpdatedPlanDoesNotAdoptUnprovenDestinationWithIdenticalBytes() async throws {
+        let (root, coordinator, original) = try await pendingChangedMove()
+        try Data("single synthetic original".utf8).write(to: root.appendingPathComponent("Final.mp3"), options: .atomic)
+        do { _ = try await coordinator.prepareRecordingReplan(original); XCTFail("Byte equality cannot establish a destination's provenance") }
+        catch SharedLibraryOperationError.pathConflict(let path) { XCTAssertEqual(path, "Final.mp3") }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Intermediate.mp3").path))
+    }
+
+    func testAcceptedUpdatedPlanRecoversAfterCancellationBeforeReceiptReplacement() async throws {
+        let (root, original, review) = try await pendingChangedMove()
+        let prepared = try await original.prepareRecordingReplan(review)
+        let local = root.deletingLastPathComponent().appendingPathComponent("local")
+        let cancelled = SharedLibraryCoordinator(root: root, writerID: original.writerID, witnessDirectory: local,
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let task = Task { try await cancelled.applyRecordingReplan(prepared) }
+        do { _ = try await task.value; XCTFail() } catch is CancellationError {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Intermediate.mp3").path))
+        let reopened = SharedLibraryCoordinator(root: root, writerID: original.writerID, witnessDirectory: local)
+        let result = try await reopened.resumeRecordingOperation(id: review.id)
+        XCTAssertEqual(result.result, .complete); XCTAssertNil(result.projectionError)
+        let again = try await reopened.resumeRecordingOperation(id: review.id)
+        XCTAssertEqual(again.result, .complete)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Final.mp3")), Data("single synthetic original".utf8))
+    }
+    func testUpdatedPlanRefusesLateUnreviewedDestinationAfterAcceptance() async throws {
+        let (root, original, review) = try await pendingChangedMove()
+        let prepared = try await original.prepareRecordingReplan(review)
+        let bytes = Data("single synthetic original".utf8)
+        let raced = SharedLibraryCoordinator(root: root, writerID: original.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"),
+            afterCommit: { try? bytes.write(to: root.appendingPathComponent("Final.mp3"), options: .atomic) })
+        do { _ = try await raced.applyRecordingReplan(prepared); XCTFail("A post-acceptance matching file is not a reviewed destination") }
+        catch SharedLibraryOperationError.pathConflict(let path) { XCTAssertEqual(path, "Final.mp3") }
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Intermediate.mp3")), bytes)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Final.mp3")), bytes)
+    }
+    func testLateRetainedAliasRemainsVisibleAfterReplannedStepsComplete() async throws {
+        let (root, coordinator, review) = try await pendingChangedMove()
+        let prepared = try await coordinator.prepareRecordingReplan(review)
+        let raced = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID,
+            witnessDirectory: root.deletingLastPathComponent().appendingPathComponent("local"),
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        do { _ = try await Task { try await raced.applyRecordingReplan(prepared) }.value; XCTFail() } catch is CancellationError {}
+        // Another accepted original path arrives after the replacement was prepared.
+        let bytes = Data("single synthetic original".utf8)
+        try bytes.write(to: root.appendingPathComponent("Meeting.mp3"), options: .atomic)
+        let result = try await coordinator.resumeRecordingOperation(id: review.id)
+        XCTAssertEqual(result.result, .needsReplanning, "The original receipt must not drop a newly surviving owned path")
+        let value = try await coordinator.reviewRecordingOperation(id: review.id)
+        XCTAssertNotNil(value, "A newly surviving original stays actionable")
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), bytes)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Intermediate.mp3")), bytes)
+        let next = try XCTUnwrap(value)
+        let updated = try await coordinator.prepareRecordingReplan(next)
+        let completed = try await coordinator.applyRecordingReplan(updated)
+        XCTAssertEqual(completed.result, .complete); XCTAssertNil(completed.projectionError)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Final.mp3")), bytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Intermediate.mp3").path))
+    }
+
+    func testCompletedReplanReceiptWithLateAliasRemainsActionable() async throws {
+        let (root, coordinator, review) = try await pendingChangedMove()
+        let prepared = try await coordinator.prepareRecordingReplan(review)
+        let local = root.deletingLastPathComponent().appendingPathComponent("local")
+        let cancelled = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: local,
+            afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        do { _ = try await Task { try await cancelled.applyRecordingReplan(prepared) }.value; XCTFail() } catch is CancellationError {}
+        let intermediateReview = try await coordinator.reviewRecordingOperation(id: review.id)
+        let accepted = try XCTUnwrap(intermediateReview)
+        let receipts = local.appendingPathComponent("Operations/\(accepted.base.libraryID.uuidString)/\(coordinator.writerID.uuidString)")
+        let materializer = try await coordinator.makeMaterializer(entity: accepted.operation.entity, paths: Array(accepted.operation.canonicalPaths), receipts: receipts)
+        let done = try await materializer.replay(accepted.operation)
+        XCTAssertEqual(done, .complete)
+        try Data("single synthetic original".utf8).write(to: root.appendingPathComponent("Meeting.mp3"), options: .atomic)
+        let value = try await coordinator.reviewRecordingOperation(id: review.id)
+        let pending = try XCTUnwrap(value, "Completed local steps are not completed publication when an old alias survives")
+        XCTAssertTrue(pending.needsReplanning)
+        let next = try await coordinator.prepareRecordingReplan(pending)
+        let result = try await coordinator.applyRecordingReplan(next)
+        XCTAssertEqual(result.result, .complete); XCTAssertNil(result.projectionError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path))
+    }
+
+    func testUpdatedPlanRefusesChangedAncestorLocation() async throws {
+        let (root, coordinator, store) = try await fixture()
+        try await store.createFolder(named: "Archive")
+        _ = try await store.moveRecording(filename: "Meeting.mp3", toFolder: "Archive")
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Archive/Meeting.mp3").entityID, kind: .recording)
+        do { _ = try await coordinator.relocateRecording(filename: "Archive/Meeting.mp3", title: "Intermediate", afterMutation: { _ in throw ReviewStop.interrupted }); XCTFail() }
+        catch ReviewStop.interrupted {}
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.assign(field: "title", value: .text("Final"))]))
+        let value = try await coordinator.reviewRecordingOperation(id: entity.id)
+        let review = try XCTUnwrap(value)
+        let prepared = try await coordinator.prepareRecordingReplan(review)
+        let folders = try await coordinator.snapshots(kinds: [.folder])
+        let folder = try XCTUnwrap(folders.first)
+        _ = try await coordinator.edit(.init(base: folder, changes: [.assign(field: "name", value: .text("Changed"))]))
+        do { _ = try await coordinator.applyRecordingReplan(prepared); XCTFail("An ancestor rename changes the reviewed destination without changing this recording") }
+        catch SharedLibraryCoordinatorError.staleReview {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Archive/Intermediate.mp3").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Archive/Final.mp3").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Changed/Final.mp3").path))
+    }
+    func testUpdatedPlanRefusesDestinationAppearingAtCommitBoundary() async throws {
+        let (root, coordinator, review) = try await pendingChangedMove()
+        let prepared = try await coordinator.prepareRecordingReplan(review)
+        let before = try await coordinator.read(.init(id: review.id, kind: .recording))
+        let bytes = Data("single synthetic original".utf8)
+        do {
+            _ = try await coordinator.applyRecordingReplan(prepared, beforeCommit: {
+                try bytes.write(to: root.appendingPathComponent("Final.mp3"), options: .atomic)
+            })
+            XCTFail("No new receipt or semantic recipe may consume an unreviewed destination")
+        } catch SharedLibraryOperationError.contentChanged(let path) { XCTAssertEqual(path, "Final.mp3") }
+        let after = try await coordinator.read(.init(id: review.id, kind: .recording))
+        XCTAssertEqual(after.fingerprint, before.fingerprint)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Intermediate.mp3")), bytes)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Final.mp3")), bytes)
+    }
+    func testOldFileIntentAndReceiptDecodeWithoutReplanFields() throws {
+        let entity = SharedEntityIdentity(id: UUID(), kind: .recording)
+        let hash = SharedLibraryOperation.fingerprint(Data("original".utf8))
+        let intent = SharedAcceptedFileIntent(schema: 1, libraryID: UUID(), entity: entity,
+            inputRevision: hash, guardRevision: hash, steps: [.move(source: "Old.mp3", destination: "New.mp3", fingerprint: hash)])
+        let encoded = try JSONEncoder().encode(intent)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNil(object["retainedFiles"]); XCTAssertNil(object["replacesOperationID"]); XCTAssertNil(object["reviewedExistingDestinations"])
+        let old = try JSONDecoder().decode(SharedAcceptedFileIntent.self, from: encoded)
+        XCTAssertNil(old.retainedFiles); XCTAssertNil(old.replacesOperationID); XCTAssertNil(old.reviewedExistingDestinations)
+        let operation = try SharedLibraryOperation(libraryID: intent.libraryID, entity: entity,
+            inputRevision: hash, outputRevision: hash, steps: intent.steps)
+        let legacy = try JSONDecoder().decode(SharedLibraryOperation.self, from: JSONEncoder().encode(operation))
+        XCTAssertNil(legacy.reviewedExistingDestinations)
+        XCTAssertEqual(legacy, operation)
+    }
+
 }

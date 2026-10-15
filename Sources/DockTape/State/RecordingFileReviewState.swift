@@ -10,13 +10,15 @@ import HiDockKit
     private(set) var isWorking = false
     private(set) var inspectionFailed = false
     private(set) var message: String?
+    private(set) var updatedPlan: SharedRecordingReplanReview?
     private var binding: SharedLibraryCoordinator?
     private var request = UUID()
     private var action: Task<Bool, Never>?
+    private var workID = UUID()
 
     func clear() {
-        request = UUID(); action?.cancel(); action = nil
-        binding = nil; items = []; message = nil; isLoading = false; isWorking = false; inspectionFailed = false
+        request = UUID(); workID = UUID(); action?.cancel(); action = nil
+        binding = nil; items = []; message = nil; updatedPlan = nil; isLoading = false; isWorking = false; inspectionFailed = false
     }
     func refresh(using coordinator: SharedLibraryCoordinator) async {
         if binding !== coordinator { clear(); binding = coordinator }
@@ -38,9 +40,55 @@ import HiDockKit
             if request == ticket, binding === coordinator, !(error is CancellationError) { inspectionFailed = true; message = "Pending file changes could not be loaded. Reload after the library is available." }
         }
     }
+    func dismissUpdatedPlan() {
+        guard !isWorking else { return }
+        updatedPlan = nil
+    }
+    func prepareUpdatedPlan(_ review: SharedRecordingOperationReview, using coordinator: SharedLibraryCoordinator) async {
+        guard binding === coordinator, !isLoading, !isWorking, review.canReplan else { return }
+        let ticket = request; let work = UUID(); workID = work; isWorking = true; message = nil
+        defer { if binding === coordinator, workID == work { isWorking = false } }
+        do {
+            let prepared = try await coordinator.prepareRecordingReplan(review)
+            guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
+            updatedPlan = prepared
+        } catch {
+            if binding === coordinator, request == ticket, !(error is CancellationError) {
+                message = "The updated plan could not be prepared. Reload after sync finishes; existing files are preserved."
+            }
+        }
+    }
+    @discardableResult func applyUpdatedPlan(using coordinator: SharedLibraryCoordinator) async -> Bool {
+        guard binding === coordinator, !isLoading, !isWorking, let prepared = updatedPlan else { return false }
+        let ticket = request; let work = UUID(); workID = work; isWorking = true; message = nil
+        let task = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                let outcome = try await coordinator.applyRecordingReplan(prepared)
+                guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
+                self.updatedPlan = nil
+                await self.refresh(using: coordinator)
+                self.message = outcome.result == .complete && outcome.projectionError == nil
+                    ? "Updated file plan completed." : "Updated plan accepted. Review any remaining pending file changes."
+                return true
+            } catch {
+                guard let self, self.binding === coordinator, self.request == ticket else { return false }
+                self.updatedPlan = nil
+                await self.refresh(using: coordinator)
+                if !(error is CancellationError) {
+                    self.message = "The updated plan could not finish. Review the current pending change before trying again; existing files are preserved."
+                }
+                return false
+            }
+        }
+        action = task
+        let result = await task.value
+        if binding === coordinator, workID == work { isWorking = false; action = nil }
+        return result
+    }
     @discardableResult func perform(_ choice: Action, review: SharedRecordingOperationReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
         guard binding === coordinator, !isLoading, !isWorking else { return false }
-        let ticket = request; isWorking = true; message = nil
+        let ticket = request; let work = UUID(); workID = work; isWorking = true; message = nil
         let task = Task { [weak self] in
             do {
                 try Task.checkCancellation()
@@ -74,7 +122,7 @@ import HiDockKit
         }
         action = task
         let result = await task.value
-        if binding === coordinator { isWorking = false; action = nil }
+        if binding === coordinator, workID == work { isWorking = false; action = nil }
         return result
     }
 }

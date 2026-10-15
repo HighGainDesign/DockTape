@@ -45,6 +45,12 @@ struct PendingRecordingFilesView: View {
                                         .disabled(!item.canAcknowledge || model.isWorking)
                                         .accessibilityLabel((item.purpose == .delete ? "Approve deletion of " : "Approve audio replacement for ") + item.title + " on this Mac")
                                 }
+                                if item.canReplan {
+                                    Button("Review Updated Plan…") {
+                                        guard let coordinator = state.sharedLibrary.coordinator else { return }
+                                        Task { await model.prepareUpdatedPlan(item, using: coordinator) }
+                                    }.disabled(model.isWorking || model.isLoading)
+                                }
                                 Button("Resume") { perform(.resume, item) }
                                     .disabled(!item.canResume || model.isWorking)
                                     .accessibilityLabel("Resume file change for " + item.title)
@@ -63,6 +69,30 @@ struct PendingRecordingFilesView: View {
             if let message = model.message { Text(message).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding([.horizontal, .top]) }
             HStack { Button("Close", action: onClose).keyboardShortcut(.cancelAction); Spacer() }.padding()
         }.frame(minWidth: 640, minHeight: 420)
+        .sheet(item: Binding(get: { model.updatedPlan }, set: { if $0 == nil { model.dismissUpdatedPlan() } })) { plan in
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Review Updated File Plan").font(.title2)
+                Text("Move the available recording and companion files to the current recording location.")
+                Text("Current files").font(.headline)
+                ScrollView { VStack(alignment: .leading, spacing: 6) {
+                    ForEach(plan.sources, id: \.self) { Text($0).textSelection(.enabled) }
+                }.frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 180)
+                Text("Destination").font(.headline)
+                Text(plan.destination).textSelection(.enabled)
+                if let message = model.message { Text(message).foregroundStyle(.secondary) }
+                HStack {
+                    Button("Cancel") { model.dismissUpdatedPlan() }.keyboardShortcut(.cancelAction).disabled(model.isWorking)
+                    Spacer()
+                    if model.isWorking { ProgressView().controlSize(.small) }
+                    Button("Apply Updated Plan") {
+                        guard let coordinator = state.sharedLibrary.coordinator else { return }
+                        Task {
+                            if await model.applyUpdatedPlan(using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() }
+                        }
+                    }.keyboardShortcut(.defaultAction).disabled(model.isWorking || model.isLoading)
+                }
+            }.padding(24).frame(width: 480).interactiveDismissDisabled(model.isWorking)
+        }
         .task(id: state.sharedLibrary.revision) { await reload() }
         .onChange(of: model.items.map(\.id)) { _, ids in if !ids.contains(where: { $0 == selected }) { selected = ids.first } }
     }

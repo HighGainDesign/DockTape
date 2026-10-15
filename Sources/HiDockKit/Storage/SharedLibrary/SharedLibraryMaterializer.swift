@@ -205,6 +205,12 @@ public actor SharedLibraryMaterializer {
           let phase = try Self.apply(
             step, files: files, authority: fresh,
             replaying: replaying, trash: trash,
+            existingDestinationReviewed: operation.reviewedExistingDestinations.map { reviewed in
+              guard case .move(_, let destination, _) = step else { return true }
+              return reviewed.contains(destination) || operation.steps.prefix(actual.completed).contains { previous in
+                if case .move(_, let target, _) = previous { return target == destination }; return false
+              }
+            },
             beforeMutation: {
               guard !fresh.revisionLease.isRevoked, try fresh.validateLocalCommit() else {
                 throw SharedLibraryOperationError.staleAuthority
@@ -279,7 +285,19 @@ public actor SharedLibraryMaterializer {
     let root = self.root
     let receipts = self.receipts
     let newPaths = Set(try replacement.steps.flatMap { try Self.items($0, root: root).map(\.url) })
-    try await access.withWrite(at: file) { scope in
+    let gate = self.gate
+    let gateItems = try gate?.items(outside: root) ?? []
+    let bindings = current.additionalBindings + (current.binding.map { [$0] } ?? [])
+    for binding in bindings { _ = try await RecordingFileAccess().waitUntilAvailable(at: binding.file, knownToExist: true) }
+    try await access.withWrites([.init(file)] + gateItems, reading: [root] + bindings.map(\.file)) { scopes in
+      let scope = scopes[0]
+      if let gate { try gate.validate(scopes[1], outside: root) }
+      guard scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath(),
+            try current.validateLocalCommit() else { throw SharedLibraryOperationError.staleAuthority }
+      for (binding, read) in zip(bindings, scopes.dropFirst(2 + gateItems.count)) {
+        guard read.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
+              try binding.validate(Data(contentsOf: read.url)) else { throw SharedLibraryOperationError.staleAuthority }
+      }
       try Self.checkRoot(root)
       guard Self.contained(scope.url, in: receipts) else {
         throw SharedLibraryOperationError.unsafePath
@@ -591,6 +609,7 @@ public actor SharedLibraryMaterializer {
     _ step: SharedLibraryOperation.Step, files: [CoordinatedFileAccess.Scope],
     authority: SharedMaterializationAuthority, replaying: Bool,
     trash: @Sendable (URL) throws -> Void,
+    existingDestinationReviewed: Bool? = nil,
     beforeMutation: () throws -> Void
   ) throws -> Phase {
     let fm = FileManager.default
@@ -601,6 +620,7 @@ public actor SharedLibraryMaterializer {
       let sourceHash = try hash(files[0])
       let destinationHash = try hash(files[1])
       if let destinationHash {
+        if sourceHash != nil && existingDestinationReviewed == false { throw SharedLibraryOperationError.pathConflict(destination) }
         guard destinationHash == expected,
           authority.pathOwners[destination] == [authority.state.id]
             || (replaying && sourceHash == nil)

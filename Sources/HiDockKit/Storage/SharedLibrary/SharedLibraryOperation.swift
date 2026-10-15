@@ -137,6 +137,9 @@ struct SharedPreparedFileOperation: Sendable {
   let entity: SharedEntityIdentity
   let inputRevision: String
   let steps: [SharedLibraryOperation.Step]
+  var replacesOperationID: UUID? = nil
+  var retainedFiles: [String: String] = [:]
+  var reviewedExistingDestinations: [String]? = nil
 }
 struct SharedAcceptedFileIntent: Codable, Sendable {
   let schema: Int
@@ -145,6 +148,9 @@ struct SharedAcceptedFileIntent: Codable, Sendable {
   let inputRevision: String
   let guardRevision: String
   let steps: [SharedLibraryOperation.Step]
+  var replacesOperationID: UUID? = nil
+  var retainedFiles: [String: String]? = nil
+  var reviewedExistingDestinations: [String]? = nil
 }
 
 /// One writer's current prepared audio intent. Committed with selected content,
@@ -198,6 +204,7 @@ public struct SharedLibraryOperation: Codable, Equatable, Sendable {
   public let outputRevision: String
   public let steps: [Step]
   public let inputAudioFingerprint: String?
+  public var reviewedExistingDestinations: [String]? = nil
   public init(
     id: UUID = UUID(), libraryID: UUID, entity: SharedEntityIdentity, inputRevision: String,
     outputRevision: String, steps: [Step], inputAudioFingerprint: String? = nil
@@ -226,6 +233,9 @@ public struct SharedLibraryOperation: Codable, Equatable, Sendable {
   func validate() throws {
     guard !inputRevision.isEmpty, Self.validHash(outputRevision), !steps.isEmpty else {
       throw SharedLibraryOperationError.invalidOperation
+    }
+    if let reviewedExistingDestinations {
+      guard Set(reviewedExistingDestinations).isSubset(of: canonicalPaths) else { throw SharedLibraryOperationError.invalidOperation }
     }
     for step in steps {
       let paths: [String]

@@ -267,6 +267,31 @@ import HiDockKit
         try expect(files.items.count == 1 && files.items[0].canResume, "Actual pending file review shows resumable recording")
         try expect(await files.perform(.resume, review: files.items[0], using: recovery), "Native action resumes the reviewed plan")
         try expect(files.items.isEmpty && FileManager.default.fileExists(atPath: recoveryRoot.appendingPathComponent("Recovered.mp3").path), "Completion clears pending row")
+        let updatedRoot = parent.appendingPathComponent("updated-recovery")
+        try FileManager.default.createDirectory(at: updatedRoot, withIntermediateDirectories: true)
+        try Data("updated plan synthetic original".utf8).write(to: updatedRoot.appendingPathComponent("Start.mp3"))
+        let updatedCoordinator = SharedLibraryCoordinator(root: updatedRoot, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("updated-recovery-local"))
+        _ = try await updatedCoordinator.enable(); _ = try await updatedCoordinator.projectOutputs()
+        let updatedID = try await updatedCoordinator.reference(to: "Start.mp3").entityID
+        do { _ = try await updatedCoordinator.relocateRecording(filename: "Start.mp3", title: "Intermediate", afterMutation: { _ in throw Failure(message: "partial updated plan") }) }
+        catch let failure as Failure { try expect(failure.message == "partial updated plan", "Expected actual move interruption") }
+        _ = try await updatedCoordinator.edit(.init(base: try await updatedCoordinator.read(.init(id: updatedID, kind: .recording)), changes: [.assign(field: "title", value: .text("Final"))]))
+        let updates = RecordingFileReviewState()
+        await updates.refresh(using: updatedCoordinator)
+        try expect(updates.items.count == 1 && updates.items[0].needsReplanning, "Changed destination appears in pending files")
+        await updates.prepareUpdatedPlan(updates.items[0], using: updatedCoordinator)
+        try expect(updates.updatedPlan?.destination == "Final.mp3" && updates.updatedPlan?.sources == ["Intermediate.mp3"], "Native preview shows actual original and intended destination")
+        try expect(await updates.applyUpdatedPlan(using: updatedCoordinator), "Native action applies only its prepared review")
+        try expect(updates.updatedPlan == nil && updates.items.isEmpty && FileManager.default.fileExists(atPath: updatedRoot.appendingPathComponent("Final.mp3").path), "Updated plan completes and clears review")
+        do { _ = try await updatedCoordinator.relocateRecording(filename: "Final.mp3", title: "Next", afterMutation: { _ in throw Failure(message: "second interrupted plan") }) }
+        catch let failure as Failure { try expect(failure.message == "second interrupted plan", "Expected second actual interruption") }
+        _ = try await updatedCoordinator.edit(.init(base: try await updatedCoordinator.read(.init(id: updatedID, kind: .recording)), changes: [.assign(field: "title", value: .text("Selected"))]))
+        await updates.refresh(using: updatedCoordinator)
+        await updates.prepareUpdatedPlan(updates.items[0], using: updatedCoordinator)
+        _ = try await updatedCoordinator.edit(.init(base: try await updatedCoordinator.read(.init(id: updatedID, kind: .recording)), changes: [.assign(field: "title", value: .text("Newer"))]))
+        try expect(!(await updates.applyUpdatedPlan(using: updatedCoordinator)), "Stale native preview cannot apply a newer edit")
+        try expect(updates.updatedPlan == nil && updates.items.count == 1 && updates.items[0].title == "Newer", "Failed native action reloads current review and drops stale preview")
+        try expect(FileManager.default.fileExists(atPath: updatedRoot.appendingPathComponent("Next.mp3").path) && !FileManager.default.fileExists(atPath: updatedRoot.appendingPathComponent("Selected.mp3").path), "Stale preview preserves the actual source")
         let peerRoot = parent.appendingPathComponent("recovery-peer")
         try FileManager.default.copyItem(at: recoveryRoot, to: peerRoot)
         let peer = SharedLibraryCoordinator(root: peerRoot, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("recovery-peer-local"))
