@@ -25,7 +25,7 @@ public struct SharedFolderReplanReview: Identifiable, Sendable {
     let sourcePaths: [String]
     let graph: String
     let bindings: [SharedMaterializationBinding]
-    /// Absent recording slots and retained aliases bound through final commit.
+    /// Absent child slots and retained aliases bound through final commit.
     let absentChildPaths: [String]
     let scope: SharedDocument
     let reusesOperation: Bool

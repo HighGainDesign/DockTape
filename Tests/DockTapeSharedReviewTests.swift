@@ -507,7 +507,7 @@ import HiDockKit
     @MainActor static func folderDeletionScopeChecks(parent: URL, peerCleanup: Bool = false, retainedChild: Bool = false) async throws {
         let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right"), trash = parent.appendingPathComponent("synthetic-trash")
         try FileManager.default.createDirectory(at: left.appendingPathComponent("Empty"), withIntermediateDirectories: true)
-        let owner = FolderFileReviewState(), pause = SavePause(armed: !retainedChild), cleanupPause = SavePause(armed: false)
+        let owner = FolderFileReviewState(), pause = SavePause(armed: false), cleanupPause = SavePause(armed: false)
         let identityFile = parent.appendingPathComponent("qa-writer.json")
         let identity = try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "synthetic folder scope installation").load()
         let a = SharedLibraryCoordinator(root: left, writerID: identity.writer, witnessDirectory: parent.appendingPathComponent("a-local"), afterPublishedLibraryRead: {
@@ -547,7 +547,8 @@ import HiDockKit
             await owner.refresh(using: a)
             guard let row = owner.items.first(where: { $0.id == entity.id }) else { throw Failure(message: "Missing retained-child scope") }
             await owner.prepareDeletionScope(row, using: a)
-            try expect(await owner.applyDeletionScope(using: a), "Initial child scope saves")
+            try await replacedFolderPreviewChecks(.scope, model: owner, review: row, using: a)
+            try expect(await owner.applyDeletionScope(owner.deletionScope!, using: a), "Initial child scope saves")
             guard let pending = owner.items.first(where: { $0.id == entity.id }) else { throw Failure(message: "Missing child preparation") }
             try expect(await owner.perform(.prepareChildren, review: pending, using: a), "Child cleanup is prepared independently")
             let childBefore = try await a.read(child)
@@ -565,10 +566,11 @@ import HiDockKit
             await owner.refresh(using: a)
             guard let row = owner.items.first(where: { $0.id == entity.id }), row.canReplan else { throw Failure(message: "Kept root needs a usable retention plan") }
             await owner.prepareUpdatedPlan(row, using: a)
+            try await replacedFolderPreviewChecks(.plan, model: owner, review: row, using: a)
             guard let plan = owner.updatedPlan else { throw Failure(message: "Retained deleted child cannot block same-path preview: " + (owner.message ?? "nil")) }
-            try expect(plan.source == "Empty" && plan.destination == "Empty" && plan.files.contains("Late.mp3"), "Retention preview preserves current original in place")
+            try expect(plan.review.source == "Empty" && plan.review.destination == "Empty" && plan.review.files.contains("Late.mp3"), "Retention preview preserves current original in place")
             await pause.arm()
-            let action = Task { await owner.applyUpdatedPlan(using: a) }
+            let action = Task { await owner.applyUpdatedPlan(plan, using: a) }
             for _ in 0..<500 { if await pause.entered { break }; try await Task.sleep(for: .milliseconds(20)) }
             guard await pause.entered else { action.cancel(); await pause.release(); _ = await action.value; throw Failure(message: "Retained-child save did not reach held refresh") }
             owner.clear()
@@ -593,8 +595,9 @@ import HiDockKit
             await owner.refresh(using: b)
             guard let row = owner.items.first(where: { $0.id == entity.id }) else { throw Failure(message: "Missing peer scope row") }
             await owner.prepareDeletionScope(row, using: b)
+            try await replacedFolderPreviewChecks(.scope, model: owner, review: row, using: b)
             try expect(owner.deletionScope != nil, "Peer scope preview opens without retiring rename receipt")
-            try expect(await owner.applyDeletionScope(using: b), "Peer scope acceptance is usable")
+            try expect(await owner.applyDeletionScope(owner.deletionScope!, using: b), "Peer scope acceptance is usable")
             guard let children = owner.items.first(where: { $0.id == entity.id }), children.canPrepareChildren else { throw Failure(message: "Peer child preparation blocked by completed root rename") }
             try expect(await owner.perform(.prepareChildren, review: children, using: b), "Peer child action is usable")
             try deliver(right, to: left, writer: b.writerID)
@@ -605,12 +608,13 @@ import HiDockKit
             await owner.refresh(using: b)
             guard let row = owner.items.first(where: { $0.id == entity.id }), row.canReviewCleanupPlan else { throw Failure(message: "Peer empty root needs distinct cleanup review") }
             await owner.prepareCleanupPlan(row, using: b)
+            try await replacedFolderPreviewChecks(.cleanup, model: owner, review: row, using: b)
             guard let cleanup = owner.cleanupPlan else { throw Failure(message: "Missing actual cleanup-plan preview") }
-            try expect(cleanup.path == "Empty" && cleanup.retainedPaths.contains("Away"), "Cleanup preview explains old path protection")
+            try expect(cleanup.review.path == "Empty" && cleanup.review.retainedPaths.contains("Away"), "Cleanup preview explains old path protection")
             let receipt = parent.appendingPathComponent("b-local/Operations/" + (try await b.read(entity)).libraryID.uuidString + "/" + b.writerID.uuidString + "/" + entity.id.uuidString + ".json")
             let bytes = try Data(contentsOf: receipt)
             await cleanupPause.arm()
-            let action = Task { await owner.applyCleanupPlan(using: b) }
+            let action = Task { await owner.applyCleanupPlan(cleanup, using: b) }
             for _ in 0..<500 { if await cleanupPause.entered { break }; try await Task.sleep(for: .milliseconds(20)) }
             guard await cleanupPause.entered else { action.cancel(); await cleanupPause.release(); _ = await action.value; throw Failure(message: "Cleanup save did not reach real held-refresh boundary") }
             owner.clear()
@@ -629,8 +633,9 @@ import HiDockKit
         await owner.refresh(using: a)
         guard let row = owner.items.first(where: { $0.id == entity.id }), row.canReviewDeletionScope else { throw Failure(message: "Late child must offer an updated child-list review") }
         await owner.prepareDeletionScope(row, using: a)
+        try await replacedFolderPreviewChecks(.scope, model: owner, review: row, using: a)
         guard let scope = owner.deletionScope else { throw Failure(message: "Updated child-list preview must open") }
-        try expect(scope.path == "Empty" && scope.members.map(\.path) == ["Empty/Late.mp3"], "Review names the exact new child")
+        try expect(scope.review.path == "Empty" && scope.review.members.map(\.path) == ["Empty/Late.mp3"], "Review names the exact new child")
         if CommandLine.arguments.contains("--folder-scopes-ui") {
             UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
             let state = AppState(baseDirectory: left, sharedIdentity: {
@@ -646,7 +651,8 @@ import HiDockKit
             print("Native folder-scope QA ready with synthetic pending late child; nothing has been deleted or approved.")
             return
         }
-        let action = Task { await owner.applyDeletionScope(using: a) }
+        await pause.arm()
+        let action = Task { await owner.applyDeletionScope(scope, using: a) }
         for _ in 0..<500 { if await pause.entered { break }; try await Task.sleep(for: .milliseconds(20)) }
         guard await pause.entered else { action.cancel(); await pause.release(); _ = await action.value; throw Failure(message: "Updated scope did not reach held feedback refresh") }
         owner.clear()
@@ -727,9 +733,10 @@ import HiDockKit
             if keep {
                 try expect(row.canReplan && !row.canResume && !row.canAcknowledge, "Kept deletion must offer a retention plan and never restart removal")
                 await owner.prepareUpdatedPlan(row, using: a)
+                try await replacedFolderPreviewChecks(.plan, model: owner, review: row, using: a)
                 guard let plan = owner.updatedPlan else { throw Failure(message: "Kept folder needs an actionable physical retention preview: " + (owner.message ?? "nil")) }
-                try expect(plan.source == "Empty" && plan.destination == "Empty", "Keeping available original directory requires no relocation")
-                try expect(await owner.applyUpdatedPlan(using: a), "Reviewed retention plan finishes")
+                try expect(plan.review.source == "Empty" && plan.review.destination == "Empty", "Keeping available original directory requires no relocation")
+                try expect(await owner.applyUpdatedPlan(owner.updatedPlan!, using: a), "Reviewed retention plan finishes")
                 try expect(FileManager.default.fileExists(atPath: left.appendingPathComponent("Empty").path), "Retaining a folder never removes it")
                 try expect(owner.items.isEmpty, "Kept deletion has no resurrected cleanup action")
                 let renamed = try await a.renameFolder(from: "Empty", to: "After")
@@ -788,7 +795,7 @@ import HiDockKit
             // complete destination must honor that stable parent ID.
             do { _ = try await Task { try await b.edit(.init(base: try await b.read(entity), changes: [.assign(field: "parent", value: .text(target.state.id.uuidString))])) }.value } catch is CancellationError { }
             try deliver(right, to: left, writer: b.writerID)
-            let pending = FolderFileReviewState(), pause = SavePause()
+            let pending = FolderFileReviewState(), pause = SavePause(armed: false)
             let current = SharedLibraryCoordinator(root: left, writerID: writer, witnessDirectory: local, afterPublishedLibraryRead: {
                 if stage == "unstarted", await MainActor.run(body: { pending.isWorking && pending.isLoading }) { await pause.pauseOnce() }
             })
@@ -803,10 +810,12 @@ import HiDockKit
             await pending.refresh(using: current)
             guard let row = pending.items.first(where: { $0.id == entity.id }), row.canReplan else { throw Failure(message: "Selected folder path needs an actionable updated plan; stage=" + stage + "; feedback=" + (pending.message ?? "nil")) }
             await pending.prepareUpdatedPlan(row, using: current)
+            try await replacedFolderPreviewChecks(.plan, model: pending, review: row, using: current)
             guard let plan = pending.updatedPlan else { throw Failure(message: "Folder updated plan must be inspectable; stage=" + stage + "; feedback=" + (pending.message ?? "nil")) }
-            try expect(plan.source == source && plan.destination == "Target/Peer", "Reviewed directory plan uses actual source and complete selected path")
+            try expect(plan.review.source == source && plan.review.destination == "Target/Peer", "Reviewed directory plan uses actual source and complete selected path")
             if stage == "unstarted" {
-                let action = Task { await pending.applyUpdatedPlan(using: current) }
+                await pause.arm()
+                let action = Task { await pending.applyUpdatedPlan(plan, using: current) }
                 for _ in 0..<500 { if await pause.entered { break }; try await Task.sleep(for: .milliseconds(20)) }
                 guard await pause.entered else { action.cancel(); await pause.release(); _ = await action.value; throw Failure(message: "Updated folder plan did not reach held feedback refresh") }
                 pending.clear()
@@ -816,7 +825,7 @@ import HiDockKit
                 _ = try await other.enable(); await pending.refresh(using: other)
                 await pause.release(); _ = await action.value
                 try expect(pending.message == nil && pending.items.isEmpty && !pending.isWorking && !pending.isLoading, "Old updated-plan feedback must not cross a library switch during refresh")
-            } else { try expect(await pending.applyUpdatedPlan(using: current), "Actual reviewed folder plan finishes") }
+            } else { try expect(await pending.applyUpdatedPlan(pending.updatedPlan!, using: current), "Actual reviewed folder plan finishes") }
             try expect(try Data(contentsOf: left.appendingPathComponent("Target/Peer/A.mp3")) == audio, "Original child audio preserved exactly")
             try expect(try Data(contentsOf: left.appendingPathComponent("Target/Peer/Nested/B.mp3")) == nested, "Nested child audio preserved exactly")
             try expect(try Data(contentsOf: left.appendingPathComponent("Target/Peer/.notes")) == notes, "Ordinary hidden file moves without replacement")
@@ -899,10 +908,10 @@ import HiDockKit
                 _ = try await current.prepareRecordingReplan(row)
                 throw Failure(message: "Updated path plan must be inspectable; stage=" + stage)
             }
-            try expect(plan.destination == "Target/Peer.mp3", "Physical plan follows the exact selected path")
-            try expect(plan.isDeletion == deleted, "Deleted path decisions need an explicit cleanup review")
+            try expect(plan.review.destination == "Target/Peer.mp3", "Physical plan follows the exact selected path")
+            try expect(plan.review.isDeletion == deleted, "Deleted path decisions need an explicit cleanup review")
             print("Path stage " + stage + ": before physical acceptance")
-            try expect(await pending.applyUpdatedPlan(using: current), "Reviewed physical continuation completes or awaits approval")
+            try expect(await pending.applyUpdatedPlan(pending.updatedPlan!, using: current), "Reviewed physical continuation completes or awaits approval")
             if deleted {
                 try expect((try await current.read(entity)).state.lifecycle == .deleted, "Path decision cannot reverse Delete")
                 let source = phase == "unstarted" ? "Meeting.mp3" : "Target/Local.mp3"
@@ -1172,6 +1181,9 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--dispatch-only") { try await fileReviewDispatchChecks(parent: parent); return }
+        if arguments.contains("--dispatch-preview-only") { try await fileReviewDispatchChecks(parent: parent, previewOnly: true); return }
+        if arguments.contains("--dispatch-feedback-only") { try await fileReviewDispatchChecks(parent: parent, feedbackOnly: true); return }
         if arguments.contains("--folder-retained-child-only") { try await folderDeletionScopeChecks(parent: parent, retainedChild: true); return }
         if arguments.contains("--folder-peer-cleanup-only") { try await folderDeletionScopeChecks(parent: parent, peerCleanup: true); return }
         if arguments.contains("--folder-scopes-only") || arguments.contains("--folder-scopes-ui") { try await folderDeletionScopeChecks(parent: parent); return }
@@ -1190,6 +1202,7 @@ import HiDockKit
             return
         }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
+        try await fileReviewDispatchChecks(parent: parent.appendingPathComponent("review-dispatch"))
         try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-scopes"))
         try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-peer-cleanup"), peerCleanup: true)
         try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-retained-child"), retainedChild: true)
@@ -1431,8 +1444,8 @@ import HiDockKit
         await updates.refresh(using: updatedCoordinator)
         try expect(updates.items.count == 1 && updates.items[0].needsReplanning, "Changed destination appears in pending files")
         await updates.prepareUpdatedPlan(updates.items[0], using: updatedCoordinator)
-        try expect(updates.updatedPlan?.destination == "Final.mp3" && updates.updatedPlan?.sources == ["Intermediate.mp3"], "Native preview shows actual original and intended destination")
-        try expect(await updates.applyUpdatedPlan(using: updatedCoordinator), "Native action applies only its prepared review")
+        try expect(updates.updatedPlan?.review.destination == "Final.mp3" && updates.updatedPlan?.review.sources == ["Intermediate.mp3"], "Native preview shows actual original and intended destination")
+        try expect(await updates.applyUpdatedPlan(updates.updatedPlan!, using: updatedCoordinator), "Native action applies only its prepared review")
         try expect(updates.updatedPlan == nil && updates.items.isEmpty && FileManager.default.fileExists(atPath: updatedRoot.appendingPathComponent("Final.mp3").path), "Updated plan completes and clears review")
         do { _ = try await updatedCoordinator.relocateRecording(filename: "Final.mp3", title: "Next", afterMutation: { _ in throw Failure(message: "second interrupted plan") }) }
         catch let failure as Failure { try expect(failure.message == "second interrupted plan", "Expected second actual interruption") }
@@ -1440,7 +1453,7 @@ import HiDockKit
         await updates.refresh(using: updatedCoordinator)
         await updates.prepareUpdatedPlan(updates.items[0], using: updatedCoordinator)
         _ = try await updatedCoordinator.edit(.init(base: try await updatedCoordinator.read(.init(id: updatedID, kind: .recording)), changes: [.assign(field: "title", value: .text("Newer"))]))
-        try expect(!(await updates.applyUpdatedPlan(using: updatedCoordinator)), "Stale native preview cannot apply a newer edit")
+        try expect(!(await updates.applyUpdatedPlan(updates.updatedPlan!, using: updatedCoordinator)), "Stale native preview cannot apply a newer edit")
         try expect(updates.updatedPlan == nil && updates.items.count == 1 && updates.items[0].title == "Newer", "Failed native action reloads current review and drops stale preview")
         try expect(FileManager.default.fileExists(atPath: updatedRoot.appendingPathComponent("Next.mp3").path) && !FileManager.default.fileExists(atPath: updatedRoot.appendingPathComponent("Selected.mp3").path), "Stale preview preserves the actual source")
         let peerRoot = parent.appendingPathComponent("recovery-peer")

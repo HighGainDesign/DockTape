@@ -94,7 +94,8 @@ public struct SharedLibraryPathIndex: Sendable {
                 for folder in try parents(state, field: "folder") {
                     prefixes.formUnion(try folderPaths(folder, visiting: [state.id]))
                 }
-                paths = try combine(prefixes, names(state, field: "title").map { $0 + ".mp3" })
+                let suffix = try SharedRecordingFiles.audioSuffix(state)
+                paths = try combine(prefixes, names(state, field: "title").map { $0 + suffix })
                 for path in paths { try recordingClaims(path, owner: state.id) }
             }
             if paths.count == 1 { resolved[state.id] = paths.first }

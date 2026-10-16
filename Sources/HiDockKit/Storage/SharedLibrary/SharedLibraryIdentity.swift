@@ -56,3 +56,25 @@ public enum SharedLibraryIdentity {
                            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
     }
 }
+
+/// Recording names retain the audio extension captured at import/bootstrap.
+/// Sidecars keep their established lowercase suffixes. Private staging names
+/// are independent and remain canonical lowercase MP3 paths.
+enum SharedRecordingFiles {
+    static let companions = [".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"]
+    static func isAudio(_ path: String) -> Bool { (path as NSString).pathExtension.lowercased() == "mp3" }
+    static func audioSuffix(_ state: SharedEntityState) throws -> String {
+        guard let field = state.fields["initialPath"] else { return ".mp3" }
+        guard case .text(let path)? = field.resolvedValue, isAudio(path),
+              (try? SharedLibraryIdentity.normalized(path)) == path else { throw SharedLibraryPathError.invalidGraph }
+        return "." + (path as NSString).pathExtension
+    }
+    static func suffixes(forAudioPath path: String) throws -> [String] {
+        guard isAudio(path) else { throw SharedLibraryPathError.invalidGraph }
+        return ["." + (path as NSString).pathExtension] + companions
+    }
+    static func suffixes(for state: SharedEntityState) throws -> [String] { [try audioSuffix(state)] + companions }
+    static func suffix(of path: String) -> String? {
+        isAudio(path) ? "." + (path as NSString).pathExtension : companions.first { path.hasSuffix($0) }
+    }
+}

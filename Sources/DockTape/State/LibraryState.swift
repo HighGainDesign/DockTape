@@ -24,7 +24,7 @@ final class LibraryState {
     func recordingSelection(_ recording: RecordingMetadata) -> RecordingSelection {
         .init(filename: recording.filename, reference: recording.reference, libraryBinding: binding)
     }
-    private func validate(_ selection: RecordingSelection) throws {
+    func validate(_ selection: RecordingSelection) throws {
         guard selection.libraryBinding == binding else { throw SharedLibraryCoordinatorError.differentBinding }
         _ = try SharedLibraryIdentity.normalized(selection.filename)
         guard recordings.contains(where: { $0.filename == selection.filename && $0.reference == selection.reference }) else { throw SharedSidecarError.reloadRequired }
@@ -49,6 +49,7 @@ final class LibraryState {
     private var contentRevisions: [String: String] = [:]
     private var metadataRequest = UUID()
     private var metadataTask: Task<Void, Error>?
+    var onSharedContent: (@MainActor () async -> Void)?
 
 
     init(store: RecordingStore, transcriptStore: TranscriptStore, sharedCoordinator: SharedLibraryCoordinator? = nil) {
@@ -81,7 +82,7 @@ final class LibraryState {
         metadataLoadState = .loading; refreshError = nil
         let task = Task { @MainActor [self] in
             do {
-                try await transcriptStore.loadAll()
+                if sharedCoordinator == nil { try await transcriptStore.loadAll() }
                 let progress: @Sendable () async -> Void = { [weak self] in await self?.publishCatalog(request: request) }
                 if initial { try await store.setup(onProgress: sharedCoordinator == nil ? nil : progress) }
                 else if sharedCoordinator != nil { try await store.loadLibraryMeta(onProgress: progress) }
@@ -116,6 +117,7 @@ final class LibraryState {
         let imported = await store.allImportedDeviceFilenames()
         let folderCatalog = await store.folderCatalog()
         let revisions = await store.contentRevisions()
+        if sharedCoordinator != nil { try? await transcriptStore.loadAll(from: store) }
         guard metadataRequest == request, !Task.isCancelled else { return }
         recordings = entries
         downloadedFilenames = Set(entries.map(\.filename))
@@ -123,6 +125,7 @@ final class LibraryState {
         if let selectedRecording, !downloadedFilenames.contains(selectedRecording) { self.selectedRecording = nil }
         importedDeviceFilenames = imported; folders = folderCatalog.names; folderReferences = folderCatalog.references
         contentRevisions = revisions
+        if sharedCoordinator != nil { await onSharedContent?() }
     }
 
     func contentID(for filename: String, fallbackRevision: UInt64) -> String {
@@ -164,7 +167,7 @@ final class LibraryState {
         for rec in affected {
             let newFilename = actualName + rec.filename.dropFirst(oldName.count)
             if sharedCoordinator == nil { try await transcriptStore.rename(from: rec.filename, to: newFilename) }
-        else { try await transcriptStore.loadAll() }
+        else { try await transcriptStore.loadAll(from: store) }
         }
         if selectedFolder == oldName { selectedFolder = actualName }
         await refresh()
@@ -193,7 +196,7 @@ final class LibraryState {
         let newFilename = try await store.moveRecording(filename: filename, toFolder: folder?.name,
             reference: selection.reference, destinationReference: folder?.reference)
         if sharedCoordinator == nil { try await transcriptStore.rename(from: filename, to: newFilename) }
-        else { try await transcriptStore.loadAll() }
+        else { try await transcriptStore.loadAll(from: store) }
         await refresh()
         return newFilename
     }
@@ -233,7 +236,7 @@ final class LibraryState {
         try validate(selection)
         let newFilename = try await store.renameRecording(filename: selection.filename, to: name, reference: selection.reference)
         if sharedCoordinator == nil { try await transcriptStore.rename(from: selection.filename, to: newFilename) }
-        else { try await transcriptStore.loadAll() }
+        else { try await transcriptStore.loadAll(from: store) }
         await refresh()
         return newFilename
     }
@@ -247,11 +250,19 @@ final class LibraryState {
         await transcriptStore.hasTranscript(for: filename)
     }
 
-    func transcript(for filename: String) async -> Transcript? {
-        await transcriptStore.transcript(for: filename)
+    func transcript(for filename: String, reference: SharedRecordingReference? = nil) async -> Transcript? {
+        let selected = reference ?? recordings.first(where: { $0.filename == filename })?.reference
+        return await transcriptStore.transcript(for: filename, reference: selected)
     }
 
     func updateSpeakerNames(for filename: String, names: [String: String]) async throws {
+        guard let recording = recordings.first(where: { $0.filename == filename }) else { throw SharedSidecarError.reloadRequired }
+        try await updateSpeakerNames(selection: recordingSelection(recording), names: names)
+    }
+    func updateSpeakerNames(selection: RecordingSelection, names: [String: String]) async throws {
+        try validate(selection)
+        let filename = selection.filename
+
         // Detect merges (same name assigned to multiple IDs)
         var nameToIDs: [String: [String]] = [:]
         for (sid, name) in names {
@@ -261,16 +272,18 @@ final class LibraryState {
             let sorted = ids.sorted()
             let targetID = sorted[0]
             for sourceID in sorted.dropFirst() {
-                try await transcriptStore.mergeSpeakers(for: filename, source: sourceID, into: targetID)
+                try await transcriptStore.mergeSpeakers(for: filename, source: sourceID, into: targetID, reference: selection.reference)
             }
         }
-        let current = await transcriptStore.transcript(for: filename)
+        try validate(selection)
+        let current = await transcriptStore.cachedTranscript(for: filename)
         if let current {
             var finalNames: [String: String] = [:]
             for sid in current.speakerIDs {
                 finalNames[sid] = names[sid] ?? sid
             }
-            try await transcriptStore.updateSpeakerNames(for: filename, names: finalNames)
+            try validate(selection)
+            try await transcriptStore.updateSpeakerNames(for: filename, names: finalNames, reference: selection.reference)
         }
     }
 }

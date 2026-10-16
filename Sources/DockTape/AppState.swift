@@ -212,10 +212,10 @@ final class AppState {
 
     private func attachSharedStores(_ coordinator: SharedLibraryCoordinator) {
         playback.stop()
-        playback.acquireLease = { filename, url in
+        playback.acquireLease = { filename, url, reference in
             let expected = coordinator.root.appendingPathComponent(filename).standardizedFileURL.resolvingSymlinksInPath()
             guard url.standardizedFileURL.resolvingSymlinksInPath() == expected else { throw SharedLibraryCoordinatorError.differentBinding }
-            let view = try await coordinator.recording(at: filename)
+            let view = try await coordinator.recording(at: filename, reference: reference)
             let token = try await coordinator.pinJob(.init(id: view.state.id, kind: .recording))
             return .init(validate: { try await coordinator.validateJob(token) }, release: { await coordinator.finishJob(token) })
         }
@@ -229,6 +229,19 @@ final class AppState {
         library.selectedRecordings = previous.selectedRecordings
         transcription = TranscriptionState(transcriptStore: transcripts, recordingStore: store, shared: coordinator)
         summarization = SummarizationState(summaryStore: SummaryStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator)), shared: coordinator)
+        let currentLibrary = library, currentTranscription = transcription, currentSummary = summarization
+        library.onSharedContent = { [weak self, weak currentLibrary] in
+            guard let self, let currentLibrary, self.library === currentLibrary,
+                  self.sharedLibrary.coordinator === coordinator else { return }
+            try? await currentSummary.summaryStore.loadAll(from: currentLibrary.store)
+            let transcribed = await currentTranscription.transcriptStore.allTranscribedFilenames()
+            let summarized = await currentSummary.summaryStore.allSummarizedFilenames()
+            guard self.library === currentLibrary, self.sharedLibrary.coordinator === coordinator else { return }
+            var statuses = Dictionary(uniqueKeysWithValues: transcribed.map { ($0, TranscriptStatus.done) })
+            for (file, status) in currentTranscription.statuses where status == .inProgress { statuses[file] = .inProgress }
+            currentTranscription.statuses = statuses
+            currentSummary.hasSummary = Set(summarized)
+        }
         templateStore = TemplateStore(baseDirectory: coordinator.root, shared: SharedTemplateAdapter(coordinator: coordinator))
         if let manager = device.deviceManager { device.syncEngine = SyncEngine(deviceManager: manager, store: store) }
     }
@@ -249,19 +262,26 @@ final class AppState {
         func stillBound() -> Bool { !Task.isCancelled && librarySetupRequest == request && library === currentLibrary && sharedLibrary.coordinator === bound }
 
         do {
-            // Existence-only sidecar scans can populate resident badges while an
-            // unrelated authoritative recording head is still being prepared.
-            try await currentLibrary.transcriptStore.loadAll()
-            try await currentSummary.summaryStore.loadAll()
-            guard stillBound() else { return }
-            let transcribedFiles = await currentTranscription.transcriptStore.allTranscribedFilenames()
-            let summarizedFiles = await currentSummary.summaryStore.allSummarizedFilenames()
-            guard stillBound() else { return }
-            for filename in transcribedFiles where currentTranscription.statuses[filename] == nil {
-                currentTranscription.statuses[filename] = .done
+            // Legacy physical hints stay cheap; shared content presence arrives
+            // with the progressively validated recording catalog below.
+            if bound == nil {
+                try await currentLibrary.transcriptStore.loadAll()
+                try await currentSummary.summaryStore.loadAll()
+                guard stillBound() else { return }
+                let transcribedFiles = await currentTranscription.transcriptStore.allTranscribedFilenames()
+                let summarizedFiles = await currentSummary.summaryStore.allSummarizedFilenames()
+                guard stillBound() else { return }
+                for filename in transcribedFiles where currentTranscription.statuses[filename] == nil {
+                    currentTranscription.statuses[filename] = .done
+                }
+                currentSummary.hasSummary = Set(summarizedFiles)
             }
-            currentSummary.hasSummary = Set(summarizedFiles)
             try await currentLibrary.setup()
+            guard stillBound() else { return }
+            if bound != nil {
+                try await currentLibrary.transcriptStore.loadAll(from: currentLibrary.store)
+                try await currentSummary.summaryStore.loadAll(from: currentLibrary.store)
+            }
             guard stillBound() else { return }
             try await currentTemplates.load()
             guard stillBound() else { return }
@@ -343,8 +363,8 @@ final class AppState {
         guard completed else { return }
         guard stillBound() else { return }
         if bound != nil { sharedLibrary.revision &+= 1 }
-        try? await currentTranscription.transcriptStore.loadAll()
-        try? await currentSummary.summaryStore.loadAll()
+        try? await currentTranscription.transcriptStore.loadAll(from: currentLibrary.store)
+        try? await currentSummary.summaryStore.loadAll(from: currentLibrary.store)
         guard stillBound() else { return }
         let transcribedFiles = await currentTranscription.transcriptStore.allTranscribedFilenames()
         guard stillBound() else { return }
@@ -556,7 +576,7 @@ final class AppState {
 
     func playRecording(_ rec: RecordingMetadata) {
         let url = library.store.baseDirectory.appendingPathComponent(rec.filename)
-        playback.play(file: rec.filename, url: url)
+        playback.play(file: rec.filename, url: url, reference: rec.reference)
         playbackTranscriptRequestID = UUID()
         let request = playbackTranscriptRequestID
         playbackTranscriptTask?.cancel()
@@ -568,7 +588,8 @@ final class AppState {
     private func refreshPlaybackTranscript(for filename: String, requestID: UUID? = nil) async {
         let request = requestID ?? playbackTranscriptRequestID
         let readingLibrary = library
-        let transcript = await readingLibrary.transcript(for: filename)
+        let reference = playback.playingFile == filename ? playback.requestedReference : nil
+        let transcript = await readingLibrary.transcript(for: filename, reference: reference)
         guard library === readingLibrary, playbackTranscriptRequestID == request else { return }
         playback.setSegmentTimestamps(
             transcript?.segments.map { (start: $0.startTime, end: $0.endTime) } ?? [],
@@ -925,11 +946,40 @@ final class AppState {
         clearMergeSelection()
     }
 
-    func updateSpeakerNames(for filename: String, names: [String: String]) async {
+    struct RecordingEditRequest {
+        let library: LibraryState
+        let coordinator: SharedLibraryCoordinator?
+        let selection: RecordingSelection
+        let summaryStore: SummaryStore
+    }
+    func recordingEditRequest(for recording: RecordingMetadata) -> RecordingEditRequest {
+        .init(library: library, coordinator: sharedLibrary.coordinator,
+              selection: library.recordingSelection(recording), summaryStore: summarization.summaryStore)
+    }
+    enum RecordingEdit {
+        case names([String: String]), split(UUID, Bool), merge(String, String), toggle(UUID)
+    }
+    @discardableResult
+    func editRecording(_ request: RecordingEditRequest, action: RecordingEdit) async -> Bool {
+        guard library === request.library, sharedLibrary.coordinator === request.coordinator else { return false }
+        guard requireWritableLibrary() else { return false }
+        let selected = request.selection
         do {
-            try await library.updateSpeakerNames(for: filename, names: names)
+            try request.library.validate(selected)
+            switch action {
+            case .names(let names): try await request.library.updateSpeakerNames(selection: selected, names: names)
+            case .split(let id, let following):
+                try await request.library.transcriptStore.splitSpeaker(for: selected.filename, segmentID: id, allFollowing: following, reference: selected.reference)
+            case .merge(let source, let target):
+                try await request.library.transcriptStore.mergeSpeakers(for: selected.filename, source: source, into: target, reference: selected.reference)
+            case .toggle(let id):
+                try await request.summaryStore.toggleItem(id, inSummaryFor: selected.filename, reference: selected.reference)
+            }
+            return library === request.library && sharedLibrary.coordinator === request.coordinator
         } catch {
-            errorMessage = "Failed to save speaker names: \(error.localizedDescription)"
+            guard library === request.library, sharedLibrary.coordinator === request.coordinator else { return false }
+            errorMessage = "Failed to save recording edits: \(error.localizedDescription)"
+            return false
         }
     }
 

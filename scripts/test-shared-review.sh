@@ -25,5 +25,5 @@ swiftc -swift-version 5 -parse-as-library -I "$BIN_PATH/Modules" \
     -I .build/checkouts/FluidAudio/Sources/MachTaskSelfWrapper/include \
     -L Vendor/libusb/lib -lusb-1.0 -lc++ \
     -framework IOKit -framework Security -framework Accelerate -framework CoreML \
-    "${OBJECTS[@]}" "${SOURCES[@]}" Tests/DockTapeSharedReviewTests.swift -o "$OUTPUT"
+    "${OBJECTS[@]}" "${SOURCES[@]}" Tests/DockTapeSharedReviewTests.swift Tests/DockTapeFileReviewDispatchTests.swift -o "$OUTPUT"
 "$OUTPUT" "$@"

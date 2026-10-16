@@ -22,12 +22,93 @@ final class SharedMetadataStoreTests: XCTestCase {
         var latest: [RecordingMetadata] = []
         var callbacks = 0
         var finished = false
+        private var contentPublications: Set<String> = []
+        private var redundant = 0
+        func acceptContent(_ entries: [RecordingMetadata], transcribed: [String]) {
+            accept(entries)
+            let key = entries.map(\.filename).sorted().joined(separator: "|") + "::" + transcribed.sorted().joined(separator: "|")
+            if !contentPublications.insert(key).inserted { redundant += 1 }
+        }
+        func redundantPublications() -> Int { redundant }
         func accept(_ entries: [RecordingMetadata]) { latest = entries; callbacks += 1 }
         func entries() -> [RecordingMetadata] { latest }
         func count() -> Int { callbacks }
         func finish() { finished = true }
         func isFinished() -> Bool { finished }
     }
+    func testNewlyReadCachedContentPublishesBeforeAnotherHeldHead() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(root); try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for filename in ["Resident.mp3", "B.mp3", "Cold.mp3"] {
+            try Data("Owned progressive observation".utf8).write(to: root.appendingPathComponent(filename))
+            try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: filename, transcriptionModel: "fixture", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: filename)]), mp3Filename: filename)
+        }
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID()); _ = try await coordinator.enable()
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator)); try await store.setup()
+        let transcripts = TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: coordinator))
+        let b = try await coordinator.reference(to: "B.mp3"), cold = try await coordinator.reference(to: "Cold.mp3")
+        let bHeld = expectation(description: "B held"), coldHeld = expectation(description: "Other cold head held")
+        let releaseB = DispatchSemaphore(value: 0), releaseCold = DispatchSemaphore(value: 0)
+        func head(_ id: UUID) -> URL { root.appendingPathComponent(".docktape/records/" + id.uuidString.lowercased() + "/" + coordinator.writerID.uuidString.lowercased() + ".json") }
+        let bHolder = Task { try await CoordinatedFileAccess().withWrite(at: head(b.entityID)) { _ in bHeld.fulfill(); _ = releaseB.wait(timeout: .now() + 8) } }
+        let coldHolder = Task { try await CoordinatedFileAccess().withWrite(at: head(cold.entityID)) { _ in coldHeld.fulfill(); _ = releaseCold.wait(timeout: .now() + 8) } }
+        await fulfillment(of: [bHeld, coldHeld], timeout: 1)
+        let residentReady = expectation(description: "First resident progress"), bReady = expectation(description: "Newly read B progresses before unrelated cold head")
+        actor Observation {
+            var resident = false, b = false
+            func observe(resident: Bool, b: Bool) -> (Bool, Bool) {
+                let firstResident = resident && !self.resident, firstB = b && !self.b
+                self.resident = self.resident || resident; self.b = self.b || b
+                return (firstResident, firstB)
+            }
+        }
+        let observation = Observation()
+        let refreshing = Task { try await store.loadLibraryMeta(onProgress: {
+            try? await transcripts.loadAll(from: store)
+            let flags = await observation.observe(resident: await transcripts.hasTranscript(for: "Resident.mp3"), b: await transcripts.hasTranscript(for: "B.mp3"))
+            if flags.0 { residentReady.fulfill() }; if flags.1 { bReady.fulfill() }
+        }) }
+        await fulfillment(of: [residentReady], timeout: 2)
+        let stillMissing = await transcripts.hasTranscript(for: "B.mp3"); XCTAssertFalse(stillMissing)
+        releaseB.signal(); try await bHolder.value
+        await fulfillment(of: [bReady], timeout: 2)
+        releaseCold.signal(); try await coldHolder.value; try await refreshing.value
+        let present = await transcripts.hasTranscript(for: "B.mp3"); XCTAssertTrue(present)
+    }
+
+    func testResidentRefreshBatchesPhysicalCatalogPublication() async throws {
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent)
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let legacy = TranscriptStore(baseDirectory: root)
+        for index in 0..<32 {
+            let filename = "Recording-\(index).mp3"
+            try Data("Synthetic original".utf8).write(to: root.appendingPathComponent(filename))
+            try await legacy.save(Transcript(recordingFilename: filename, transcriptionModel: "fixture", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: String(repeating: "Synthetic long meeting. ", count: 4000))]), mp3Filename: filename)
+        }
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        _ = try await coordinator.enable()
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        try await store.setup()
+        let observation = CatalogObservation()
+        let transcripts = TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: coordinator))
+        try await store.loadLibraryMeta(onProgress: {
+            try? await transcripts.loadAll(from: store)
+            await observation.acceptContent(await store.allRecordings(), transcribed: await transcripts.allTranscribedFilenames())
+        })
+        let publications = await observation.count(), entries = await store.allRecordings()
+        // A later batch can expose newly observed content even when cached
+        // metadata is unchanged. Each publication must still add real results.
+        let redundant = await observation.redundantPublications()
+        XCTAssertEqual(redundant, 0)
+        XCTAssertLessThan(publications, entries.count, "Resident arrivals must be coalesced rather than rescan once per recording")
+        XCTAssertEqual(entries.count, 32)
+        XCTAssertTrue(entries.allSatisfy { $0.reference != nil })
+    }
+
     func testProgressiveCatalogExposesResidentNestedRecordingBeforeUnrelatedHead() async throws {
         try await checkProgressiveCatalog(deleted: false)
     }

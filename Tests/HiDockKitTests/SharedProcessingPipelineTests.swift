@@ -14,18 +14,48 @@ final class SharedProcessingPipelineTests: XCTestCase {
     }
     private var roots: [URL] = []
     override func tearDown() { for root in roots { try? FileManager.default.removeItem(at: root) } }
-    private func fixture() async throws -> (URL, SharedLibraryCoordinator, RecordingStore, TranscriptStore) {
+    private func fixture(additionalAudio: [String] = []) async throws -> (URL, SharedLibraryCoordinator, RecordingStore, TranscriptStore) {
         let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         roots.append(parent)
         let root = parent.appendingPathComponent("library")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try Data("synthetic original".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+        for name in ["Meeting.mp3"] + additionalAudio { try Data(("synthetic original " + name).utf8).write(to: root.appendingPathComponent(name)) }
         let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
         _ = try await coordinator.enable()
         let records = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
         let transcripts = TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: coordinator))
         return (root, coordinator, records, transcripts)
     }
+    private actor RenameOnce {
+        var ran = false
+        let coordinator: SharedLibraryCoordinator
+        let filename: String
+        let reference: SharedRecordingReference
+        init(coordinator: SharedLibraryCoordinator, filename: String, reference: SharedRecordingReference) {
+            self.coordinator = coordinator; self.filename = filename; self.reference = reference
+        }
+        func run() async throws {
+            guard !ran else { return }; ran = true
+            let result = try await coordinator.relocateRecording(filename: filename, title: "Renamed while queued", reference: reference)
+            guard result.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
+        }
+    }
+    func testBulkTranscriptionKeepsQueuedRecordingIdentityAfterRename() async throws {
+        let (_, coordinator, records, transcripts) = try await fixture(additionalAudio: ["Later.mp3"])
+        try await records.setup()
+        let entries = await records.allRecordings()
+        XCTAssertEqual(entries.count, 2)
+        let second = entries[1], reference = try XCTUnwrap(entries[1].reference)
+        let rename = RenameOnce(coordinator: coordinator, filename: second.filename, reference: reference)
+        let pipeline = RecordingPipeline(recordingStore: records, transcriptStore: transcripts, shared: coordinator,
+            transcriber: Engine(action: { try await rename.run() }))
+        try await pipeline.setup()
+        try await pipeline.transcribeAllLocal()
+        let view = try await coordinator.read(.init(id: reference.entityID, kind: .recording))
+        let transcript = try SharedSidecarAdapter.transcript(view, filename: "Renamed while queued.mp3")
+        XCTAssertEqual(transcript?.plainText(), "Synthetic result", "Bulk transcription must resolve its captured ID after the other item renamed it")
+    }
+
     func testActualSharedPipelinePublishesJSONMarkdownAndTextFromAcceptedGeneration() async throws {
         let (root, coordinator, records, transcripts) = try await fixture()
         let pipeline = RecordingPipeline(recordingStore: records, transcriptStore: transcripts, shared: coordinator, transcriber: Engine(action: {}))

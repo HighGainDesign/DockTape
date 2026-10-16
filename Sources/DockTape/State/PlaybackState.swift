@@ -11,7 +11,7 @@ final class PlaybackState {
         let validate: @Sendable () async throws -> Void
         let release: @Sendable () async -> Void
     }
-    var acquireLease: (@Sendable (String, URL) async throws -> Lease)?
+    var acquireLease: (@Sendable (String, URL, SharedRecordingReference?) async throws -> Lease)?
     private var playbackLease: Lease?
 
     var playingFile: String?
@@ -28,6 +28,7 @@ final class PlaybackState {
     private var preparingAsset: AVURLAsset?
     private var requestID = UUID()
     private var requestedURL: URL?
+    private(set) var requestedReference: SharedRecordingReference?
     private var pendingSeek: Double?
     private let prepareFile: @Sendable (URL, @escaping @Sendable () async -> Void) async throws -> Bool
 
@@ -54,14 +55,15 @@ final class PlaybackState {
 
     static let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
-    func play(file: String, url: URL) {
-        if playingFile == file {
+    func play(file: String, url: URL, reference: SharedRecordingReference? = nil) {
+        if playingFile == file, requestedReference == reference {
             if isPreparing { stop(); return }
             if avPlayer != nil { togglePlayPause(); return }
         }
         stop()
         playingFile = file
         requestedURL = url
+        requestedReference = reference
         isPreparing = true
         preparationMessage = "Preparing recording…"
         let request = requestID
@@ -69,7 +71,7 @@ final class PlaybackState {
             guard let self else { return }
             do {
                 if let acquireLease {
-                    let lease = try await acquireLease(file, url)
+                    let lease = try await acquireLease(file, url, reference)
                     guard requestID == request, !Task.isCancelled else { await lease.release(); return }
                     playbackLease = lease
                 }
@@ -110,7 +112,7 @@ final class PlaybackState {
 
     func retry() {
         guard let file = playingFile, let url = requestedURL else { return }
-        play(file: file, url: url)
+        play(file: file, url: url, reference: requestedReference)
     }
 
     private func startPlayer(url: URL) {
@@ -181,6 +183,7 @@ final class PlaybackState {
         isPreparing = false
         loadError = nil
         requestedURL = nil
+        requestedReference = nil
         pendingSeek = nil
         if let obs = endOfPlaybackObserver {
             NotificationCenter.default.removeObserver(obs)

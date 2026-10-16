@@ -73,6 +73,20 @@ final class SharedCompletedChildFolderTests: XCTestCase {
         let replay = try await restarted.resumeFolderOperation(id: f.folder.id)
         XCTAssertEqual(replay.result, .complete)
     }
+    func testCompletedParentReplayAcceptsEquivalentRootWithoutDirectoryHint() async throws {
+        let f = try await fixture(); try await completeChild(f)
+        let moved = try await f.a.renameFolder(from: "Folder", to: "After")
+        XCTAssertEqual(moved.result, .complete)
+        let childBefore = try await f.a.read(f.child)
+        let root = URL(fileURLWithPath: f.root.path, isDirectory: false)
+        XCTAssertFalse(root.hasDirectoryPath)
+        let restarted = SharedLibraryCoordinator(root: root, writerID: f.a.writerID, witnessDirectory: f.root.deletingLastPathComponent().appendingPathComponent("a-local"))
+        let replay = try await restarted.resumeFolderOperation(id: f.folder.id)
+        XCTAssertEqual(replay.result, .complete)
+        let childAfter = try await restarted.read(f.child)
+        XCTAssertEqual(childAfter.state, childBefore.state)
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent("After/.note")), f.note)
+    }
     private func moveParentOnBothReplicas() async throws -> Fixture {
         let f = try await fixture(); try await completeChild(f)
         let renamed = try await f.a.renameFolder(from: "Folder", to: "After"); XCTAssertEqual(renamed.result, .complete)
@@ -372,7 +386,138 @@ final class SharedCompletedChildFolderTests: XCTestCase {
         XCTAssertEqual(rename.result, .complete)
         XCTAssertEqual(try Data(contentsOf: unrelated), bytes)
     }
-    private func deliver(_ source: URL, to destination: URL, writer: UUID) throws {
+    private struct NestedFixture {
+        let parent: URL, left: URL, right: URL
+        let a: SharedLibraryCoordinator, b: SharedLibraryCoordinator
+        let root: SharedEntityIdentity, nested: SharedEntityIdentity, child: SharedEntityIdentity
+        let note: Data
+    }
+    private func completedNestedFixture() async throws -> NestedFixture {
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString); roots.append(parent)
+        let left = parent.appendingPathComponent("left"), right = parent.appendingPathComponent("right"), trash = parent.appendingPathComponent("synthetic-trash")
+        try FileManager.default.createDirectory(at: left.appendingPathComponent("Folder/Nested"), withIntermediateDirectories: true)
+        try Data("Synthetic nested child conversation".utf8).write(to: left.appendingPathComponent("Folder/Nested/Clip.mp3"))
+        let recycle: @Sendable (URL) throws -> Void = { file in
+            try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: file, to: trash.appendingPathComponent(UUID().uuidString))
+        }
+        let a = SharedLibraryCoordinator(root: left, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("a-local"), trash: recycle)
+        _ = try await a.enable(); _ = try await a.projectOutputs()
+        let folders = try await a.snapshots(kinds: [.folder])
+        let root = SharedEntityIdentity(id: try XCTUnwrap(folders.first { $0.state.value(for: "name") == .text("Folder") }).state.id, kind: .folder)
+        let nested = SharedEntityIdentity(id: try XCTUnwrap(folders.first { $0.state.value(for: "name") == .text("Nested") }).state.id, kind: .folder)
+        let child = SharedEntityIdentity(id: try await a.reference(to: "Folder/Nested/Clip.mp3").entityID, kind: .recording)
+        try FileManager.default.copyItem(at: left, to: right)
+        let b = SharedLibraryCoordinator(root: right, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("b-local"), trash: recycle)
+        try await b.requestEnrollment(requestID: UUID(), label: "Completed nested peer")
+        for _ in 0..<3 { try deliver(right, to: left, writer: b.writerID); try await a.refresh(); try deliver(left, to: right, writer: a.writerID); try await b.refresh() }
+        let out = try await b.renameFolder(from: "Folder", to: "Away"), back = try await b.renameFolder(from: "Away", to: "Folder")
+        XCTAssertEqual(out.result, .complete); XCTAssertEqual(back.result, .complete)
+        let initial = try await a.deleteFolder(named: "Folder"); XCTAssertEqual(initial.result, .waitingForAcknowledgments)
+        try deliver(left, to: right, writer: a.writerID)
+        for name in ["library.json", ".templates.json"] { try Data(contentsOf: left.appendingPathComponent(name)).write(to: right.appendingPathComponent(name), options: .atomic) }
+        let childReview = try await b.reviewRecordingOperation(id: child.id)
+        try await b.acknowledgeReviewedRecordingOperation(XCTUnwrap(childReview))
+        try deliver(right, to: left, writer: b.writerID, excludingFolder: root.id)
+        _ = try await a.resumeFolderDeletion(id: root.id)
+        try deliver(left, to: right, writer: a.writerID)
+        for name in ["library.json", ".templates.json"] { try Data(contentsOf: left.appendingPathComponent(name)).write(to: right.appendingPathComponent(name), options: .atomic) }
+        let peerChild = try await b.resumeRecordingOperation(id: child.id); XCTAssertEqual(peerChild.result, .complete)
+        let nestedReview = try await b.reviewFolderOperation(id: nested.id)
+        try await b.acknowledgeReviewedFolderOperation(XCTUnwrap(nestedReview))
+        try deliver(right, to: left, writer: b.writerID, excludingFolder: root.id)
+        let beforeRootApproval = try await a.resumeFolderDeletion(id: root.id)
+        XCTAssertEqual(beforeRootApproval.result, .waitingForAcknowledgments)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: left.appendingPathComponent("Folder/Nested").path), "Real nested cleanup must finish first")
+        try deliver(right, to: left, writer: b.writerID)
+        let conflict = try await a.read(root), choices = try await a.folderLifecycleChoices(conflict)
+        let keep = try XCTUnwrap(choices.first { $0.keep })
+        _ = try await a.resolveFolderLifecycle(keep)
+        let note = Data("Preserve ordinary retained parent note".utf8)
+        try note.write(to: left.appendingPathComponent("Folder/.note"))
+        let retention = try await a.reviewFolderOperation(id: root.id)
+        let plan = try await a.prepareFolderReplan(XCTUnwrap(retention)), retained = try await a.applyFolderReplan(plan)
+        XCTAssertEqual(retained.result, .complete)
+        return .init(parent: parent, left: left, right: right, a: a, b: b, root: root, nested: nested, child: child, note: note)
+    }
+    private func nestedReceipts(_ f: NestedFixture) async throws -> [URL: Data] {
+        let library = try await f.a.read(f.child).libraryID
+        let directory = f.parent.appendingPathComponent("a-local/Operations/" + library.uuidString + "/" + f.a.writerID.uuidString)
+        return try Dictionary(uniqueKeysWithValues: [f.nested.id, f.child.id].map { id in
+            let file = directory.appendingPathComponent(id.uuidString + ".json"), bytes = try Data(contentsOf: file), receipt = try SharedOperationReceipt.decode(bytes)
+            XCTAssertEqual(receipt.completed, receipt.operation.steps.count); XCTAssertFalse(receipt.attempting)
+            return (file, bytes)
+        })
+    }
+    func testOrdinaryParentRenameAfterCompletedNestedCleanupPreservesChildStateAndReceipts() async throws {
+        let f = try await completedNestedFixture(), receipts = try await nestedReceipts(f)
+        let nestedBefore = try await f.a.read(f.nested), childBefore = try await f.a.read(f.child)
+        XCTAssertEqual(nestedBefore.state.lifecycle, .deleted); XCTAssertEqual(childBefore.state.lifecycle, .deleted)
+        let moved = try await f.a.renameFolder(from: "Folder", to: "After")
+        XCTAssertEqual(moved.result, .complete, "Completed nested cleanup must permit an ordinary parent relocation")
+        guard moved.result == .complete else { return }
+        XCTAssertEqual(try Data(contentsOf: f.left.appendingPathComponent("After/.note")), f.note)
+        let nestedAfter = try await f.a.read(f.nested), childAfter = try await f.a.read(f.child)
+        XCTAssertEqual(nestedAfter.state, nestedBefore.state); XCTAssertEqual(childAfter.state, childBefore.state)
+        for (file, bytes) in receipts { XCTAssertEqual(try Data(contentsOf: file), bytes) }
+        let restarted = SharedLibraryCoordinator(root: f.left, writerID: f.a.writerID, witnessDirectory: f.parent.appendingPathComponent("a-local"))
+        let replay = try await restarted.resumeFolderOperation(id: f.root.id)
+        XCTAssertEqual(replay.result, .complete)
+    }
+    func testCompletedNestedSlotRefusesReturnedDirectoryWithoutRecordingFiles() async throws {
+        let f = try await completedNestedFixture(), receipts = try await nestedReceipts(f)
+        let moved = try await f.a.renameFolder(from: "Folder", to: "After"); XCTAssertEqual(moved.result, .complete)
+        let alias = f.left.appendingPathComponent("Folder/Nested")
+        try FileManager.default.createDirectory(at: alias, withIntermediateDirectories: true)
+        let held = try await f.a.renameFolder(from: "After", to: "Third")
+        XCTAssertEqual(held.result, .needsReplanning, "An empty returned nested directory is not an absent recording family")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: alias.path))
+        XCTAssertEqual(try Data(contentsOf: f.left.appendingPathComponent("After/.note")), f.note)
+        for (file, bytes) in receipts { XCTAssertEqual(try Data(contentsOf: file), bytes) }
+        try FileManager.default.removeItem(at: alias)
+        let resumed = try await f.a.resumeFolderOperation(id: f.root.id)
+        XCTAssertEqual(resumed.result, .complete)
+    }
+    func testCompletedNestedPermissionRechecksLateHistoricalDirectoryPlaceholder() async throws {
+        let f = try await completedNestedFixture(), receipts = try await nestedReceipts(f)
+        let moved = try await f.a.renameFolder(from: "Folder", to: "After"); XCTAssertEqual(moved.result, .complete)
+        let interrupted = SharedLibraryCoordinator(root: f.left, writerID: f.a.writerID, witnessDirectory: f.parent.appendingPathComponent("a-local"), afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        do { _ = try await Task { try await interrupted.renameFolder(from: "After", to: "Third") }.value; XCTFail("Expected interrupted accepted intent") }
+        catch is CancellationError { }
+        let permission = try await f.a.operationAuthority(entity: f.root, paths: ["After", "Third"])
+        XCTAssertTrue(permission.directoryScopeMatches); XCTAssertTrue(try permission.validateLocalCommit())
+        let placeholder = f.left.appendingPathComponent(".Folder.icloud"), bytes = Data("Synthetic late nested ancestor".utf8)
+        try bytes.write(to: placeholder)
+        XCTAssertFalse(try permission.validateLocalCommit())
+        let held = try await f.a.resumeFolderOperation(id: f.root.id)
+        XCTAssertEqual(held.result, .needsReplanning)
+        XCTAssertEqual(try Data(contentsOf: placeholder), bytes)
+        XCTAssertEqual(try Data(contentsOf: f.left.appendingPathComponent("After/.note")), f.note)
+        for (file, bytes) in receipts { XCTAssertEqual(try Data(contentsOf: file), bytes) }
+    }
+    func testChangedCohortCannotReuseCompletedNestedCleanupApprovals() async throws {
+        let f = try await completedNestedFixture(), receipts = try await nestedReceipts(f)
+        let thirdRoot = f.parent.appendingPathComponent("third")
+        try FileManager.default.copyItem(at: f.left, to: thirdRoot)
+        let third = SharedLibraryCoordinator(root: thirdRoot, writerID: UUID(), witnessDirectory: f.parent.appendingPathComponent("third-local"))
+        try await third.requestEnrollment(requestID: UUID(), label: "New nested cleanup peer")
+        for _ in 0..<4 {
+            try deliver(thirdRoot, to: f.left, writer: third.writerID); try deliver(thirdRoot, to: f.right, writer: third.writerID)
+            try await f.a.refresh(); try await f.b.refresh()
+            try deliver(f.left, to: thirdRoot, writer: f.a.writerID); try deliver(f.left, to: f.right, writer: f.a.writerID)
+            try deliver(f.right, to: thirdRoot, writer: f.b.writerID); try deliver(f.right, to: f.left, writer: f.b.writerID)
+            try await third.refresh()
+        }
+        let permission = try await f.a.operationAuthority(entity: f.nested, paths: [])
+        XCTAssertEqual(permission.membership.cohort.count, 3); XCTAssertFalse(permission.mayDestroy(.delete))
+        let nestedBefore = try await f.a.read(f.nested)
+        let held = try await f.a.renameFolder(from: "Folder", to: "After")
+        XCTAssertEqual(held.result, .needsReplanning, "Physical absence cannot substitute for current cohort approval")
+        let nestedAfter = try await f.a.read(f.nested); XCTAssertEqual(nestedAfter.state, nestedBefore.state)
+        XCTAssertEqual(try Data(contentsOf: f.left.appendingPathComponent("Folder/.note")), f.note)
+        for (file, bytes) in receipts { XCTAssertEqual(try Data(contentsOf: file), bytes) }
+    }
+    private func deliver(_ source: URL, to destination: URL, writer: UUID, excludingFolder: UUID? = nil) throws {
         let tree = source.appendingPathComponent(".docktape").resolvingSymlinksInPath()
         let iterator = try XCTUnwrap(FileManager.default.enumerator(at: tree, includingPropertiesForKeys: [.isDirectoryKey]))
         for case let file as URL in iterator where file.pathExtension == "json" {
@@ -381,7 +526,9 @@ final class SharedCompletedChildFolderTests: XCTestCase {
             let payload = object["payload"] as? [String: Any]
             let owner = (object["writerID"] as? String) ?? (payload?["writer"] as? String) ?? (object["founder"] as? String)
             guard owner.flatMap(UUID.init(uuidString:)) == writer else { continue }
-            let relative = String(file.resolvingSymlinksInPath().path.dropFirst(tree.path.count + 1)), target = destination.appendingPathComponent(".docktape/" + relative)
+            let relative = String(file.resolvingSymlinksInPath().path.dropFirst(tree.path.count + 1))
+            if let excludingFolder, relative.lowercased().hasPrefix("folders/" + excludingFolder.uuidString.lowercased() + "/") { continue }
+            let target = destination.appendingPathComponent(".docktape/" + relative)
             try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             try bytes.write(to: target, options: .atomic)
         }

@@ -17,7 +17,7 @@ import HiDockKit
     private(set) var isWorking = false
     private(set) var inspectionFailed = false
     private(set) var message: String?
-    private(set) var updatedPlan: SharedRecordingReplanReview?
+    private(set) var updatedPlan: FileReviewPreview<SharedRecordingReplanReview>?
     private var deletionSnapshots: [UUID: SharedLibraryViewSnapshot] = [:]
     private var binding: SharedLibraryCoordinator?
     private var request = UUID()
@@ -74,11 +74,13 @@ import HiDockKit
                 let outcome = try await coordinator.prepareReviewedDeletion(candidate.snapshot)
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = outcome.result == .complete ? "Deletion completed." : "Cleanup prepared. Review the remaining file changes and participating Mac approvals."
                 return true
             } catch {
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return false }
                 await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return false }
                 self.message = "Cleanup could not be prepared. Reload or retry after the recording and its companion files are available and any changed files have been reviewed."
                 return false
             }
@@ -101,11 +103,13 @@ import HiDockKit
                 _ = try await coordinator.resolve(.init(base: snapshot, changes: [.restore]))
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = "Recording kept. Review its external files before deleting again. Files already removed are not restored automatically."
                 return true
             } catch {
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return false }
                 await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return false }
                 self.message = "The recording or library changed. Reload before keeping it for file review."
                 return false
             }
@@ -127,15 +131,16 @@ import HiDockKit
         do {
             let prepared = try await coordinator.prepareRecordingReplan(review)
             guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
-            updatedPlan = prepared
+            updatedPlan = FileReviewPreview(review: prepared)
         } catch {
             if binding === coordinator, request == ticket, !(error is CancellationError) {
                 message = "The updated plan could not be prepared. Reload after sync finishes; existing files are preserved."
             }
         }
     }
-    @discardableResult func applyUpdatedPlan(using coordinator: SharedLibraryCoordinator) async -> Bool {
-        guard binding === coordinator, !isLoading, !isWorking, let prepared = updatedPlan else { return false }
+    @discardableResult func applyUpdatedPlan(_ preview: FileReviewPreview<SharedRecordingReplanReview>, using coordinator: SharedLibraryCoordinator) async -> Bool {
+        guard binding === coordinator, !isLoading, !isWorking, updatedPlan?.id == preview.id else { return false }
+        let prepared = preview.review
         let ticket = request; let work = UUID(); workID = work; isWorking = true; message = nil
         let task = Task { [weak self] in
             do {
@@ -144,6 +149,7 @@ import HiDockKit
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 self.updatedPlan = nil
                 await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = outcome.result == .complete && outcome.projectionError == nil
                     ? "Updated file plan completed." : "Updated plan accepted. Review any remaining pending file changes."
                 return true
@@ -151,6 +157,7 @@ import HiDockKit
                 guard let self, self.binding === coordinator, self.request == ticket else { return false }
                 self.updatedPlan = nil
                 await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return false }
                 if !(error is CancellationError) {
                     self.message = "The updated plan could not finish. Review the current pending change before trying again; existing files are preserved."
                 }
@@ -186,6 +193,7 @@ import HiDockKit
                 }
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = text
                 return true
             } catch {

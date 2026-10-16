@@ -8,11 +8,18 @@ public enum SharedSidecarError: Error, Equatable, Sendable {
 /// Store boundary for shared content. Each store retains the exact snapshot its
 /// user saw; edits target that generation and affected field, never cached JSON.
 /// Physical sidecars are projections and are not implicitly adopted on reads.
+struct SharedContentPresence: Sendable {
+    let filenames: Set<String>
+    let observation: UInt64
+    let isComplete: Bool
+}
+
 public actor SharedSidecarAdapter {
     public nonisolated let coordinator: SharedLibraryCoordinator
     private struct Key: Hashable { let entity: UUID; let component: SharedComponent }
     private var displayed: [Key: SharedLibraryViewSnapshot] = [:]
     private var readRequests: [String: UUID] = [:]
+    private var selectedReferences: [String: SharedRecordingReference] = [:]
     public init(coordinator: SharedLibraryCoordinator) { self.coordinator = coordinator }
     public nonisolated func requireRoot(_ root: URL) throws {
         guard root.standardizedFileURL.resolvingSymlinksInPath() == coordinator.root else {
@@ -20,23 +27,45 @@ public actor SharedSidecarAdapter {
         }
     }
 
-    public func transcript(for filename: String) async throws -> Transcript? {
+    /// A complete standalone existence scan reads accepted state. App startup
+    /// reuses its progressive RecordingStore catalog instead of awaiting this
+    /// all-recording operation before displaying resident entries.
+    func contentFilenames(_ component: SharedComponent) async throws -> SharedContentPresence {
+        let observation = await coordinator.nextContentObservation()
+        let views = try await coordinator.snapshots(kinds: [.recording, .folder])
+        let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: true)
+        let filenames = Set(views.compactMap { view -> String? in
+            guard view.state.kind == .recording, view.state.lifecycle == .alive,
+                  !view.state.generationValues(for: component).isEmpty,
+                  let path = index.resolvedPaths[view.state.id], index.owners(of: path) == [view.state.id] else { return nil }
+            return path
+        })
+        return .init(filenames: filenames, observation: observation, isComplete: true)
+    }
+
+    public func transcript(for filename: String, reference: SharedRecordingReference? = nil) async throws -> Transcript? {
         let request = UUID(); readRequests[filename] = request
-        let view = try await coordinator.recording(at: filename)
+        let view = try await coordinator.recording(at: filename, reference: reference)
         let result = try Self.transcript(view, filename: filename)
         try Task.checkCancellation()
-        if readRequests[filename] == request { displayed[Key(entity: view.state.id, component: .transcript)] = view }
+        if readRequests[filename] == request {
+            displayed[Key(entity: view.state.id, component: .transcript)] = view
+            selectedReferences[filename] = .init(libraryID: view.libraryID, entityID: view.state.id)
+        }
         return result
     }
-    public func summary(for filename: String) async throws -> Summary? {
+    public func summary(for filename: String, reference: SharedRecordingReference? = nil) async throws -> Summary? {
         let request = UUID(); readRequests[filename] = request
-        let view = try await coordinator.recording(at: filename)
+        let view = try await coordinator.recording(at: filename, reference: reference)
         let result = try Self.summary(view, filename: filename)
         try Task.checkCancellation()
-        if readRequests[filename] == request { displayed[Key(entity: view.state.id, component: .summary)] = view }
+        if readRequests[filename] == request {
+            displayed[Key(entity: view.state.id, component: .summary)] = view
+            selectedReferences[filename] = .init(libraryID: view.libraryID, entityID: view.state.id)
+        }
         return result
     }
-    public func save(_ transcript: Transcript, filename: String, job: SharedLibraryJobToken? = nil) async throws -> Transcript {
+    public func save(_ transcript: Transcript, filename: String, job: SharedLibraryJobToken? = nil, reference: SharedRecordingReference? = nil) async throws -> Transcript {
         readRequests[filename] = UUID()
         guard transcript.recordingFilename == filename else { throw SharedSidecarError.invalidContent }
         if let job {
@@ -48,7 +77,8 @@ public actor SharedSidecarAdapter {
             return result
         }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-        let fresh = try await coordinator.recording(at: filename)
+        try await validateEditingReference(reference, filename: filename)
+        let fresh = try await coordinator.recording(at: filename, reference: reference ?? selectedReferences[filename])
         let seen = displayed[Key(entity: fresh.state.id, component: .transcript)]
         guard seen != nil || fresh.state.generationValues(for: .transcript).isEmpty else {
             throw SharedSidecarError.reloadRequired
@@ -63,7 +93,7 @@ public actor SharedSidecarAdapter {
         guard let accepted = try Self.transcript(result, filename: filename) else { throw SharedSidecarError.invalidContent }
         return accepted
     }
-    public func save(_ summary: Summary, filename: String, job: SharedLibraryJobToken? = nil) async throws -> Summary {
+    public func save(_ summary: Summary, filename: String, job: SharedLibraryJobToken? = nil, reference: SharedRecordingReference? = nil) async throws -> Summary {
         readRequests[filename] = UUID()
         guard summary.recordingFilename == filename else { throw SharedSidecarError.invalidContent }
         if let job {
@@ -75,7 +105,8 @@ public actor SharedSidecarAdapter {
             return result
         }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-        let fresh = try await coordinator.recording(at: filename)
+        try await validateEditingReference(reference, filename: filename)
+        let fresh = try await coordinator.recording(at: filename, reference: reference ?? selectedReferences[filename])
         let seen = displayed[Key(entity: fresh.state.id, component: .summary)]
         guard seen != nil || fresh.state.generationValues(for: .summary).isEmpty else {
             throw SharedSidecarError.reloadRequired
@@ -90,9 +121,18 @@ public actor SharedSidecarAdapter {
         guard let accepted = try Self.summary(result, filename: filename) else { throw SharedSidecarError.invalidContent }
         return accepted
     }
-    public func updateSpeakerNames(filename: String, names: [String: String]) async throws -> Transcript? {
+    /// Explicit editor references must still be the snapshot selected by this
+    /// store, and still name the same recording at the displayed path.
+    func validateEditingReference(_ reference: SharedRecordingReference?, filename: String) async throws {
+        guard let reference else { return }
+        guard selectedReferences[filename] == reference else { throw SharedSidecarError.reloadRequired }
+        _ = try await coordinator.recording(at: filename, reference: reference)
+        guard selectedReferences[filename] == reference else { throw SharedSidecarError.reloadRequired }
+    }
+    public func updateSpeakerNames(filename: String, names: [String: String], reference: SharedRecordingReference? = nil) async throws -> Transcript? {
         readRequests[filename] = UUID()
-        let fresh = try await coordinator.recording(at: filename)
+        try await validateEditingReference(reference, filename: filename)
+        let fresh = try await coordinator.recording(at: filename, reference: reference ?? selectedReferences[filename])
         let key = Key(entity: fresh.state.id, component: .transcript)
         guard let base = displayed[key], let generation = base.state.currentDocument(for: .transcript),
               let before = try Self.transcript(base, filename: filename) else { throw SharedSidecarError.reloadRequired }
@@ -112,9 +152,10 @@ public actor SharedSidecarAdapter {
         displayed[key] = accepted
         return try Self.transcript(accepted, filename: filename)
     }
-    public func toggleItem(_ item: UUID, filename: String) async throws -> Summary? {
+    public func toggleItem(_ item: UUID, filename: String, reference: SharedRecordingReference? = nil) async throws -> Summary? {
         readRequests[filename] = UUID()
-        let fresh = try await coordinator.recording(at: filename)
+        try await validateEditingReference(reference, filename: filename)
+        let fresh = try await coordinator.recording(at: filename, reference: reference ?? selectedReferences[filename])
         let key = Key(entity: fresh.state.id, component: .summary)
         guard let base = displayed[key], let generation = base.state.currentDocument(for: .summary),
               let summary = try Self.summary(base, filename: filename),

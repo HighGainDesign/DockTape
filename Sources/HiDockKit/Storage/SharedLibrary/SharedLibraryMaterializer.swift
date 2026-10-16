@@ -317,7 +317,7 @@ public actor SharedLibraryMaterializer {
       if let gate { try gate.validate(scopes[1], outside: root) }
       try Self.checkRoot(root)
       guard Self.contained(scopes[0].url, in: receipts),
-            scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath(),
+            scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath().path == root.standardizedFileURL.resolvingSymlinksInPath().path,
             !current.revisionLease.isRevoked, try current.validateLocalCommit() else { throw SharedLibraryOperationError.staleAuthority }
       for (binding, read) in zip(bindings, scopes.dropFirst(2 + gateItems.count)) {
         guard read.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
@@ -362,7 +362,7 @@ public actor SharedLibraryMaterializer {
       if let gate { try gate.validate(scopes[1], outside: root) }
       try Self.checkRoot(root)
       guard Self.contained(scopes[0].url, in: receipts),
-            scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath(),
+            scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath().path == root.standardizedFileURL.resolvingSymlinksInPath().path,
             !current.revisionLease.isRevoked, try current.validateLocalCommit() else { throw SharedLibraryOperationError.staleAuthority }
       let reads = scopes.dropFirst(2 + gateItems.count)
       for (binding, scope) in zip(bindings, reads) {
@@ -423,7 +423,7 @@ public actor SharedLibraryMaterializer {
       if let gate { try gate.validate(scopes[1], outside: root) }
       try Self.checkRoot(root)
       guard Self.contained(scopes[0].url, in: receipts),
-            scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath(),
+            scopes[1 + gateItems.count].url.standardizedFileURL.resolvingSymlinksInPath().path == root.standardizedFileURL.resolvingSymlinksInPath().path,
             !current.revisionLease.isRevoked, try current.validateLocalCommit() else { throw SharedLibraryOperationError.staleAuthority }
       for (binding, read) in zip(bindings, scopes.dropFirst(2 + gateItems.count)) {
         guard read.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
@@ -972,7 +972,7 @@ public actor SharedLibraryMaterializer {
   /// /private/tmp for a missing child while resolving its existing parent to
   /// /tmp, including on a mounted volume. Resolve symlinks before preserving
   /// the missing suffix so an escape still compares outside the library.
-  private static func canonicalLocation(_ url: URL, links: Int = 0) -> URL? {
+  static func canonicalLocation(_ url: URL, links: Int = 0) -> URL? {
     guard links < 40 else { return nil }
     var location = url.standardizedFileURL.resolvingSymlinksInPath()
     var suffix: [String] = []

@@ -143,6 +143,9 @@ public enum SharedLibraryChange: Sendable {
 public actor SharedLibraryCoordinator {
   public nonisolated let root: URL
   public nonisolated let writerID: UUID
+  // Process-local display ordering only; never persisted or used as write authority.
+  private var contentObservation: UInt64 = 0
+  func nextContentObservation() -> UInt64 { contentObservation += 1; return contentObservation }
   private var bootstrapReviewTickets: Set<String> = []
   private let bootstrap: LegacyLibraryBootstrap
   private let versionAccess: RecordingFileVersionAccess
@@ -416,9 +419,17 @@ public actor SharedLibraryCoordinator {
   /// Resolve an existing identity, never derive a new ID from an unfamiliar
   /// filename. Initial-path hits read only that recording and its ancestors,
   /// so a cold unrelated recording cannot block a resident one.
-  public func recording(at relativePath: String) async throws -> SharedLibraryViewSnapshot {
+  public func recording(at relativePath: String, reference: SharedRecordingReference? = nil) async throws -> SharedLibraryViewSnapshot {
     let path = try SharedLibraryIdentity.normalized(relativePath)
     let manifest = try await bind()
+    if let reference {
+      guard reference.libraryID == manifest.libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
+      let view = try await read(.init(id: reference.entityID, kind: .recording))
+      guard view.libraryID == reference.libraryID, try await currentPath(view) == path else {
+        throw SharedLibraryCoordinatorError.differentBinding
+      }
+      return view
+    }
     if let reference = manifest.references.first(where: { $0.entity.kind == .recording && $0.initialPath == path }) {
       let view = try await read(reference.entity)
       if try await currentPath(view) == path { return view }
@@ -471,7 +482,7 @@ public actor SharedLibraryCoordinator {
     guard published.recordings[reference.entityID]?.contains(path) == true else { throw SharedLibraryOperationError.unfinishedOperation }
     for original in published.recordings[reference.entityID] ?? [] where original != path {
       let stem = (original as NSString).deletingPathExtension
-      for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+      for suffix in try SharedRecordingFiles.suffixes(forAudioPath: original) {
         let url = root.appendingPathComponent(stem + suffix)
         let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
         if FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path) { throw SharedLibraryOperationError.unfinishedOperation }
@@ -491,7 +502,7 @@ public actor SharedLibraryCoordinator {
     guard case .text(let title)? = view.state.value(for: "title"), !title.contains("/") else {
       throw SharedSidecarError.ambiguousPath
     }
-    var parts = [title + ".mp3"]
+    var parts = [title + (try SharedRecordingFiles.audioSuffix(view.state))]
     var parent = view.state.value(for: "folder")
     var visited: Set<UUID> = [view.state.id]
     while let value = parent {
@@ -837,7 +848,7 @@ public actor SharedLibraryCoordinator {
     guard filenames.count >= 2 else { throw HiDockError.invalidFilename("Need at least 2 recordings to merge") }
     guard try await mayEdit() else { throw SharedLibraryCoordinatorError.enrollmentPending }
     let path = try SharedLibraryIdentity.normalized(filename)
-    guard !path.contains("/"), path.hasSuffix(".mp3") else { throw SharedLibraryIdentityError.invalidRelativePath }
+    guard !path.contains("/"), SharedRecordingFiles.isAudio(path) else { throw SharedLibraryIdentityError.invalidRelativePath }
     var tokens: [SharedLibraryJobToken] = []
     do {
       var concatenator = MP3Concatenator()
@@ -876,7 +887,7 @@ public actor SharedLibraryCoordinator {
     let index = try await pathIndex(for: views)
     let stem = (filename as NSString).deletingPathExtension
     guard index.owners(of: filename).isEmpty else { throw SharedLibraryOperationError.pathConflict(filename) }
-    for suffix in [".mp3", ".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".txt"] {
+    for suffix in try SharedRecordingFiles.suffixes(forAudioPath: filename) {
       let url = root.appendingPathComponent(stem + suffix)
       let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
       guard !FileManager.default.fileExists(atPath: url.path), !FileManager.default.fileExists(atPath: placeholder.path) else { throw SharedLibraryOperationError.pathConflict(stem + suffix) }
@@ -1346,14 +1357,13 @@ public actor SharedLibraryCoordinator {
     let index = try SharedLibraryPathIndex(states: views.map(\.state), caseSensitive: sensitive)
     var requiredOriginal = Dictionary(uniqueKeysWithValues: original.entries.map { ($0.path, $0) })
     var alternatives: [String: Set<String>] = [:], requiredFiles: Set<String> = [], allowedDirectories: Set<String> = []
-    let suffixes = [".mp3", ".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".txt"]
     if allowLaterEdits {
       // Completed moves must not reappear after later accepted child work.
       // Replace only known recording slots with their current semantic proofs;
       // unknown/ordinary original files still require their original hashes.
       for member in scope.members where member.kind == .recording {
         let stem = String((member.path as NSString).deletingPathExtension.dropFirst(destination.count + 1))
-        for suffix in suffixes {
+        for suffix in try SharedRecordingFiles.suffixes(forAudioPath: member.path) {
           let retained = requiredOriginal.removeValue(forKey: stem + suffix)
           if source == destination,
              views.first(where: { $0.state.id == member.id })?.state.lifecycle == .deleted,
@@ -1388,7 +1398,7 @@ public actor SharedLibraryCoordinator {
         requiredFiles.insert(relative)
         if let member {
           let oldStem = String((member.path as NSString).deletingPathExtension.dropFirst(destination.count + 1))
-          for suffix in suffixes {
+          for suffix in try SharedRecordingFiles.suffixes(forAudioPath: member.path) {
             if let hash = original.entries.first(where: { $0.path == oldStem + suffix })?.fingerprint {
               alternatives[stem + suffix, default: []].insert(hash)
             }
@@ -1418,7 +1428,7 @@ public actor SharedLibraryCoordinator {
     return try await CoordinatedFileAccess().withWrites(items, reading: [root] + bindings.map(\.file) + [from, placeholder, to]) { scopes in
       try gate.validate(scopes[0], outside: root)
       guard !permission.revisionLease.isRevoked, try permission.validateLocalCommit(),
-            scopes[items.count].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath() else { throw SharedLibraryOperationError.staleAuthority }
+            scopes[items.count].url.standardizedFileURL.resolvingSymlinksInPath().path == root.standardizedFileURL.resolvingSymlinksInPath().path else { throw SharedLibraryOperationError.staleAuthority }
       try SharedLibraryMaterializer.checkRoot(root)
       for (binding, read) in zip(bindings, scopes.dropFirst(items.count + 1)) {
         guard read.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
@@ -1465,7 +1475,7 @@ public actor SharedLibraryCoordinator {
     return try await CoordinatedFileAccess().withWrites(items, reading: [root] + bindings.map(\.file) + [directory]) { scopes in
       try gate.validate(scopes[0], outside: root)
       guard !permission.revisionLease.isRevoked, try permission.validateLocalCommit(),
-            scopes[items.count].url.standardizedFileURL.resolvingSymlinksInPath() == root.standardizedFileURL.resolvingSymlinksInPath() else { return false }
+            scopes[items.count].url.standardizedFileURL.resolvingSymlinksInPath().path == root.standardizedFileURL.resolvingSymlinksInPath().path else { return false }
       try SharedLibraryMaterializer.checkRoot(root)
       for (binding, scope) in zip(bindings, scopes.dropFirst(items.count + 1)) {
         guard scope.url.standardizedFileURL.resolvingSymlinksInPath() == binding.file.standardizedFileURL.resolvingSymlinksInPath(),
@@ -1573,11 +1583,12 @@ public actor SharedLibraryCoordinator {
         guard let child = views.first(where: { $0.state.id == member.id }), child.state.lifecycle == .deleted else { continue }
         let relative = String(member.path.dropFirst(destination.count + 1))
         let stems = paths.map { ($0 + "/" + relative as NSString).deletingPathExtension }
-        let suffixes = [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"]
-        let aliases = Set(stems.flatMap { stem in suffixes.map { stem + $0 } })
-        guard let absent = try await acknowledgedAbsentRecordingPaths(child, additionalPaths: aliases,
+        let suffixes = member.kind == .recording ? try SharedRecordingFiles.suffixes(forAudioPath: member.path) : []
+        let aliases = member.kind == .folder ? Set(paths.map { $0 + "/" + relative })
+          : Set(stems.flatMap { stem in suffixes.map { stem + $0 } })
+        guard let absent = try await acknowledgedAbsentChildPaths(child, additionalPaths: aliases,
             membership: membership, completed: published.completedFileIntents[member.id] ?? [:], index: index,
-            witness: witness, hasPendingWork: permission.hasPendingWork) else { throw SharedSidecarError.conflictedContent }
+            witness: witness, hasPendingWork: permission.hasPendingWork, states: views.map(\.state)) else { throw SharedSidecarError.conflictedContent }
         absentChildPaths.formUnion(absent)
       }
     }
@@ -1703,7 +1714,7 @@ public actor SharedLibraryCoordinator {
               && member.path.hasPrefix(request.path + "/")
               && (try? SharedLibraryIdentity.normalized(member.path)) == member.path
               && !member.revision.isEmpty
-              && (member.kind != .recording || member.path.hasSuffix(".mp3"))
+              && (member.kind != .recording || SharedRecordingFiles.isAudio(member.path))
           }) else { throw SharedLibraryOperationError.differentBinding }
     return request
   }
@@ -2049,7 +2060,7 @@ public actor SharedLibraryCoordinator {
       } else {
         if current.state.lifecycle == .deleted && !FileManager.default.fileExists(atPath: root.appendingPathComponent(member.path).path) {
           let stem = String(member.path.dropLast(4))
-          let paths = [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"].map { stem + $0 }
+          let paths = try SharedRecordingFiles.suffixes(forAudioPath: member.path).map { stem + $0 }
           let permission = try await operationAuthority(entity: entity, paths: paths, reviewedFolder: reviewedFolder, expectedCohort: expectedCohort)
           if try await acknowledgedRemovalIsPresent(paths: paths, permission: permission) { continue }
           return .init(id: id, name: request.path, result: .waitingForFile(member.path), projectionError: nil)
@@ -2118,9 +2129,9 @@ public actor SharedLibraryCoordinator {
           let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json),
           intent.steps == operation.steps, intent.inputRevision == operation.inputRevision else { return false }
     var paths = operation.canonicalPaths
-    for path in operation.canonicalPaths where path.hasSuffix(".mp3") {
+    for path in operation.canonicalPaths where SharedRecordingFiles.isAudio(path) {
       let stem = String(path.dropLast(4))
-      paths.formUnion([".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"].map { stem + $0 })
+      paths.formUnion(try SharedRecordingFiles.suffixes(forAudioPath: path).map { stem + $0 })
     }
     let permission = try await operationAuthority(entity: operation.entity, paths: Array(paths), reviewedFolder: reviewedFolder, expectedCohort: expectedCohort)
     if let expectedCohort, permission.membership.fingerprint != expectedCohort { throw SharedLibraryOperationError.staleAuthority }
@@ -2261,7 +2272,8 @@ public actor SharedLibraryCoordinator {
         changes.append(.assign(field: "folder", value: .text(destination.reference.entityID.uuidString)))
       } else { changes.append(.assign(field: "folder", value: .unset)) }
     }
-    let destination = folder.isEmpty ? basename + ".mp3" : folder + "/" + basename + ".mp3"
+    let suffix = try SharedRecordingFiles.audioSuffix(base.state)
+    let destination = folder.isEmpty ? basename + suffix : folder + "/" + basename + suffix
     if source == destination { return .init(filename: source, result: .complete, projectionError: nil, view: base) }
     let all = try await snapshots(kinds: [.recording, .folder])
     let sensitive = (try? root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames ?? false
@@ -2276,14 +2288,14 @@ public actor SharedLibraryCoordinator {
     var sourceBindings = published.proofs.map { file, hash in
       SharedMaterializationBinding(file: file) { SharedLibraryOperation.fingerprint($0) == hash }
     } + destinationBindings
-    for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+    for suffix in try SharedRecordingFiles.suffixes(forAudioPath: source) {
       let from = sourceStem + suffix, to = destinationStem + suffix
       let target = root.appendingPathComponent(to)
       guard !FileManager.default.fileExists(atPath: target.path),
             !FileManager.default.fileExists(atPath: target.deletingLastPathComponent().appendingPathComponent("." + target.lastPathComponent + ".icloud").path) else {
         throw SharedLibraryOperationError.pathConflict(to)
       }
-      if let bytes = try await RecordingFileAccess().readDataIfPresent(at: root.appendingPathComponent(from), knownToExist: suffix == ".mp3") {
+      if let bytes = try await RecordingFileAccess().readDataIfPresent(at: root.appendingPathComponent(from), knownToExist: suffix.lowercased() == ".mp3") {
         if suffix.hasSuffix(".json") {
           try published.validateCompanion(path: from, bytes: bytes, entity: entity.id, library: base.libraryID,
               kind: suffix == ".transcript.json" ? "transcript" : "summary")
@@ -2291,7 +2303,7 @@ public actor SharedLibraryCoordinator {
         let hash = SharedLibraryOperation.fingerprint(bytes)
         sourceBindings.append(.init(file: root.appendingPathComponent(from)) { SharedLibraryOperation.fingerprint($0) == hash })
         steps.append(.move(source: from, destination: to, fingerprint: hash))
-      } else if suffix == ".mp3" { throw CocoaError(.fileReadNoSuchFile) }
+      } else if suffix.lowercased() == ".mp3" { throw CocoaError(.fileReadNoSuchFile) }
     }
     // Ancestor source-set proofs share the format item. Coordinate it once,
     // while retaining every entity/source-set validator on that item.
@@ -2423,15 +2435,15 @@ public actor SharedLibraryCoordinator {
     let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
     let stem = (source as NSString).deletingPathExtension
     var steps: [SharedLibraryOperation.Step] = []
-    for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+    for suffix in try SharedRecordingFiles.suffixes(forAudioPath: source) {
       let path = stem + suffix
-      if let bytes = try await RecordingFileAccess().readDataIfPresent(at: root.appendingPathComponent(path), knownToExist: suffix == ".mp3") {
+      if let bytes = try await RecordingFileAccess().readDataIfPresent(at: root.appendingPathComponent(path), knownToExist: suffix.lowercased() == ".mp3") {
         if suffix.hasSuffix(".json") {
           try published.validateCompanion(path: path, bytes: bytes, entity: entity.id, library: base.libraryID,
               kind: suffix == ".transcript.json" ? "transcript" : "summary")
         }
         let fingerprint = SharedLibraryOperation.fingerprint(bytes)
-        if expectedMember != nil, suffix == ".mp3" {
+        if expectedMember != nil, suffix.lowercased() == ".mp3" {
           let selected: String?
           if case .text(let known)? = base.state.value(for: "audioFingerprint") { selected = known }
           else { selected = try SharedRecordingMetadataAdapter.render(base).audioSHA256 }
@@ -2446,7 +2458,7 @@ public actor SharedLibraryCoordinator {
           }
         }
         steps.append(.trash(path: path, fingerprint: fingerprint))
-      } else if suffix == ".mp3" { throw CocoaError(.fileReadNoSuchFile) }
+      } else if suffix.lowercased() == ".mp3" { throw CocoaError(.fileReadNoSuchFile) }
     }
     let paths = steps.compactMap { step -> String? in
       if case .trash(let path, _) = step { return path }
@@ -2496,11 +2508,11 @@ public actor SharedLibraryCoordinator {
         }
       }
     }
-    let suffixes = [".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".mp3", ".txt"]
     for path in Array(files.keys) {
-      guard let suffix = suffixes.first(where: { path.hasSuffix($0) }) else { throw SharedLibraryOperationError.invalidReceipt }
+      guard let suffix = SharedRecordingFiles.suffix(of: path) else { throw SharedLibraryOperationError.invalidReceipt }
       let stem = String(path.dropLast(suffix.count))
-      for suffix in suffixes where files[stem + suffix] == nil { files[stem + suffix] = [] }
+      let audio = SharedRecordingFiles.isAudio(path) ? path : stem + (try SharedRecordingFiles.audioSuffix(state))
+      for suffix in try SharedRecordingFiles.suffixes(forAudioPath: audio) where files[stem + suffix] == nil { files[stem + suffix] = [] }
     }
     for (path, hashes) in files {
       _ = try SharedLibraryIdentity.normalized(path)
@@ -2529,6 +2541,69 @@ public actor SharedLibraryCoordinator {
     })
     guard !paths.isEmpty, paths.allSatisfy({ !Self.fileOrPlaceholderExists($0, root: root) }) else { return nil }
     return paths
+  }
+  /// A deleted folder contributes an absent slot only after its own current
+  /// empty-directory cleanup is approved. This never invents a local receipt.
+  private func acknowledgedAbsentFolderPaths(_ view: SharedLibraryViewSnapshot,
+      additionalPaths: Set<String>, membership: SharedLibraryMembership, completed: [String: String],
+      index: SharedLibraryPathIndex, witness: SharedOwnerWitness, hasPendingWork: Bool,
+      states: [SharedEntityState]) async throws -> Set<String>? {
+    guard view.state.kind == .folder, view.state.lifecycle == .deleted, view.state.conflicts.isEmpty,
+          !hasPendingWork, let owner = try currentFolderIntentOwner(in: view),
+          case .document(let document)? = view.state.value(for: SharedEntityState.fileIntentField(writer: owner)),
+          let intent = try? JSONDecoder().decode(SharedAcceptedFileIntent.self, from: document.json),
+          intent.steps.count == 1, case .removeEmptyDirectory = intent.steps[0] else { return nil }
+    // A missing directory does not resolve a live or competing descendant.
+    for child in states where child.id != view.state.id && (child.kind == .recording || child.kind == .folder) {
+      var parents = child.fields[child.kind == .folder ? "parent" : "folder"]?.values ?? []
+      var visited: Set<UUID> = []
+      while let value = parents.popFirst() {
+        guard case .text(let text) = value, let id = UUID(uuidString: text), visited.insert(id).inserted else { continue }
+        if id == view.state.id {
+          guard child.lifecycle == .deleted, child.conflicts.isEmpty else { return nil }
+          break
+        }
+        if let ancestor = states.first(where: { $0.kind == .folder && $0.id == id }) { parents.formUnion(ancestor.fields["parent"]?.values ?? []) }
+      }
+    }
+    let acknowledgments = try await SharedOperationAcknowledgmentStore(
+      root: root, libraryID: view.libraryID, writer: writerID, witness: witness, gate: gate).load(entity: view.state.id)
+    let permission = SharedMaterializationAuthority(libraryID: view.libraryID, state: view.state,
+      membership: membership, acknowledgments: acknowledgments, hasPendingWork: false, pathOwners: [:])
+    guard permission.mayDestroy(.delete) else { return nil }
+    var paths = additionalPaths.union(try folderDeletionPaths(view.state, library: view.libraryID))
+    for (writer, document, intent) in try SharedPublishedLocations.fileIntents(state: view.state, library: view.libraryID) {
+      guard completed[writer] != SharedLibraryOperation.fingerprint(document.json) else { continue }
+      for step in intent.steps {
+        switch step {
+        case .moveDirectory(let source, let destination, _): paths.formUnion([source, destination])
+        case .createDirectory(let path), .removeEmptyDirectory(let path): paths.insert(path)
+        default: throw SharedLibraryOperationError.invalidReceipt
+        }
+      }
+    }
+    for path in paths { _ = try SharedLibraryIdentity.normalized(path) }
+    paths = Set(paths.filter { path in
+      let owners = index.owners(of: path)
+      return owners.count != 1 || owners.contains(view.state.id)
+    })
+    guard !paths.isEmpty, paths.allSatisfy({ !Self.fileOrPlaceholderExists($0, root: root) }) else { return nil }
+    return paths
+  }
+  private func acknowledgedAbsentChildPaths(_ view: SharedLibraryViewSnapshot,
+      additionalPaths: Set<String>, membership: SharedLibraryMembership, completed: [String: String],
+      index: SharedLibraryPathIndex, witness: SharedOwnerWitness, hasPendingWork: Bool,
+      states: [SharedEntityState]) async throws -> Set<String>? {
+    switch view.state.kind {
+    case .recording:
+      return try await acknowledgedAbsentRecordingPaths(view, additionalPaths: additionalPaths,
+        membership: membership, completed: completed, index: index, witness: witness, hasPendingWork: hasPendingWork)
+    case .folder:
+      return try await acknowledgedAbsentFolderPaths(view, additionalPaths: additionalPaths,
+        membership: membership, completed: completed, index: index, witness: witness,
+        hasPendingWork: hasPendingWork, states: states)
+    case .template: return nil
+    }
   }
   private nonisolated static func fileOrPlaceholderExists(_ path: String, root: URL) -> Bool {
     let url = root.appendingPathComponent(path)
@@ -2578,14 +2653,14 @@ public actor SharedLibraryCoordinator {
       let published = try await SharedPublishedLocations.load(root: root, manifest: manifest, membership: membership, afterLibraryRead: afterPublishedLibraryRead)
       let destination = try? await currentPath(view)
       let oldDestination = progress.operation.steps.compactMap { step -> String? in
-        if case .move(_, let target, _) = step, target.hasSuffix(".mp3") { return target }; return nil
+        if case .move(_, let target, _) = step, SharedRecordingFiles.isAudio(target) { return target }; return nil
       }.first
       if view.state.lifecycle == .alive, let destination, oldDestination == destination,
          published.completedFileIntents[id]?[writerID.uuidString.lowercased()] == SharedLibraryOperation.fingerprint(document.json) { return nil }
       let locations = try published.reservations(states: [view.state], library: view.libraryID)
       for source in locations[id] ?? [] where source != destination {
         let stem = (source as NSString).deletingPathExtension
-        for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+        for suffix in try SharedRecordingFiles.suffixes(forAudioPath: source) {
           let path = stem + suffix
           let url = root.appendingPathComponent(path)
           let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
@@ -2696,14 +2771,14 @@ public actor SharedLibraryCoordinator {
       do { try published.validateCompanion(path: path, bytes: bytes, entity: review.id, library: review.base.libraryID, kind: component.rawValue) }
       catch { throw SharedLibraryOperationError.contentChanged(path) }
       let suffix = "." + component.rawValue + ".json"
-      let recording = String(path.dropLast(suffix.count)) + ".mp3"
+      let recording = String(path.dropLast(suffix.count)) + (try SharedRecordingFiles.audioSuffix(review.base.state))
       let derived = try SharedLibraryReadableExport.derivedCompanions(json: bytes, component: component, recordingPath: recording)
       trustedHashes[path] = hash
       for (name, data) in derived { trustedHashes[name] = SharedLibraryOperation.fingerprint(data) }
       publicationProofs.merge(published.proofs, uniquingKeysWith: { _, new in new })
       publicationProofs[url] = hash
     }
-    let suffixes = [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"]
+    let suffixes = try SharedRecordingFiles.suffixes(for: review.base.state)
     var witnesses: [SharedFilePathWitness] = [], steps: [SharedLibraryOperation.Step] = [], existingTargets: [String] = [], sources: [String] = []
     for suffix in suffixes {
       let candidates = retained.keys.filter { $0.hasSuffix(suffix) }.sorted()
@@ -2739,7 +2814,7 @@ public actor SharedLibraryCoordinator {
         steps.append(.move(source: absentSource, destination: target, fingerprint: expected))
       } else { for source in moving { steps.append(.move(source: source, destination: target, fingerprint: expected)) } }
     }
-    guard deleting ? steps.contains(where: { if case .trash(let path, _) = $0 { return path.hasSuffix(".mp3") }; return false })
+    guard deleting ? steps.contains(where: { if case .trash(let path, _) = $0 { return SharedRecordingFiles.isAudio(path) }; return false })
       : steps.contains(where: { if case .move(_, let target, _) = $0 { return target == destination }; return false }) else { throw SharedLibraryOperationError.invalidOperation }
     _ = try await operationAuthority(entity: review.operation.entity, paths: Array(Set(steps.flatMap { step -> [String] in if case .move(let source, let target, _) = step { return [source, target] }; return [] })))
     try await validateFileReview(review)
@@ -2872,7 +2947,7 @@ public actor SharedLibraryCoordinator {
     guard let progress = try await reader.progress(entity: entity, libraryID: view.libraryID),
           let audio = progress.operation.steps.first(where: {
             switch $0 {
-            case .move(let path, _, _), .trash(let path, _), .publishAudio(let path, _, _), .replaceAudio(let path, _, _, _, _): return path.hasSuffix(".mp3")
+            case .move(let path, _, _), .trash(let path, _), .publishAudio(let path, _, _), .replaceAudio(let path, _, _, _, _): return SharedRecordingFiles.isAudio(path)
             default: return false
             }
           }) else { throw SharedLibraryOperationError.invalidOperation }
@@ -3071,7 +3146,7 @@ public actor SharedLibraryCoordinator {
       guard let destination = index.resolvedPaths[view.state.id] else { continue }
       for source in reservations[view.state.id] ?? [] where source != destination {
         let stem = (source as NSString).deletingPathExtension
-        for suffix in [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"] {
+        for suffix in try SharedRecordingFiles.suffixes(forAudioPath: source) {
           let url = root.appendingPathComponent(stem + suffix)
           absentPaths.append(stem + suffix)
           let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
@@ -3092,7 +3167,7 @@ public actor SharedLibraryCoordinator {
       for (owner, document, intent) in intents {
         guard progress.operation.steps == intent.steps, progress.operation.inputRevision == intent.inputRevision,
               let destination = index.resolvedPaths[view.state.id],
-              let audio = intent.steps.first(where: { if case .move(_, let path, _) = $0 { return path.hasSuffix(".mp3") }; return false }),
+              let audio = intent.steps.first(where: { if case .move(_, let path, _) = $0 { return SharedRecordingFiles.isAudio(path) }; return false }),
               case .move(_, let path, let hash) = audio, path == destination else { continue }
         let file = root.appendingPathComponent(path)
         guard let bytes = try await RecordingFileAccess().readDataIfPresent(at: file, knownToExist: true), SharedLibraryOperation.fingerprint(bytes) == hash else { throw SharedLibraryOperationError.contentChanged(path) }
@@ -3288,12 +3363,13 @@ public actor SharedLibraryCoordinator {
             guard let child = snapshots.first(where: { $0.state.id == member.id }), child.state.lifecycle == .deleted else { continue }
             let relative = String(member.path.dropFirst(scope.destination.count + 1))
             let stems = placements.map { ($0 + "/" + relative as NSString).deletingPathExtension }
-            let suffixes = [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"]
-            let paths = Set(stems.flatMap { stem in suffixes.map { stem + $0 } })
+            let suffixes = member.kind == .recording ? try SharedRecordingFiles.suffixes(forAudioPath: member.path) : []
+            let paths = member.kind == .folder ? Set(placements.map { $0 + "/" + relative })
+              : Set(stems.flatMap { stem in suffixes.map { stem + $0 } })
             guard !validFolderMoves.isEmpty,
-                  let absent = try await acknowledgedAbsentRecordingPaths(.init(libraryID: manifest.libraryID, repository: child),
+                  let absent = try await acknowledgedAbsentChildPaths(.init(libraryID: manifest.libraryID, repository: child),
                     additionalPaths: paths, membership: membership, completed: locations.completedFileIntents[member.id] ?? [:],
-                    index: index, witness: witness, hasPendingWork: result.hasPendingWork) else {
+                    index: index, witness: witness, hasPendingWork: result.hasPendingWork, states: snapshots.map(\.state)) else {
               membersMatch = false; break
             }
             absentChildPaths.formUnion(absent)
@@ -3314,13 +3390,15 @@ public actor SharedLibraryCoordinator {
     if entity.kind == .folder, selected.state.lifecycle == .deleted {
       // Parent removal must not skip a child's returned originals merely
       // because that child already has a completed local Trash receipt.
-      for child in snapshots where child.state.kind == .recording && child.state.lifecycle == .deleted && affected.contains(child.state.id) {
+      for child in snapshots where child.state.id != entity.id && (child.state.kind == .recording || child.state.kind == .folder)
+          && child.state.lifecycle == .deleted && affected.contains(child.state.id) {
         guard let path = index.resolvedPaths[child.state.id] else { result.descendantCleanupIsReady = false; continue }
         let stem = (path as NSString).deletingPathExtension
-        let aliases = Set([".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"].map { stem + $0 })
-        guard let absent = try await acknowledgedAbsentRecordingPaths(.init(libraryID: manifest.libraryID, repository: child),
+        let aliases = child.state.kind == .folder ? Set([path])
+          : Set(try SharedRecordingFiles.suffixes(forAudioPath: path).map { stem + $0 })
+        guard let absent = try await acknowledgedAbsentChildPaths(.init(libraryID: manifest.libraryID, repository: child),
             additionalPaths: aliases, membership: membership, completed: locations.completedFileIntents[child.state.id] ?? [:],
-            index: index, witness: witness, hasPendingWork: result.hasPendingWork) else {
+            index: index, witness: witness, hasPendingWork: result.hasPendingWork, states: snapshots.map(\.state)) else {
           result.descendantCleanupIsReady = false; continue
         }
         absentChildPaths.formUnion(absent)
@@ -3576,7 +3654,7 @@ public actor SharedLibraryCoordinator {
         let proposed = try SharedLibraryPathIndex(states: views.map { $0.state.id == base.state.id ? selected : $0.state }, caseSensitive: sensitive)
         guard let destination = proposed.resolvedPaths[base.state.id], existing.owners(of: destination) == [base.state.id] else { continue }
         let stem = (destination as NSString).deletingPathExtension
-        guard [".mp3", ".transcript.json", ".summary.json", ".txt", ".transcript.md", ".summary.md"].allSatisfy({ existing.owners(of: stem + $0) == [base.state.id] }) else { continue }
+        guard try SharedRecordingFiles.suffixes(forAudioPath: destination).allSatisfy({ existing.owners(of: stem + $0) == [base.state.id] }) else { continue }
         choices.append(.init(destination: destination, values: values, base: base, context: context, cohort: membership.fingerprint))
       }
     }

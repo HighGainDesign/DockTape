@@ -10,9 +10,9 @@ import HiDockKit
     private(set) var isWorking = false
     private(set) var inspectionFailed = false
     private(set) var message: String?
-    private(set) var updatedPlan: SharedFolderReplanReview?
-    private(set) var deletionScope: SharedFolderDeletionScopeReview?
-    private(set) var cleanupPlan: SharedFolderCleanupReview?
+    private(set) var updatedPlan: FileReviewPreview<SharedFolderReplanReview>?
+    private(set) var deletionScope: FileReviewPreview<SharedFolderDeletionScopeReview>?
+    private(set) var cleanupPlan: FileReviewPreview<SharedFolderCleanupReview>?
     private var binding: SharedLibraryCoordinator?
     private var request = UUID()
     private var action: Task<Bool, Never>?
@@ -53,13 +53,14 @@ import HiDockKit
         do {
             let prepared = try await coordinator.prepareFolderReplan(review)
             guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
-            deletionScope = nil; cleanupPlan = nil; updatedPlan = prepared
+            deletionScope = nil; cleanupPlan = nil; updatedPlan = FileReviewPreview(review: prepared)
         } catch {
             if binding === coordinator, request == ticket, !(error is CancellationError) { message = "The directory plan could not be prepared. Reload after sync finishes; existing folders and files are preserved." }
         }
     }
-    @discardableResult func applyUpdatedPlan(using coordinator: SharedLibraryCoordinator) async -> Bool {
-        guard binding === coordinator, !isLoading, !isWorking, let prepared = updatedPlan else { return false }
+    @discardableResult func applyUpdatedPlan(_ preview: FileReviewPreview<SharedFolderReplanReview>, using coordinator: SharedLibraryCoordinator) async -> Bool {
+        guard binding === coordinator, !isLoading, !isWorking, updatedPlan?.id == preview.id else { return false }
+        let prepared = preview.review
         let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
         let task = Task { [weak self] in
             do {
@@ -93,13 +94,14 @@ import HiDockKit
         do {
             let prepared = try await coordinator.prepareFolderDeletionScope(review)
             guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
-            updatedPlan = nil; cleanupPlan = nil; deletionScope = prepared
+            updatedPlan = nil; cleanupPlan = nil; deletionScope = FileReviewPreview(review: prepared)
         } catch {
             if binding === coordinator, request == ticket, !(error is CancellationError) { message = "The child list could not be prepared. Reload after sync finishes; existing files are preserved." }
         }
     }
-    @discardableResult func applyDeletionScope(using coordinator: SharedLibraryCoordinator) async -> Bool {
-        guard binding === coordinator, !isLoading, !isWorking, let prepared = deletionScope else { return false }
+    @discardableResult func applyDeletionScope(_ preview: FileReviewPreview<SharedFolderDeletionScopeReview>, using coordinator: SharedLibraryCoordinator) async -> Bool {
+        guard binding === coordinator, !isLoading, !isWorking, deletionScope?.id == preview.id else { return false }
+        let prepared = preview.review
         let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
         let task = Task { [weak self] in
             do {
@@ -132,13 +134,14 @@ import HiDockKit
         do {
             let prepared = try await coordinator.prepareFolderCleanupPlan(review)
             guard binding === coordinator, request == ticket, !Task.isCancelled else { return }
-            updatedPlan = nil; deletionScope = nil; cleanupPlan = prepared
+            updatedPlan = nil; deletionScope = nil; cleanupPlan = FileReviewPreview(review: prepared)
         } catch {
             if binding === coordinator, request == ticket, !(error is CancellationError) { message = "The cleanup plan is not ready. Finish related pending files and reload; existing directories and rename progress are preserved." }
         }
     }
-    @discardableResult func applyCleanupPlan(using coordinator: SharedLibraryCoordinator) async -> Bool {
-        guard binding === coordinator, !isLoading, !isWorking, let prepared = cleanupPlan else { return false }
+    @discardableResult func applyCleanupPlan(_ preview: FileReviewPreview<SharedFolderCleanupReview>, using coordinator: SharedLibraryCoordinator) async -> Bool {
+        guard binding === coordinator, !isLoading, !isWorking, cleanupPlan?.id == preview.id else { return false }
+        let prepared = preview.review
         let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
         let task = Task { [weak self] in
             do {

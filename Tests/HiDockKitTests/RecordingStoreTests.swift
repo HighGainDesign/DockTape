@@ -18,6 +18,85 @@ final class RecordingStoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: tmpDir)
     }
 
+    func testLegacyMovesPreservePathMetadataAcrossRenameAndRestart() async throws {
+        let original = Data("Synthetic original".utf8)
+        try original.write(to: tmpDir.appendingPathComponent("Clip.mp3"))
+        try await store.setMeta(mode: "Wip", deviceFilename: "synthetic-device.hda", for: "Clip.mp3")
+        try await store.createFolder(named: "Folder")
+        let moved = try await store.moveRecording(filename: "Clip.mp3", toFolder: "Folder")
+        let renamed = try await store.renameRecording(filename: moved, to: "Renamed")
+        let out = try await store.moveRecording(filename: renamed, toFolder: nil)
+        let mode = await store.mode(for: out)
+        XCTAssertEqual(mode, "Wip")
+        let restarted = RecordingStore(baseDirectory: tmpDir); try await restarted.setup()
+        let persisted = await restarted.mode(for: out), imported = await restarted.isImported(deviceFilename: "synthetic-device.hda")
+        XCTAssertEqual(persisted, "Wip"); XCTAssertTrue(imported)
+        XCTAssertEqual(try Data(contentsOf: tmpDir.appendingPathComponent(out)), original)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: tmpDir.appendingPathComponent("library.json"))) as? [String: Any])
+        XCTAssertEqual(Set(object.keys), ["Renamed.mp3"], "Moving metadata must not leave orphan aliases")
+    }
+
+    func testLegacyFolderRenamePreservesNestedMetadataAndUnrelatedSameBasename() async throws {
+        for folder in ["Before/Nested", "Other"] {
+            try FileManager.default.createDirectory(at: tmpDir.appendingPathComponent(folder), withIntermediateDirectories: true)
+            try Data(("Synthetic " + folder).utf8).write(to: tmpDir.appendingPathComponent(folder + "/Clip.mp3"))
+        }
+        try await store.setMeta(mode: "Pho", deviceFilename: "nested-device.hda", for: "Before/Nested/Clip.mp3")
+        try await store.setMeta(mode: "Rec", deviceFilename: "other-device.hda", for: "Other/Clip.mp3")
+        let libraryURL = tmpDir.appendingPathComponent("library.json")
+        var before = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: libraryURL)) as? [String: [String: Any]])
+        before["Before/Nested/Clip.mp3"]?["futureField"] = ["preserve": true]
+        before["Before/Nested/Clip.mp3"]?["recordedAt"] = 12345.0
+        try JSONSerialization.data(withJSONObject: before).write(to: libraryURL)
+        _ = try await store.renameFolder(from: "Before", to: "After")
+        let restarted = RecordingStore(baseDirectory: tmpDir); try await restarted.setup()
+        let nested = await restarted.mode(for: "After/Nested/Clip.mp3"), other = await restarted.mode(for: "Other/Clip.mp3")
+        XCTAssertEqual(nested, "Pho"); XCTAssertEqual(other, "Rec")
+        let imported = await restarted.allImportedDeviceFilenames()
+        XCTAssertEqual(imported, ["nested-device.hda", "other-device.hda"])
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: tmpDir.appendingPathComponent("library.json"))) as? [String: Any])
+        XCTAssertEqual(Set(object.keys), ["After/Nested/Clip.mp3", "Other/Clip.mp3"])
+        let nestedObject = try XCTUnwrap(object["After/Nested/Clip.mp3"] as? [String: Any])
+        XCTAssertEqual(nestedObject["futureField"] as? [String: Bool], ["preserve": true])
+        let entries = await restarted.allRecordings()
+        XCTAssertEqual(entries.first { $0.filename == "After/Nested/Clip.mp3" }?.recordedAt, Date(timeIntervalSinceReferenceDate: 12345))
+    }
+
+    func testCancellationAfterLegacyMoveFinishesMetadataRelocation() async throws {
+        for folderRename in [false, true] {
+            let root = tmpDir.appendingPathComponent(folderRename ? "folder" : "recording")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Before"), withIntermediateDirectories: true)
+            let audio = Data("Owned cancellation fixture".utf8)
+            try audio.write(to: root.appendingPathComponent("Before/Clip.mp3"))
+            let records = RecordingStore(baseDirectory: root); try await records.setup()
+            try await records.setMeta(mode: "Pho", deviceFilename: "synthetic-device.hda", for: "Before/Clip.mp3")
+            let held = expectation(description: "Metadata held after physical move"), release = DispatchSemaphore(value: 0)
+            let holder = Task { try await CoordinatedFileAccess().withWrite(at: root.appendingPathComponent("library.json")) { _ in
+                held.fulfill(); _ = release.wait(timeout: .now() + 8)
+            } }
+            await fulfillment(of: [held], timeout: 1)
+            let moving = Task {
+                if folderRename { _ = try await records.renameFolder(from: "Before", to: "After") }
+                else { _ = try await records.moveRecording(filename: "Before/Clip.mp3", toFolder: nil) }
+            }
+            let destination = folderRename ? "After/Clip.mp3" : "Clip.mp3"
+            for _ in 0..<200 {
+                if FileManager.default.fileExists(atPath: root.appendingPathComponent(destination).path) { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(destination).path))
+            moving.cancel(); release.signal(); try await holder.value
+            do { try await moving.value } catch is CancellationError { }
+            let restarted = RecordingStore(baseDirectory: root); try await restarted.setup()
+            let mode = await restarted.mode(for: destination), imported = await restarted.isImported(deviceFilename: "synthetic-device.hda")
+            XCTAssertEqual(mode, "Pho", "A completed physical move must finish its metadata rekey despite cancellation")
+            XCTAssertTrue(imported)
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("library.json"))) as? [String: Any])
+            XCTAssertEqual(Set(object.keys), [destination])
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(destination)), audio)
+        }
+    }
+
     func testSetupCreatesDirectory() async throws {
         XCTAssertTrue(FileManager.default.fileExists(atPath: tmpDir.path))
     }

@@ -28,7 +28,21 @@ struct DockTapeSharedLibraryTests {
     }
     @MainActor static func main() async {
         do {
-            if CommandLine.arguments.contains("--bootstrap-continuation-only") {
+            if CommandLine.arguments.contains("--queued-content-edit-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeQueuedContent-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await queuedContentEditChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--unpublished-content-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeUnpublishedContent-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                for action in [ColdMetadataAction.complete, .stop, .switchLibrary] {
+                    try await coldMetadataStartupChecks(parent: parent.appendingPathComponent(String(describing: action)), action: action, unpublishedContent: true)
+                }
+            } else if CommandLine.arguments.contains("--bootstrap-continuation-only") {
                 _ = NSApplication.shared
                 UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
                 let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeBootstrapContinuation-" + UUID().uuidString)
@@ -170,14 +184,25 @@ struct DockTapeSharedLibraryTests {
         try expect(state.sharedLibrary.coordinator != nil, "All shared stores must use one coordinator")
         let entity = try await state.sharedLibrary.coordinator!.recording(at: "Meeting.mp3").state.id
         let playbackCoordinator = state.sharedLibrary.coordinator!
+        guard let selected = state.library.recordings.first(where: { $0.filename == "Meeting.mp3" }), let selectedReference = selected.reference else {
+            throw Failure(description: "Shared playback selection needs a captured reference")
+        }
+        state.playRecording(selected)
+        try expect(state.playback.requestedReference == selectedReference, "AppState must pass the selected recording ID into playback")
+        let playbackDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while state.playback.isPreparing {
+            guard ContinuousClock.now < playbackDeadline else { state.playback.stop(); throw Failure(description: "Synthetic playback preparation did not settle") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        state.playback.stop()
         let gate = Gate()
         let heldPlayer = PlaybackState(prepareFile: { _, _ in await gate.wait(); return true })
-        heldPlayer.acquireLease = { filename, _ in
-            let view = try await playbackCoordinator.recording(at: filename)
+        heldPlayer.acquireLease = { filename, _, reference in
+            let view = try await playbackCoordinator.recording(at: filename, reference: reference)
             let token = try await playbackCoordinator.pinJob(.init(id: view.state.id, kind: .recording))
             return .init(validate: { try await playbackCoordinator.validateJob(token) }, release: { await playbackCoordinator.finishJob(token) })
         }
-        heldPlayer.play(file: "Meeting.mp3", url: root.appendingPathComponent("Meeting.mp3"))
+        heldPlayer.play(file: "Meeting.mp3", url: root.appendingPathComponent("Meeting.mp3"), reference: selectedReference)
         let playerDeadline = ContinuousClock.now.advanced(by: .seconds(3))
         while !(await gate.waiting) {
             guard ContinuousClock.now < playerDeadline else { throw Failure(description: "Playback preparation did not start") }
@@ -306,9 +331,13 @@ struct DockTapeSharedLibraryTests {
         try await batchDeleteChecks(parent: parent.appendingPathComponent("normal-batch"), switchLibrary: false)
         try await batchDeleteChecks(parent: parent.appendingPathComponent("late-batch"), switchLibrary: true)
         try await publicationOverlapChecks(parent: parent.appendingPathComponent("publication-overlap"))
+        try await queuedContentEditChecks(parent: parent.appendingPathComponent("queued-content"))
         try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-metadata"))
         try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-stop"), action: .stop)
         try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-switch"), action: .switchLibrary)
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("unpublished-complete"), unpublishedContent: true)
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("unpublished-stop"), action: .stop, unpublishedContent: true)
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("unpublished-switch"), action: .switchLibrary, unpublishedContent: true)
         try await coldMetadataRefreshChecks(parent: parent.appendingPathComponent("cold-refresh"))
         try await coldMetadataRetryChecks(parent: parent.appendingPathComponent("cold-retry"))
         try await backgroundMetadataChecks(parent: parent.appendingPathComponent("background-metadata"))
@@ -431,25 +460,102 @@ struct DockTapeSharedLibraryTests {
     }
 
     enum ColdMetadataAction { case complete, stop, switchLibrary }
-    @MainActor static func coldMetadataStartupChecks(parent: URL, deletedOnly: Bool = false, action: ColdMetadataAction = .complete) async throws {
+    @MainActor static func queuedContentEditChecks(parent: URL) async throws {
+        let a = parent.appendingPathComponent("a"), b = parent.appendingPathComponent("b")
+        let segments = [Transcript.Segment(startTime: 0, endTime: 1, text: "Synthetic", speakerID: "s"),
+                        Transcript.Segment(startTime: 1, endTime: 2, text: "Other", speakerID: "other")]
+        let item = Summary.Item(text: "Owned action")
+        func seed(_ root: URL, _ filename: String) async throws {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try Data("Owned queued edit original".utf8).write(to: root.appendingPathComponent(filename))
+            try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: filename, transcriptionModel: "fixture", hasSpeakerLabels: true,
+                segments: segments, speakerNames: ["s": "Original", "other": "Other"]), mp3Filename: filename)
+            try await SummaryStore(baseDirectory: root).save(Summary(recordingFilename: filename, model: "fixture", provider: "fixture", templateUsed: "fixture",
+                sections: [.init(heading: "Action Items", content: "", items: [item])]), mp3Filename: filename)
+        }
+        try await seed(a, "Meeting.mp3"); try await seed(b, "Meeting.mp3")
+        let state = AppState(baseDirectory: a); try await state.setup()
+        _ = await state.library.transcript(for: "Meeting.mp3")
+        _ = await state.summarization.summaryStore.summary(for: "Meeting.mp3")
+        let selected = state.library.recordings.first!
+        let edit = state.recordingEditRequest(for: selected)
+        let actions: [AppState.RecordingEdit] = [.names(["s": "Wrong library name"]), .split(segments[0].id, true), .merge("s", "other"), .toggle(item.id)]
+        let deferred = { for action in actions { _ = await state.editRecording(edit, action: action) } }
+        try expect(await state.switchStorageLocation(to: .custom, customURL: b), "Switch before deferred content edit")
+        _ = await state.library.transcript(for: "Meeting.mp3")
+        _ = await state.summarization.summaryStore.summary(for: "Meeting.mp3")
+        let transcriptBytes = try Data(contentsOf: b.appendingPathComponent("Meeting.transcript.json"))
+        let summaryBytes = try Data(contentsOf: b.appendingPathComponent("Meeting.summary.json"))
+        await deferred()
+        try expect(try Data(contentsOf: b.appendingPathComponent("Meeting.transcript.json")) == transcriptBytes, "A queued speaker edit must not modify a replacement library")
+        try expect(try Data(contentsOf: b.appendingPathComponent("Meeting.summary.json")) == summaryBytes, "A queued summary edit must not modify a replacement library")
+        await state.sharedLibrary.close()
+
+        let sharedRoot = parent.appendingPathComponent("shared")
+        try await seed(sharedRoot, "Meeting.mp3"); try await seed(sharedRoot, "Other.mp3")
+        let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("writer.json"), installationAnchor: "queued content fixture").load()
+        }
+        let shared = AppState(baseDirectory: sharedRoot, sharedIdentity: identity, sharedWitnessDirectory: parent.appendingPathComponent("witnesses"))
+        try await shared.setup(); try expect(await shared.enableSharedLibrary(), "Enable owned same-name edit fixture")
+        let coordinator = shared.sharedLibrary.coordinator!
+        await coordinator.stopMonitoring()
+        let old = shared.library.recordings.first { $0.filename == "Meeting.mp3" }!
+        _ = try await shared.library.transcriptStore.loadTranscript(for: old.filename, reference: old.reference)
+        _ = try await shared.summarization.summaryStore.loadSummary(for: old.filename, reference: old.reference)
+        let oldEdit = shared.recordingEditRequest(for: old)
+        _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Former", reference: old.reference)
+        let replacement = try await coordinator.reference(to: "Other.mp3")
+        _ = try await coordinator.relocateRecording(filename: "Other.mp3", title: "Meeting", reference: replacement)
+        _ = await shared.library.refresh()
+        _ = try await shared.library.transcriptStore.loadTranscript(for: "Meeting.mp3", reference: replacement)
+        _ = try await shared.summarization.summaryStore.loadSummary(for: "Meeting.mp3", reference: replacement)
+        let before = try await coordinator.recording(at: "Meeting.mp3", reference: replacement)
+        for action in actions { _ = await shared.editRecording(oldEdit, action: action) }
+        let after = try await coordinator.recording(at: "Meeting.mp3", reference: replacement)
+        try expect(after.state == before.state, "All deferred edit actions preserve a same-name replacement recording")
+        let current = shared.library.recordings.first { $0.reference == replacement }!
+        let accepted = await shared.editRecording(shared.recordingEditRequest(for: current), action: .names(["s": "Current name", "other": "Other"]))
+        try expect(accepted, "A current captured editor still saves")
+        let updated = try await shared.library.transcriptStore.loadTranscript(for: "Meeting.mp3", reference: replacement)
+        try expect(updated?.speakerNames["s"] == "Current name", "Current editor persists through shared authority")
+        await shared.sharedLibrary.close()
+        print("Queued names/split/merge/checkbox edits preserve replacement library and stable identity; current editor saves.")
+    }
+
+    @MainActor static func coldMetadataStartupChecks(parent: URL, deletedOnly: Bool = false, action: ColdMetadataAction = .complete, unpublishedContent: Bool = false) async throws {
         for deleted in deletedOnly ? [true] : [false, true] {
             let folder = parent.appendingPathComponent(deleted ? "deleted" : "alive")
             let root = folder.appendingPathComponent("library")
             try FileManager.default.createDirectory(at: root.appendingPathComponent("Empty"), withIntermediateDirectories: true)
             for name in ["A.mp3", "B.mp3"] {
                 try Data("synthetic cold metadata original".utf8).write(to: root.appendingPathComponent(name))
-                try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: name, transcriptionModel: "fixture", hasSpeakerLabels: false,
-                    segments: [.init(startTime: 0, endTime: 1, text: "Resident " + name)]), mp3Filename: name)
+                if !unpublishedContent || name != "B.mp3" {
+                    try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: name, transcriptionModel: "fixture", hasSpeakerLabels: false,
+                        segments: [.init(startTime: 0, endTime: 1, text: "Resident " + name)]), mp3Filename: name)
+                }
             }
-            try await SummaryStore(baseDirectory: root).save(Summary(recordingFilename: "B.mp3", model: "fixture", provider: "fixture", templateUsed: "fixture",
-                sections: [.init(heading: "Summary", content: "Resident B summary")]), mp3Filename: "B.mp3")
+            if !unpublishedContent {
+                try await SummaryStore(baseDirectory: root).save(Summary(recordingFilename: "B.mp3", model: "fixture", provider: "fixture", templateUsed: "fixture",
+                    sections: [.init(heading: "Summary", content: "Resident B summary")]), mp3Filename: "B.mp3")
+            }
             let identity = try await SharedLibraryWriterIdentityStore(file: folder.appendingPathComponent("identity.json"), installationAnchor: "cold metadata fixture").load()
             let witnesses = folder.appendingPathComponent("witnesses")
             let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: witnesses)
             _ = try await seed.enable()
             let a = try await seed.recording(at: "A.mp3")
             if deleted { _ = try await seed.edit(.init(base: a, changes: [.delete])) }
-            _ = try await seed.projectOutputs()
+            if unpublishedContent {
+                try await TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: seed)).save(
+                    Transcript(recordingFilename: "B.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+                        segments: [.init(startTime: 0, endTime: 1, text: "Resident B.mp3")]), mp3Filename: "B.mp3")
+                try await SummaryStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: seed)).save(
+                    Summary(recordingFilename: "B.mp3", model: "fixture", provider: "fixture", templateUsed: "fixture",
+                        sections: [.init(heading: "Summary", content: "Resident B summary")]), mp3Filename: "B.mp3")
+                try expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("B.transcript.json").path)
+                    && !FileManager.default.fileExists(atPath: root.appendingPathComponent("B.summary.json").path),
+                    "Accepted first generations must still be awaiting output publication")
+            } else { _ = try await seed.projectOutputs() }
             let audioA = try Data(contentsOf: root.appendingPathComponent("A.mp3"))
             let head = root.appendingPathComponent(".docktape/records/" + a.state.id.uuidString.lowercased() + "/" + identity.writer.uuidString.lowercased() + ".json")
             let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)

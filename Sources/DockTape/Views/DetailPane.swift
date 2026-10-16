@@ -124,7 +124,7 @@ struct DetailPane: View {
             tabContent(for: rec)
         }
         .task(id: "\(contentID(for: rec.filename))|\(transcriptRetry)") {
-            guard await reloadTranscript(for: rec.filename) else { return }
+            guard await reloadTranscript(for: rec) else { return }
             guard !Task.isCancelled, state.library.selectedRecording == rec.filename else { return }
 
             if !userHasPickedTab {
@@ -147,7 +147,7 @@ struct DetailPane: View {
             // Reload transcript and auto-switch when transcription completes
             if newStatus == .done {
                 Task {
-                    guard await reloadTranscript(for: rec.filename) else { return }
+                    guard await reloadTranscript(for: rec) else { return }
                     programmaticTabSwitchCount += 1
                     state.selectedDetailTab = .transcript
                 }
@@ -250,12 +250,13 @@ struct DetailPane: View {
         state.library.contentID(for: filename, fallbackRevision: state.sharedLibrary.revision)
     }
 
-    private func reloadTranscript(for filename: String) async -> Bool {
+    private func reloadTranscript(for recording: RecordingMetadata) async -> Bool {
+        let filename = recording.filename
         let identity = contentID(for: filename)
         guard !Task.isCancelled, state.library.selectedRecording == filename else { return false }
         let store = state.library.transcriptStore
         await transcriptState.load(for: identity) { waiting in
-            try await store.loadTranscript(for: filename, onWaiting: waiting)
+            try await store.loadTranscript(for: filename, reference: recording.reference, onWaiting: waiting)
         }
         return !Task.isCancelled && state.library.selectedRecording == filename
             && contentID(for: filename) == identity && transcriptState.filename == identity
@@ -282,6 +283,7 @@ struct DetailPane: View {
 
         case .transcript:
             if transcriptLoadedFor == contentID(for: rec.filename), !transcriptState.isLoading, let transcript {
+                let editRequest = state.recordingEditRequest(for: rec)
                 TranscriptViewer(
                     transcript: transcript,
                     playbackState: state.playback.playingFile == rec.filename ? state.playback : nil,
@@ -295,20 +297,17 @@ struct DetailPane: View {
                     },
                     onSaveSpeakerNames: { names in
                         Task {
-                            await state.updateSpeakerNames(for: rec.filename, names: names)
-                            _ = await reloadTranscript(for: rec.filename)
+                            if await state.editRecording(editRequest, action: .names(names)) { _ = await reloadTranscript(for: rec) }
                         }
                     },
                     onSplitSpeaker: { segID, allFollowing in
                         Task {
-                            try? await state.library.transcriptStore.splitSpeaker(for: rec.filename, segmentID: segID, allFollowing: allFollowing)
-                            _ = await reloadTranscript(for: rec.filename)
+                            if await state.editRecording(editRequest, action: .split(segID, allFollowing)) { _ = await reloadTranscript(for: rec) }
                         }
                     },
                     onMergeSpeaker: { sourceSID, targetSID in
                         Task {
-                            try? await state.library.transcriptStore.mergeSpeakers(for: rec.filename, source: sourceSID, into: targetSID)
-                            _ = await reloadTranscript(for: rec.filename)
+                            if await state.editRecording(editRequest, action: .merge(sourceSID, targetSID)) { _ = await reloadTranscript(for: rec) }
                         }
                     }
                 )

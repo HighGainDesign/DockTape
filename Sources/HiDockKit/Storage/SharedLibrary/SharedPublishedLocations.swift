@@ -41,9 +41,9 @@ struct SharedPublishedLocations: Sendable {
                 for (path, hash) in intent.retainedFiles ?? [:] {
                     _ = try SharedLibraryIdentity.normalized(path)
                     guard SharedLibraryOperation.validHash(hash) else { throw SharedLibraryOperationError.invalidReceipt }
-                    let suffixes = [".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".mp3", ".txt"]
-                    guard let suffix = suffixes.first(where: { path.hasSuffix($0) }) else { throw SharedLibraryOperationError.invalidOperation }
-                    result[state.id, default: []].insert(String(path.dropLast(suffix.count)) + ".mp3")
+                    guard let suffix = SharedRecordingFiles.suffix(of: path) else { throw SharedLibraryOperationError.invalidOperation }
+                    let audio = SharedRecordingFiles.isAudio(path) ? path : String(path.dropLast(suffix.count)) + (try SharedRecordingFiles.audioSuffix(state))
+                    result[state.id, default: []].insert(audio)
                 }
                 for step in intent.steps {
                     let paths: [String]
@@ -53,9 +53,8 @@ struct SharedPublishedLocations: Sendable {
                     default: throw SharedLibraryOperationError.invalidOperation
                     }
                     for path in paths {
-                        let suffixes = [".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".mp3", ".txt"]
-                        guard let suffix = suffixes.first(where: { path.hasSuffix($0) }) else { throw SharedLibraryOperationError.invalidOperation }
-                        let audio = String(path.dropLast(suffix.count)) + ".mp3"
+                        guard let suffix = SharedRecordingFiles.suffix(of: path) else { throw SharedLibraryOperationError.invalidOperation }
+                        let audio = SharedRecordingFiles.isAudio(path) ? path : String(path.dropLast(suffix.count)) + (try SharedRecordingFiles.audioSuffix(state))
                         _ = try SharedLibraryIdentity.normalized(audio)
                         result[state.id, default: []].insert(audio)
                     }

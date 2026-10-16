@@ -28,6 +28,66 @@ final class SharedLibraryProjectionWriterTests: XCTestCase {
         _ = try await coordinator.enable()
         return (root, coordinator)
     }
+    func testPublicationRejectsFolderSymlinkIntroducedWhileAwaitingCoordination() async throws {
+        try await checkChangedPublicationParent(registry: false, atOutput: false)
+    }
+    func testPublicationRejectsRegistrySymlinkIntroducedWhileAwaitingCoordination() async throws {
+        try await checkChangedPublicationParent(registry: true, atOutput: false)
+    }
+    func testPublicationRejectsFolderSymlinkIntroducedAtOutputBoundary() async throws {
+        try await checkChangedPublicationParent(registry: false, atOutput: true)
+    }
+    private func checkChangedPublicationParent(registry: Bool, atOutput: Bool) async throws {
+        let fm = FileManager.default
+        let parent = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        roots.append(parent)
+        let root = parent.appendingPathComponent("library"), folder = root.appendingPathComponent("Folder")
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let originalAudio = Data("Synthetic audio must remain unchanged".utf8)
+        try originalAudio.write(to: folder.appendingPathComponent("Clip.mp3"))
+        let transcript = Transcript(recordingFilename: "Folder/Clip.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Keep this synthetic transcript inside the library")])
+        try await TranscriptStore(baseDirectory: root).save(transcript, mp3Filename: "Folder/Clip.mp3")
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        _ = try await coordinator.enable(); _ = try await coordinator.projectOutputs()
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Folder/Clip.mp3").entityID, kind: .recording)
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        let changed = Transcript(recordingFilename: "Folder/Clip.mp3", transcriptionModel: "changed fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Changed synthetic transcript")])
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [
+            .generation(try SharedDocument(id: UUID(), json: encoder.encode(changed)), component: .transcript)
+        ]))
+        let source = registry ? root.appendingPathComponent(".docktape/projections") : folder
+        let outside = parent.appendingPathComponent("outside"), aside = parent.appendingPathComponent("aside")
+        try fm.copyItem(at: source, to: outside)
+        let sentinel = Data("Unrelated outside file; preserve exact bytes".utf8)
+        let sentinelURL = outside.appendingPathComponent(registry ? coordinator.writerID.uuidString.lowercased() + ".json" : "Clip.transcript.md")
+        if !registry { try sentinel.write(to: sentinelURL) }
+        let outsideBefore = try Data(contentsOf: sentinelURL)
+        let outsideFiles = try Dictionary(uniqueKeysWithValues: fm.contentsOfDirectory(at: outside, includingPropertiesForKeys: nil).map { ($0.lastPathComponent, try Data(contentsOf: $0)) })
+        let registryURL = root.appendingPathComponent(".docktape/projections/" + coordinator.writerID.uuidString.lowercased() + ".json")
+        let registryBefore = try Data(contentsOf: registryURL)
+        let replace: @Sendable () throws -> Void = {
+            try FileManager.default.moveItem(at: source, to: aside)
+            try FileManager.default.createSymbolicLink(at: source, withDestinationURL: outside)
+        }
+        do {
+            if atOutput {
+                _ = try await coordinator.projectOutputs(beforeOutput: { index in if index == 2 { try replace() } })
+            } else {
+                _ = try await coordinator.projectOutputs(beforeWrite: { try? replace() })
+            }
+            XCTFail("A changed parent must not redirect publication outside its original library scope")
+        } catch SharedLibraryOperationError.unsafePath { }
+        catch SharedProjectionWriteError.stale { }
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: source.path), outside.path)
+        XCTAssertEqual(try Data(contentsOf: sentinelURL), outsideBefore)
+        for (name, data) in outsideFiles { XCTAssertEqual(try Data(contentsOf: outside.appendingPathComponent(name)), data, "Outside file changed: \(name)") }
+        if !atOutput { XCTAssertEqual(try Data(contentsOf: registry ? aside.appendingPathComponent(registryURL.lastPathComponent) : registryURL), registryBefore,
+            "Reject an escaped output before publishing any intent") }
+        if !registry { XCTAssertEqual(try Data(contentsOf: outside.appendingPathComponent("Clip.mp3")), originalAudio) }
+    }
+
     func testInterruptedBootstrapAggregateHasExplicitRecovery() async throws {
         struct Interrupted: Error {}
         for output in [1, 5] {

@@ -1,6 +1,7 @@
 // © 2026 High Gain Design. All rights reserved.
 
 import Foundation
+import HiDockKit
 
 /// Exercises the app's real AVPlayer state; the SPM suite covers HiDockKit only.
 @main
@@ -47,8 +48,9 @@ struct DockTapePlaybackTests {
         try expect(playback.playingFile == nil && playback.segmentTimestamps.isEmpty,
                    "Stopping must clear the timeline and ignore pending transcript loads")
         try await cloudPlaybackChecks(url: audioURL)
+        try await stableReferencePlaybackChecks(url: audioURL)
         try await selectionLoadingChecks()
-        print("Playback and selected-content regression checks passed (original9 + cloud/cancellation/selection checks).")
+        print("Playback and selected-content regression checks passed (original9 + cloud/cancellation/selection and shared identity/retry checks).")
     }
 
     private actor Gate {
@@ -133,6 +135,45 @@ struct DockTapePlaybackTests {
         try await waitUntil { failing.loadError != nil }
         try expect(!failing.isPlaying && !failing.isPreparing, "Playback errors must exit the waiting state")
         failing.stop()
+    }
+
+    @MainActor
+    private static func stableReferencePlaybackChecks(url: URL) async throws {
+        let parent = url.deletingLastPathComponent().appendingPathComponent("shared-playback")
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let audio = try Data(contentsOf: url)
+        for name in ["Meeting.mp3", "Other.mp3"] { try audio.write(to: root.appendingPathComponent(name)) }
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        _ = try await coordinator.enable()
+        let selected = try await coordinator.reference(to: "Meeting.mp3")
+        let other = try await coordinator.reference(to: "Other.mp3")
+        actor Attempts { var count = 0; func next() -> Int { count += 1; return count } }
+        let attempts = Attempts()
+        let player = PlaybackState(prepareFile: { _, _ in
+            if await attempts.next() == 1 { throw CocoaError(.fileReadNoPermission) }
+            return true
+        })
+        player.acquireLease = { filename, _, reference in
+            guard let reference else { throw SharedLibraryCoordinatorError.differentBinding }
+            let view = try await coordinator.recording(at: filename, reference: reference)
+            let token = try await coordinator.pinJob(.init(id: view.state.id, kind: .recording))
+            return .init(validate: { try await coordinator.validateJob(token) }, release: { await coordinator.finishJob(token) })
+        }
+        player.play(file: "Meeting.mp3", url: root.appendingPathComponent("Meeting.mp3"), reference: selected)
+        try await waitUntil { player.loadError != nil }
+        try expect(player.requestedReference == selected, "A failed preparation retains the selected ID for Retry")
+        player.retry()
+        try await waitUntil { player.avPlayer != nil || player.loadError != nil }
+        try expect(player.avPlayer != nil && player.loadError == nil && player.requestedReference == selected,
+            "Retry must reacquire authority for the same selected recording")
+        player.play(file: "Meeting.mp3", url: root.appendingPathComponent("Meeting.mp3"), reference: other)
+        try await waitUntil { player.loadError != nil }
+        try expect(player.avPlayer == nil && player.requestedReference == other,
+            "Reusing a filename with another ID must begin a new validated request and reject its path mismatch")
+        player.stop()
+        try expect(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")) == audio,
+            "Playback and rejected selection preserve original bytes")
     }
 
     @MainActor

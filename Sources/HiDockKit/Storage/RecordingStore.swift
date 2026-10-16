@@ -108,7 +108,13 @@ public actor RecordingStore {
         }
         let oldURL = baseDirectory.appendingPathComponent(oldName)
         let newURL = baseDirectory.appendingPathComponent(sanitized)
+        let metadataMoves = Dictionary(uniqueKeysWithValues:
+            LibraryFileDiscovery.files(in: oldURL, relativeTo: baseDirectory, suffix: ".mp3").map { file in
+                (metadataKey(for: file.relativePath), sanitized + String(file.relativePath.dropFirst(oldName.count)))
+            })
+        try Task.checkCancellation()
         try FileManager.default.moveItem(at: oldURL, to: newURL)
+        try await relocateLegacyMetadata(metadataMoves)
         return sanitized
     }
 
@@ -202,9 +208,11 @@ public actor RecordingStore {
         guard filename != newFilename else { return filename }
         try requireAvailableRecordingPath(newFilename)
 
+        let oldMetadataKey = metadataKey(for: filename)
         // Move the MP3 file
         let oldMP3 = oldDir.appendingPathComponent(basename)
         let newMP3 = newDir.appendingPathComponent(basename)
+        try Task.checkCancellation()
         try fm.moveItem(at: oldMP3, to: newMP3)
 
         // Move associated sidecar files (best effort)
@@ -216,6 +224,7 @@ public actor RecordingStore {
             }
         }
 
+        try await relocateLegacyMetadata([oldMetadataKey: newFilename])
         return newFilename
     }
 
@@ -486,6 +495,7 @@ public actor RecordingStore {
             guard outcome.result == .complete else { throw SharedLibraryOperationError.unfinishedOperation }
             metadataTicket += 1
             meta.removeValue(forKey: outcome.filename); metaBaseline.removeValue(forKey: outcome.filename); recordingReferences.removeValue(forKey: outcome.filename)
+            acceptedTranscripts.remove(outcome.filename); acceptedSummaries.remove(outcome.filename)
             return
         }
         if reference != nil { throw SharedLibraryCoordinatorError.differentBinding }
@@ -604,6 +614,9 @@ public actor RecordingStore {
         meta[outcome.filename] = accepted; metaBaseline[outcome.filename] = accepted
         recordingReferences.removeValue(forKey: previous)
         recordingReferences[outcome.filename] = .init(libraryID: outcome.view.libraryID, entityID: outcome.view.state.id)
+        acceptedTranscripts.remove(previous); acceptedSummaries.remove(previous)
+        if !outcome.view.state.generationValues(for: .transcript).isEmpty { acceptedTranscripts.insert(outcome.filename) }
+        if !outcome.view.state.generationValues(for: .summary).isEmpty { acceptedSummaries.insert(outcome.filename) }
         return outcome.filename
     }
 
@@ -630,6 +643,14 @@ public actor RecordingStore {
     /// Semantic revisions for independently loaded shared recordings. Maintenance
     /// acknowledgments and unrelated entity progress do not invalidate editors.
     public func contentRevisions() -> [String: String] { recordingContentRevisions }
+    private var contentObservation: UInt64 = 0
+    private var contentIsComplete = false
+    private var acceptedTranscripts: Set<String> = []
+    private var acceptedSummaries: Set<String> = []
+    func sharedContentFilenames(_ component: SharedComponent, coordinator: SharedLibraryCoordinator) throws -> SharedContentPresence {
+        guard shared?.coordinator === coordinator else { throw SharedLibraryCoordinatorError.differentBinding }
+        return .init(filenames: component == .transcript ? acceptedTranscripts : acceptedSummaries, observation: contentObservation, isComplete: contentIsComplete)
+    }
     private var sharedVisibility: SharedRecordingMetadataAdapter.Visibility?
     private var metadataTicket: UInt64 = 0
 
@@ -643,7 +664,7 @@ public actor RecordingStore {
                 progress = { catalog in await self.acceptProgress(catalog, ticket: ticket, onProgress: onProgress) }
             } else { progress = nil }
             let loaded = try await shared.loadCatalog(onProgress: progress)
-            if metadataTicket == ticket { meta = loaded.metadata; metaBaseline = loaded.metadata; recordingReferences = loaded.references; sharedVisibility = loaded.visibility; recordingContentRevisions = loaded.revisions; folderReferences = loaded.folderReferences }
+            if metadataTicket == ticket { meta = loaded.metadata; metaBaseline = loaded.metadata; recordingReferences = loaded.references; sharedVisibility = loaded.visibility; recordingContentRevisions = loaded.revisions; folderReferences = loaded.folderReferences; acceptedTranscripts = loaded.transcripts; acceptedSummaries = loaded.summaries; contentObservation = loaded.observation; contentIsComplete = loaded.isComplete }
             return
         }
         let url = baseDirectory.appendingPathComponent("library.json")
@@ -669,6 +690,7 @@ public actor RecordingStore {
         guard metadataTicket == ticket, !Task.isCancelled else { return }
         meta = catalog.metadata; metaBaseline = catalog.metadata
         recordingReferences = catalog.references; sharedVisibility = catalog.visibility; recordingContentRevisions = catalog.revisions; folderReferences = catalog.folderReferences
+        acceptedTranscripts = catalog.transcripts; acceptedSummaries = catalog.summaries; contentObservation = catalog.observation; contentIsComplete = catalog.isComplete
         await onProgress()
     }
 
@@ -719,6 +741,27 @@ public actor RecordingStore {
                     object[change.key] = current
                 }
             }
+        let loaded = try JSONDecoder().decode([String: RecordingMeta].self, from: bytes)
+        if metadataTicket == ticket { meta = loaded; metaBaseline = loaded }
+    }
+
+    /// Re-key the latest raw entries under coordination. Moving the cached
+    /// typed value would discard unknown fields and edits from another store.
+    /// Callers capture old keys while the old physical names still exist.
+    private func relocateLegacyMetadata(_ paths: [String: String]) async throws {
+        guard !paths.isEmpty else { return }
+        metadataTicket += 1; let ticket = metadataTicket
+        // The files have already moved. Finish this bounded metadata commit even
+        // when the caller cancels; cancellation must not manufacture a rollback.
+        let root = baseDirectory
+        let bytes = try await Task.detached {
+            try await LegacyLibraryFileAccess().mutateObject(
+            at: root.appendingPathComponent("library.json"), root: root) { object in
+                let values = paths.compactMap { source, destination in object[source].map { (source, destination, $0) } }
+                for (source, _, _) in values { object.removeValue(forKey: source) }
+                for (_, destination, value) in values { object[destination] = value }
+            }
+        }.value
         let loaded = try JSONDecoder().decode([String: RecordingMeta].self, from: bytes)
         if metadataTicket == ticket { meta = loaded; metaBaseline = loaded }
     }

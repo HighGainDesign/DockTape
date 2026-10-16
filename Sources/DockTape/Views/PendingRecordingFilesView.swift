@@ -91,7 +91,8 @@ struct PendingRecordingFilesView: View {
             if let message = model.message { Text(message).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding([.horizontal, .top]) }
             HStack { Button("Close", action: onClose).keyboardShortcut(.cancelAction); Spacer() }.padding()
         }.frame(minWidth: 640, minHeight: 420)
-        .sheet(item: Binding(get: { model.updatedPlan }, set: { if $0 == nil { model.dismissUpdatedPlan() } })) { plan in
+        .sheet(item: Binding(get: { model.updatedPlan }, set: { if $0 == nil { model.dismissUpdatedPlan() } })) { preview in
+            let plan = preview.review
             VStack(alignment: .leading, spacing: 16) {
                 Text("Review Updated File Plan").font(.title2)
                 Text(plan.isDeletion ? "Review deletion cleanup for the remaining files. Removal waits for approval from participating Macs." : "Move the available recording and companion files to the current recording location.")
@@ -111,7 +112,7 @@ struct PendingRecordingFilesView: View {
                     Button("Apply Updated Plan") {
                         guard let coordinator = state.sharedLibrary.coordinator else { return }
                         Task {
-                            if await model.applyUpdatedPlan(using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() }
+                            if await model.applyUpdatedPlan(preview, using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() }
                         }
                     }.keyboardShortcut(.defaultAction).disabled(model.isWorking || model.isLoading)
                 }

@@ -19,14 +19,48 @@ public actor SummaryStore {
         self.shared = shared
     }
 
-    /// Set of MP3 filenames that have summary files on disk.
+    /// Filenames with known content: accepted shared generations or legacy sidecar names.
     private var knownFiles: Set<String> = []
+    private var presenceRequest = UUID()
+    private var presenceObservations: [String: UInt64] = [:]
+    private var completePresenceObservation: UInt64 = 0
+    private var contentReadRequests: [String: UUID] = [:]
 
-    /// Scan for summary files (existence only, no parsing). Fast startup.
-    public func loadAll() throws {
-        knownFiles = Set(LibraryFileDiscovery.files(in: baseDirectory, suffix: ".summary.json").map {
-            String($0.relativePath.dropLast(".summary.json".count)) + ".mp3"
-        })
+    /// Legacy libraries scan sidecar names. Shared libraries use accepted
+    /// generations, including an interrupted first publication with no sidecar.
+    /// A supplied catalog must belong to this exact coordinator and root.
+    public func loadAll(from recordingStore: RecordingStore? = nil) async throws {
+        let request = UUID(); presenceRequest = request
+        guard let shared else {
+            if let recordingStore, recordingStore.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() != baseDirectory.standardizedFileURL.resolvingSymlinksInPath() {
+                throw SharedLibraryCoordinatorError.differentBinding
+            }
+            knownFiles = Set(LibraryFileDiscovery.files(in: baseDirectory, suffix: ".summary.json").map {
+                String($0.relativePath.dropLast(".summary.json".count)) + ".mp3"
+            })
+            return
+        }
+        try shared.requireRoot(baseDirectory)
+        let before = revisions
+        let presence: SharedContentPresence
+        if let recordingStore {
+            presence = try await recordingStore.sharedContentFilenames(.summary, coordinator: shared.coordinator)
+        } else { presence = try await shared.contentFilenames(.summary) }
+        try Task.checkCancellation()
+        guard presenceRequest == request, presence.observation >= completePresenceObservation else { return }
+        // A complete absence also covers filenames this store has never seen.
+        if presence.isComplete { completePresenceObservation = presence.observation }
+        for filename in Set(knownFiles).union(cache.keys).union(presence.filenames).union(contentReadRequests.keys) {
+            // Cached/progressive catalogs may predate an individual read/save.
+            // Partial scans only add observations; absence is final only after
+            // a complete scan started after the last successful local result.
+            guard presence.observation >= presenceObservations[filename, default: 0],
+                  before[filename] == revisions[filename],
+                  presence.isComplete || presence.filenames.contains(filename) else { continue }
+            if presence.filenames.contains(filename) { knownFiles.insert(filename) }
+            else { cache.removeValue(forKey: filename); knownFiles.remove(filename) }
+            presenceObservations[filename] = presence.observation
+        }
     }
 
     /// Load a single summary from disk on demand.
@@ -40,16 +74,18 @@ public actor SummaryStore {
     }
 
     /// Save a summary, keyed by MP3 filename.
-    public func save(_ summary: Summary, mp3Filename: String, job: SharedLibraryJobToken? = nil) async throws {
+    public func save(_ summary: Summary, mp3Filename: String, job: SharedLibraryJobToken? = nil, reference: SharedRecordingReference? = nil) async throws {
         if let shared {
             try shared.requireRoot(baseDirectory)
             revisions[mp3Filename, default: 0] += 1
-            let accepted = try await shared.save(summary, filename: mp3Filename, job: job)
+            let accepted = try await shared.save(summary, filename: mp3Filename, job: job, reference: reference)
             revisions[mp3Filename, default: 0] += 1
+            presenceObservations[mp3Filename] = await shared.coordinator.nextContentObservation()
             cache[mp3Filename] = accepted
             knownFiles.insert(mp3Filename)
             return
         }
+        guard reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
         try LegacyLibraryFileAccess.requireLegacyRoot(baseDirectory)
         let url = fileURL(for: mp3Filename)
         let encoder = JSONEncoder()
@@ -64,24 +100,52 @@ public actor SummaryStore {
     }
 
     /// Get a summary for a recording (lazy-loads from disk).
-    public func summary(for mp3Filename: String) async -> Summary? {
-        try? await loadSummary(for: mp3Filename)
+    public func summary(for mp3Filename: String, reference: SharedRecordingReference? = nil) async -> Summary? {
+        try? await loadSummary(for: mp3Filename, reference: reference)
     }
 
     /// Throwing UI load distinguishes a missing sidecar from download/read errors.
-    public func loadSummary(for mp3Filename: String,
+    public func loadSummary(for mp3Filename: String, reference: SharedRecordingReference? = nil,
                                onWaiting: @Sendable () async -> Void = {}) async throws -> Summary? {
+        let readRequest = UUID(); contentReadRequests[mp3Filename] = readRequest
+        return try await loadSummary(for: mp3Filename, reference: reference, onWaiting: onWaiting, readRequest: readRequest, retries: 3)
+    }
+    private func loadSummary(for mp3Filename: String, reference: SharedRecordingReference?,
+                              onWaiting: @Sendable () async -> Void, readRequest: UUID, retries: Int) async throws -> Summary? {
+        guard contentReadRequests[mp3Filename] == readRequest else { throw CancellationError() }
         let revision = revisions[mp3Filename, default: 0]
+        // A late completion must retain the observation order of its request,
+        // rather than presenting an old snapshot as a freshly observed value.
+        let observation = await shared?.coordinator.nextContentObservation()
+        try Task.checkCancellation()
+        guard contentReadRequests[mp3Filename] == readRequest else { throw CancellationError() }
         let loaded: Summary?
         if let shared {
             try shared.requireRoot(baseDirectory)
-            loaded = try await shared.summary(for: mp3Filename)
+            loaded = try await shared.summary(for: mp3Filename, reference: reference)
         } else {
+            guard reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
             loaded = try await loadFromDisk(mp3Filename: mp3Filename,
                                             knownToExist: knownFiles.contains(mp3Filename), onWaiting: onWaiting)
         }
         try Task.checkCancellation()
-        guard revisions[mp3Filename, default: 0] == revision else { return cache[mp3Filename] }
+        guard contentReadRequests[mp3Filename] == readRequest else { throw CancellationError() }
+        let contradictsNewerPresence = observation.map {
+            presenceObservations[mp3Filename, default: 0] > $0 && knownFiles.contains(mp3Filename) != (loaded != nil)
+        } ?? false
+        if revisions[mp3Filename, default: 0] != revision || contradictsNewerPresence {
+            if let current = cache[mp3Filename] { return current }
+            // A first accepted generation can arrive while an older nil read
+            // waits. Read its current bytes instead of hiding the new content.
+            if shared != nil, knownFiles.contains(mp3Filename) {
+                guard retries > 0 else { throw SharedLibraryCoordinatorError.staleReview }
+                return try await loadSummary(for: mp3Filename, reference: reference, onWaiting: onWaiting, readRequest: readRequest, retries: retries - 1)
+            }
+            return nil
+        }
+        // Commit observation order only with a successful result. Failed or
+        // cancelled reads must not veto an already accepted catalog update.
+        if let observation { presenceObservations[mp3Filename] = max(presenceObservations[mp3Filename, default: 0], observation) }
         cache[mp3Filename] = loaded
         if loaded != nil { knownFiles.insert(mp3Filename) } else { knownFiles.remove(mp3Filename) }
         return loaded
@@ -93,14 +157,17 @@ public actor SummaryStore {
     }
 
     /// Toggle an action item's completion state and persist.
-    public func toggleItem(_ itemID: UUID, inSummaryFor mp3Filename: String) async throws {
+    public func toggleItem(_ itemID: UUID, inSummaryFor mp3Filename: String, reference: SharedRecordingReference? = nil) async throws {
         if let shared {
             try shared.requireRoot(baseDirectory)
             revisions[mp3Filename, default: 0] += 1
-            cache[mp3Filename] = try await shared.toggleItem(itemID, filename: mp3Filename)
+            let accepted = try await shared.toggleItem(itemID, filename: mp3Filename, reference: reference)
+            presenceObservations[mp3Filename] = await shared.coordinator.nextContentObservation()
+            cache[mp3Filename] = accepted
             revisions[mp3Filename, default: 0] += 1
             return
         }
+        guard reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
         guard let base = cache[mp3Filename],
               let item = base.sections.flatMap({ $0.items ?? [] }).first(where: { $0.id == itemID }) else {
             throw HiDockError.storageError("Reload this summary before editing.")
@@ -161,7 +228,7 @@ public actor SummaryStore {
         Array(cache.values)
     }
 
-    /// All MP3 filenames that have summaries (from disk scan, no parsing).
+    /// All filenames with known content in the current accepted/legacy catalog.
     public func allSummarizedFilenames() -> [String] {
         Array(knownFiles)
     }

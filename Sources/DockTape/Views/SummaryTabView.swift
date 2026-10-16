@@ -80,7 +80,7 @@ struct SummaryTabView: View {
         let store = state.summarization.summaryStore
         guard !Task.isCancelled, state.library.selectedRecording == filename, contentID == identity else { return }
         await summaryState.load(for: identity) { waiting in
-            try await store.loadSummary(for: filename, onWaiting: waiting)
+            try await store.loadSummary(for: filename, reference: recording.reference, onWaiting: waiting)
         }
         guard !Task.isCancelled, state.library.selectedRecording == filename, contentID == identity else { return }
         hasTranscript = await state.transcription.transcriptStore.hasTranscript(for: filename)
@@ -317,6 +317,7 @@ struct SummaryTabView: View {
 
     private func sectionView(_ section: Summary.Section) -> some View {
         let isActionable = Self.actionableSections.contains(section.heading)
+        let editRequest = state.recordingEditRequest(for: recording)
 
         return VStack(alignment: .leading, spacing: 8) {
             Text(section.heading)
@@ -335,11 +336,7 @@ struct SummaryTabView: View {
                         HStack(alignment: .top, spacing: 8) {
                             Button {
                                 Task {
-                                    try? await state.summarization.summaryStore.toggleItem(
-                                        item.id,
-                                        inSummaryFor: recording.filename
-                                    )
-                                    await reloadSummary()
+                                    if await state.editRecording(editRequest, action: .toggle(item.id)) { await reloadSummary() }
                                 }
                             } label: {
                                 Image(systemName: item.isCompleted

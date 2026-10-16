@@ -59,7 +59,7 @@ public actor RecordingPipeline {
         guard recordingStore.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() == transcriptStore.baseDirectory.standardizedFileURL.resolvingSymlinksInPath(),
               shared == nil || shared?.root == recordingStore.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() else { throw SharedLibraryCoordinatorError.differentBinding }
         try await recordingStore.setup()
-        try await transcriptStore.loadAll()
+        try await transcriptStore.loadAll(from: recordingStore)
     }
 
     // MARK: - Full Pipeline (Download + Transcribe)
@@ -129,8 +129,11 @@ public actor RecordingPipeline {
         var job: SharedLibraryJobToken?
         do {
             if let shared {
-                let view = try await shared.recording(at: filename)
-                if let reference, reference.libraryID != view.libraryID || reference.entityID != view.state.id { throw SharedLibraryCoordinatorError.differentBinding }
+                let view: SharedLibraryViewSnapshot
+                if let reference {
+                    view = try await shared.read(.init(id: reference.entityID, kind: .recording))
+                    guard view.libraryID == reference.libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
+                } else { view = try await shared.recording(at: filename) }
                 job = try await shared.pinJob(.init(id: view.state.id, kind: .recording), output: .transcript, audioURL: url)
             }
             try await prepareModels()
@@ -174,18 +177,27 @@ public actor RecordingPipeline {
         numSpeakers: Int? = nil,
         onEvent: (@Sendable (Event) -> Void)?
     ) async throws {
-        if shared != nil {
+        if let shared {
             var count = 0
             for meta in metas {
-                if await transcriptStore.hasTranscript(for: meta.filename) { onEvent?(.skippedTranscription(filename: meta.filename)); count += 1; continue }
-                onEvent?(.transcribing(filename: meta.filename, duration: DurationCalculator.formatDuration(meta.estimatedDuration)))
+                try Task.checkCancellation()
+                var filename = meta.filename
                 let start = CFAbsoluteTimeGetCurrent()
                 do {
-                    let result = try await transcribeRecording(filename: meta.filename, numSpeakers: numSpeakers)
+                    guard let reference = meta.reference else { throw SharedSidecarError.reloadRequired }
+                    filename = try await shared.resolve(reference)
+                    let view = try await shared.read(.init(id: reference.entityID, kind: .recording))
+                    guard view.libraryID == reference.libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
+                    if try SharedSidecarAdapter.transcript(view, filename: filename) != nil {
+                        onEvent?(.skippedTranscription(filename: filename)); count += 1; continue
+                    }
+                    onEvent?(.transcribing(filename: filename, duration: DurationCalculator.formatDuration(meta.estimatedDuration)))
+                    let result = try await transcribeRecording(filename: filename, numSpeakers: numSpeakers, reference: reference)
                     count += 1
-                    onEvent?(.transcribed(filename: meta.filename, segments: result.segments.count, speakers: result.speakerIDs.count,
+                    onEvent?(.transcribed(filename: filename, segments: result.segments.count, speakers: result.speakerIDs.count,
                         elapsed: String(format: "%.1f", CFAbsoluteTimeGetCurrent() - start)))
-                } catch { onEvent?(.transcriptionFailed(filename: meta.filename, error: error.localizedDescription)) }
+                } catch is CancellationError { throw CancellationError() }
+                catch { onEvent?(.transcriptionFailed(filename: filename, error: error.localizedDescription)) }
             }
             onEvent?(.complete(fileCount: count)); return
         }

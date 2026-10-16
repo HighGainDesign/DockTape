@@ -57,10 +57,11 @@ final class SharedLibraryReviewState {
     private(set) var message: String?
     private var binding: SharedLibraryCoordinator?
     private var request = UUID()
+    private var workID = UUID()
     private var action: Task<Bool, Never>?
 
     func clear() {
-        request = UUID(); action?.cancel(); action = nil
+        request = UUID(); workID = UUID(); action?.cancel(); action = nil
         binding = nil; items = []; revision &+= 1; message = nil; isLoading = false; isApplying = false
     }
     func refresh(using coordinator: SharedLibraryCoordinator) async {
@@ -135,7 +136,7 @@ final class SharedLibraryReviewState {
             } else { changes.append(.assign(field: field.id, value: choice.value)) }
         }
         if preservingDeletion { changes.append(.delete) }
-        let ticket = request
+        let ticket = request, work = UUID(); workID = work
         isApplying = true; message = nil
         let task = Task { [weak self] in
             do {
@@ -167,6 +168,7 @@ final class SharedLibraryReviewState {
                 catch { publication = (publication.map { $0 + " " } ?? "Choice saved. ") + "Readable files could not be updated yet. Reload the review or retry after sync finishes." }
                 guard self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 await self.refresh(using: coordinator)
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 if let publication { self.message = publication }
                 return true
             } catch {
@@ -181,11 +183,11 @@ final class SharedLibraryReviewState {
         }
         action = task
         let result = await task.value
-        if binding === coordinator { isApplying = false; action = nil }
+        if binding === coordinator, workID == work { isApplying = false; action = nil }
         return result
     }
     private func applyRecordingPath(_ review: SharedRecordingPathReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
-        let ticket = request
+        let ticket = request, work = UUID(); workID = work
         isApplying = true; message = nil
         let task = Task { [weak self] in
             do {
@@ -194,7 +196,7 @@ final class SharedLibraryReviewState {
                 _ = try await coordinator.resolveRecordingPath(review)
                 guard self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 await self.refresh(using: coordinator)
-                guard self.binding === coordinator, !Task.isCancelled else { return true }
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = "Location selected. Existing files are preserved. Review any remaining competing content, then open Pending Files to review the updated file plan."
                 return true
             } catch {
@@ -205,18 +207,18 @@ final class SharedLibraryReviewState {
         }
         action = task
         let result = await task.value
-        if binding === coordinator { isApplying = false; action = nil }
+        if binding === coordinator, workID == work { isApplying = false; action = nil }
         return result
     }
     private func applyFolderLifecycle(_ review: SharedFolderLifecycleReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
-        let ticket = request; isApplying = true; message = nil
+        let ticket = request, work = UUID(); workID = work; isApplying = true; message = nil
         let task = Task { [weak self] in
             do {
                 try Task.checkCancellation()
                 _ = try await coordinator.resolveFolderLifecycle(review)
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 await self.refresh(using: coordinator)
-                guard self.binding === coordinator, !Task.isCancelled else { return true }
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = review.keep
                     ? "Folder kept. Child recording decisions are preserved. Open Pending Folders to review remaining file work."
                     : "Folder deletion selected. Files remain until the child scope and fresh approvals are reviewed in Pending Folders."
@@ -228,11 +230,11 @@ final class SharedLibraryReviewState {
             }
         }
         action = task; let result = await task.value
-        if binding === coordinator { isApplying = false; action = nil }
+        if binding === coordinator, workID == work { isApplying = false; action = nil }
         return result
     }
     private func applyFolderPath(_ review: SharedFolderPathReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
-        let ticket = request
+        let ticket = request, work = UUID(); workID = work
         isApplying = true; message = nil
         let task = Task { [weak self] in
             do {
@@ -240,7 +242,7 @@ final class SharedLibraryReviewState {
                 _ = try await coordinator.resolveFolderPath(review)
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 await self.refresh(using: coordinator)
-                guard self.binding === coordinator, !Task.isCancelled else { return true }
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = "Folder location selected. Existing files are preserved. Open Pending Folders to review the updated plan."
                 return true
             } catch {
@@ -251,11 +253,11 @@ final class SharedLibraryReviewState {
         }
         action = task
         let result = await task.value
-        if binding === coordinator { isApplying = false; action = nil }
+        if binding === coordinator, workID == work { isApplying = false; action = nil }
         return result
     }
     private func applyFolderRequest(_ review: SharedFolderDeletionRequestReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
-        let ticket = request
+        let ticket = request, work = UUID(); workID = work
         isApplying = true; message = nil
         let task = Task { [weak self] in
             do {
@@ -264,7 +266,7 @@ final class SharedLibraryReviewState {
                 _ = try await coordinator.resolveFolderDeletionRequest(review)
                 guard self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 await self.refresh(using: coordinator)
-                guard self.binding === coordinator, !Task.isCancelled else { return true }
+                guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = "Deletion request selected. Files have not been removed. Open Pending Folders to review and continue cleanup."
                 return true
             } catch {
@@ -278,7 +280,7 @@ final class SharedLibraryReviewState {
         }
         action = task
         let result = await task.value
-        if binding === coordinator { isApplying = false; action = nil }
+        if binding === coordinator, workID == work { isApplying = false; action = nil }
         return result
     }
     private static func item(_ snapshot: SharedLibraryViewSnapshot, writerLabels: [UUID: String], folderRequests requests: [SharedFolderDeletionRequestReview] = [], recordingPaths: [SharedRecordingPathReview] = [], folderPaths: [SharedFolderPathReview] = [], folderLifecycles: [SharedFolderLifecycleReview] = []) -> Item {

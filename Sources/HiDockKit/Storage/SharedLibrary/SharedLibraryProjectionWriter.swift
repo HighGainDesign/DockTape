@@ -92,6 +92,12 @@ struct SharedLibraryProjectionWriter {
         let registryFile = registryDir.appendingPathComponent(writer.uuidString.lowercased() + ".json")
         let registries = LibraryFileDiscovery.files(in: registryDir, suffix: ".json").map { registryDir.appendingPathComponent($0.relativePath) }
         let paths = outputs.keys.sorted()
+        // Freeze the physical destinations before hydration or coordination can
+        // suspend. Comparing two freshly resolved URLs would accept a parent
+        // symlink that redirected both of them to the same outside location.
+        let outputURLs = [registryFile] + paths.map { root.appendingPathComponent($0) }
+        let expectedRoot = SharedLibraryMaterializer.canonicalLocation(root)?.path
+        let expectedLocations = outputURLs.map { SharedLibraryMaterializer.canonicalLocation($0)?.path }
         for path in paths {
             let url = root.appendingPathComponent(path)
             guard SharedLibraryMaterializer.contained(url, in: root) else { throw SharedLibraryOperationError.unsafePath }
@@ -109,6 +115,18 @@ struct SharedLibraryProjectionWriter {
             guard !context.lease.isRevoked, try context.validate() else { throw SharedProjectionWriteError.stale }
             try context.gate.validate(scopes[paths.count + 1], outside: root)
             try SharedLibraryMaterializer.checkRoot(root)
+            guard SharedLibraryMaterializer.canonicalLocation(root)?.path == expectedRoot else { throw SharedLibraryOperationError.unsafePath }
+            func validateDestination(_ index: Int) throws {
+                guard let expected = expectedLocations[index],
+                      SharedLibraryMaterializer.contained(outputURLs[index], in: root),
+                      SharedLibraryMaterializer.contained(scopes[index].url, in: root),
+                      SharedLibraryMaterializer.canonicalLocation(outputURLs[index])?.path == expected,
+                      SharedLibraryMaterializer.canonicalLocation(scopes[index].url)?.path == expected else {
+                    throw SharedLibraryOperationError.unsafePath
+                }
+            }
+            // Reject the entire batch before writing even its intent registry.
+            for index in outputURLs.indices { try validateDestination(index) }
             let readScopes = Array(scopes.dropFirst(writes.count).prefix(reads.count))
             let physicalScopes = Array(scopes.dropFirst(writes.count + reads.count))
             guard physicalScopes[0].url.standardizedFileURL.resolvingSymlinksInPath().path == root.standardizedFileURL.resolvingSymlinksInPath().path else { throw SharedLibraryOperationError.unsafePath }
@@ -230,7 +248,7 @@ struct SharedLibraryProjectionWriter {
             // The intent registry precedes output publication. An interruption
             // leaves old recognized bytes or new authorized bytes, never backups.
             let previousRegistry = try? Data(contentsOf: scopes[0].url)
-            if !changes.isEmpty { try intent.write(to: scopes[0].url, options: .atomic) }
+            if !changes.isEmpty { try validateDestination(0); try intent.write(to: scopes[0].url, options: .atomic) }
             for (index, path, bytes, expected) in changes {
                 if let marker = proposed[path] {
                     // Spend input approval before the physical write. If the
@@ -239,16 +257,19 @@ struct SharedLibraryProjectionWriter {
                     attempted[path] = marker
                     let attempt = try SharedProjectionRegistry(library: context.manifest.libraryID, writer: writer,
                         files: previousFiles, pending: pending, attempted: attempted).encoded()
+                    try validateDestination(0)
                     try attempt.write(to: scopes[0].url, options: .atomic)
                 }
                 try beforeOutput(index)
+                try validateDestination(0)
+                try validateDestination(index)
                 let current = FileManager.default.fileExists(atPath: scopes[index].url.path)
                     ? SharedLibraryOperation.fingerprint(try Data(contentsOf: scopes[index].url)) : nil
                 guard current == expected else { throw SharedProjectionWriteError.stale }
                 try bytes.write(to: scopes[index].url, options: .atomic)
                 try afterOutput(index)
             }
-            if !changes.isEmpty || previousRegistry != registry { try registry.write(to: scopes[0].url, options: .atomic) }
+            if !changes.isEmpty || previousRegistry != registry { try validateDestination(0); try registry.write(to: scopes[0].url, options: .atomic) }
             return .init(written: changes.count, unchanged: unchanged)
         }
     }

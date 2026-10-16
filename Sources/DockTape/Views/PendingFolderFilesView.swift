@@ -83,7 +83,8 @@ struct PendingFolderFilesView: View {
             if let message = model.message { Text(message).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding([.horizontal, .top]) }
             HStack { Button("Close", action: onClose).keyboardShortcut(.cancelAction); Spacer() }.padding()
         }.frame(minWidth: 640, minHeight: 420)
-        .sheet(item: Binding(get: { model.updatedPlan }, set: { if $0 == nil { model.dismissUpdatedPlan() } })) { plan in
+        .sheet(item: Binding(get: { model.updatedPlan }, set: { if $0 == nil { model.dismissUpdatedPlan() } })) { preview in
+            let plan = preview.review
             VStack(alignment: .leading, spacing: 16) {
                 Text("Review Updated Folder Plan").font(.title2)
                 Text(plan.source == plan.destination ? "Keep the available directory at the selected location after verifying its files. Child recordings keep their identities." : "Move the available directory and its files to the selected folder location. Child recordings keep their identities.")
@@ -101,13 +102,14 @@ struct PendingFolderFilesView: View {
                     if model.isWorking { ProgressView().controlSize(.small) }
                     Button("Apply Updated Plan") {
                         guard let coordinator = state.sharedLibrary.coordinator else { return }
-                        Task { if await model.applyUpdatedPlan(using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
+                        Task { if await model.applyUpdatedPlan(preview, using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
                     }.keyboardShortcut(.defaultAction).disabled(model.isWorking || model.isLoading)
                         .accessibilityLabel("Apply reviewed folder location " + plan.destination)
                 }
             }.padding(24).frame(width: 500).interactiveDismissDisabled(model.isWorking)
         }
-        .sheet(item: Binding(get: { model.deletionScope }, set: { if $0 == nil { model.dismissDeletionScope() } })) { scope in
+        .sheet(item: Binding(get: { model.deletionScope }, set: { if $0 == nil { model.dismissDeletionScope() } })) { preview in
+            let scope = preview.review
             VStack(alignment: .leading, spacing: 16) {
                 Text("Review Updated Child List").font(.title2)
                 Text(scope.path).font(.headline).textSelection(.enabled)
@@ -131,13 +133,14 @@ struct PendingFolderFilesView: View {
                     if model.isWorking { ProgressView().controlSize(.small) }
                     Button("Save Child List") {
                         guard let coordinator = state.sharedLibrary.coordinator else { return }
-                        Task { if await model.applyDeletionScope(using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
+                        Task { if await model.applyDeletionScope(preview, using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
                     }.keyboardShortcut(.defaultAction).disabled(model.isWorking || model.isLoading)
                         .accessibilityLabel("Save reviewed child list for " + scope.path)
                 }
             }.padding(24).frame(width: 520).interactiveDismissDisabled(model.isWorking)
         }
-        .sheet(item: Binding(get: { model.cleanupPlan }, set: { if $0 == nil { model.dismissCleanupPlan() } })) { plan in
+        .sheet(item: Binding(get: { model.cleanupPlan }, set: { if $0 == nil { model.dismissCleanupPlan() } })) { preview in
+            let plan = preview.review
             VStack(alignment: .leading, spacing: 16) {
                 Text("Review Folder Cleanup Plan").font(.title2)
                 Text(plan.path).font(.headline).textSelection(.enabled)
@@ -156,7 +159,7 @@ struct PendingFolderFilesView: View {
                     if model.isWorking { ProgressView().controlSize(.small) }
                     Button("Save Cleanup Plan") {
                         guard let coordinator = state.sharedLibrary.coordinator else { return }
-                        Task { if await model.applyCleanupPlan(using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
+                        Task { if await model.applyCleanupPlan(preview, using: coordinator), state.sharedLibrary.coordinator === coordinator { await state.refreshAll() } }
                     }.keyboardShortcut(.defaultAction).disabled(model.isWorking || model.isLoading)
                         .accessibilityLabel("Save reviewed cleanup plan for " + plan.path)
                 }
