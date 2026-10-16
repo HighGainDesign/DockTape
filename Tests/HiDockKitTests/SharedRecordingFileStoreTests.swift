@@ -1567,6 +1567,195 @@ final class SharedRecordingFileStoreTests: XCTestCase {
         let finished = try await coordinator.reviewRecordingOperation(id: entity.id)
         XCTAssertNil(finished, "Completed receipt is not pending work")
     }
+    func testReadablePublicationWaitsForSlowMonitoredRefresh() async throws {
+        try await readablePublicationDuringMonitoredRefresh(.complete)
+    }
+    func testReadablePublicationCanCancelWhileMonitoredRefreshIsHeld() async throws {
+        try await readablePublicationDuringMonitoredRefresh(.cancel)
+    }
+    func testReadablePublicationPreservesExternalFileChangedWhileWaiting() async throws {
+        try await readablePublicationDuringMonitoredRefresh(.external)
+    }
+    private enum MonitorPublicationScenario { case complete, cancel, external }
+    private func readablePublicationDuringMonitoredRefresh(_ scenario: MonitorPublicationScenario) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("library/Unrelated"), withIntermediateDirectories: true)
+        let (root, coordinator, _) = try await fixture(directory: directory)
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(entity), changes: [.assign(field: "metadata.mode", value: .text("\"Wip\""))]))
+        try await coordinator.refresh()
+        let libraryFile = root.appendingPathComponent("library.json")
+        let originalLibrary = try Data(contentsOf: libraryFile)
+        let folders = try await coordinator.snapshots(kinds: [.folder])
+        let folder = try XCTUnwrap(folders.first { $0.state.value(for: "name") == .text("Unrelated") })
+        let control = root.appendingPathComponent(".docktape/folders/" + folder.state.id.uuidString.lowercased() + "/" + coordinator.writerID.uuidString.lowercased() + ".json")
+        let held = expectation(description: "Unrelated provider metadata is held during publication")
+        let refreshing = expectation(description: "Actual monitored refresh reaches the held metadata")
+        refreshing.assertForOverFulfill = false
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let events = await coordinator.events()
+        let observer = Task {
+            for await event in events {
+                if case .loading(_, let loaded) = event, loaded.id == folder.state.id { refreshing.fulfill() }
+            }
+        }
+        try await coordinator.startMonitoring()
+        let holding = Task {
+            try await CoordinatedFileAccess().withWrite(at: control) { _ in
+                held.fulfill()
+                guard release.wait(timeout: .now() + 10) == .success else { throw ReviewStop.interrupted }
+            }
+        }
+        await fulfillment(of: [held], timeout: 2)
+        let note = root.appendingPathComponent("unrelated-note.md")
+        try await CoordinatedFileAccess().withWrite(at: note) { scope in
+            try Data("Unrelated external change".utf8).write(to: scope.url, options: .atomic)
+        }
+        await fulfillment(of: [refreshing], timeout: 3)
+        let publication = Task { try await coordinator.projectOutputs() }
+        let transcriptFile = root.appendingPathComponent("Meeting.transcript.json")
+        let external = Data("{external synthetic file awaiting review".utf8)
+        if scenario == .cancel {
+            try await Task.sleep(for: .milliseconds(200))
+            let cancelled = expectation(description: "Publication cancels before the provider is released")
+            publication.cancel()
+            let cancellation = Task {
+                do { _ = try await publication.value; XCTFail("Cancelled publication must not complete") }
+                catch { XCTAssertTrue(error is CancellationError) }
+                cancelled.fulfill()
+            }
+            await fulfillment(of: [cancelled], timeout: 1)
+            release.signal()
+            await cancellation.value
+        } else {
+            if scenario == .external { try external.write(to: transcriptFile, options: .atomic) }
+            // Exceeds the old 1.325-second retry budget while the provider
+            // refresh remains active; completion must govern fresh authority.
+            try await Task.sleep(for: .milliseconds(2200))
+            release.signal()
+            do {
+                _ = try await publication.value
+                XCTAssertTrue(scenario == .complete, "External bytes need explicit recovery")
+            } catch {
+                if scenario == .external {
+                    XCTAssertEqual(error as? SharedProjectionWriteError, .untracked("Meeting.transcript.json"))
+                } else { XCTFail("Publication must wait for fresh monitored state: \(error)") }
+            }
+        }
+        try await holding.value
+        await coordinator.stopMonitoring()
+        observer.cancel()
+        if scenario == .complete {
+            let metadata = try JSONDecoder().decode([String: RecordingStore.RecordingMeta].self, from: Data(contentsOf: libraryFile))
+            XCTAssertEqual(metadata["Meeting.mp3"]?.mode, "Wip")
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")), Data("single synthetic original".utf8))
+        } else if scenario == .cancel {
+            XCTAssertEqual(try Data(contentsOf: libraryFile), originalLibrary, "Cancelled publication must not later write pending metadata")
+        } else {
+            XCTAssertEqual(try Data(contentsOf: transcriptFile), external, "Fresh authority must preserve untracked bytes")
+        }
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "Unrelated external change")
+    }
+    func testReviewedResumeWaitsForSlowMonitoredRefresh() async throws {
+        try await reviewedResumeDuringMonitoredRefresh(.complete)
+    }
+    func testReviewedResumeCanCancelWhileMonitoredRefreshIsHeld() async throws {
+        try await reviewedResumeDuringMonitoredRefresh(.cancel)
+    }
+    func testReviewedResumeRejectsAChangedPlanAfterMonitoredRefresh() async throws {
+        try await reviewedResumeDuringMonitoredRefresh(.changed)
+    }
+    private enum MonitorReplayScenario { case complete, cancel, changed }
+    private func reviewedResumeDuringMonitoredRefresh(_ scenario: MonitorReplayScenario) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("library/Unrelated"), withIntermediateDirectories: true)
+        let (root, coordinator, _) = try await fixture(directory: directory)
+        let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)
+        do {
+            _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Reviewed", afterMutation: { _ in throw ReviewStop.interrupted })
+            XCTFail("Expected the controlled interruption")
+        } catch ReviewStop.interrupted {}
+        let pending = try await coordinator.reviewRecordingOperation(id: entity.id)
+        let review = try XCTUnwrap(pending)
+        XCTAssertTrue(review.canResume)
+        let folders = try await coordinator.snapshots(kinds: [.folder])
+        let folder = try XCTUnwrap(folders.first { $0.state.value(for: "name") == .text("Unrelated") })
+        let control = root.appendingPathComponent(".docktape/folders/" + folder.state.id.uuidString.lowercased() + "/" + coordinator.writerID.uuidString.lowercased() + ".json")
+        let held = expectation(description: "Unrelated provider metadata is held")
+        let refreshing = expectation(description: "Actual monitored refresh reaches the held entity")
+        refreshing.assertForOverFulfill = false
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let events = await coordinator.events()
+        let observer = Task {
+            for await event in events {
+                if case .loading(_, let loaded) = event, loaded.id == folder.state.id { refreshing.fulfill() }
+            }
+        }
+        try await coordinator.startMonitoring()
+        let holding = Task {
+            try await CoordinatedFileAccess().withWrite(at: control) { _ in
+                held.fulfill()
+                guard release.wait(timeout: .now() + 10) == .success else { throw ReviewStop.interrupted }
+            }
+        }
+        await fulfillment(of: [held], timeout: 2)
+        let note = root.appendingPathComponent("unrelated-note.md")
+        try await CoordinatedFileAccess().withWrite(at: note) { scope in
+            try Data("Unrelated external change".utf8).write(to: scope.url, options: .atomic)
+        }
+        await fulfillment(of: [refreshing], timeout: 3)
+        let resumed = Task { try await coordinator.resumeReviewedRecordingOperation(review) }
+        var outcome: SharedRecordingFileOutcome?
+        if scenario == .cancel {
+            try await Task.sleep(for: .milliseconds(200))
+            let cancelled = expectation(description: "Cancel finishes before the provider is released")
+            resumed.cancel()
+            let cancellation = Task {
+                do { _ = try await resumed.value; XCTFail("Cancelled recovery must not complete") }
+                catch { XCTAssertTrue(error is CancellationError) }
+                cancelled.fulfill()
+            }
+            await fulfillment(of: [cancelled], timeout: 1)
+            release.signal()
+            await cancellation.value
+        } else {
+            if scenario == .changed {
+                try await Task.sleep(for: .milliseconds(200))
+                let current = try await coordinator.read(entity)
+                _ = try await coordinator.edit(.init(base: current, changes: [.assign(field: "title", value: .text("Changed while waiting"))]))
+            }
+            // A slow provider refresh exceeds the old stale-proof retry budget.
+            // Its completion, rather than that budget, must govern the wait.
+            try await Task.sleep(for: .milliseconds(2200))
+            release.signal()
+            do { outcome = try await resumed.value }
+            catch { XCTFail("Recovery must recheck fresh authority after monitored refresh: \(error)") }
+        }
+        try await holding.value
+        await coordinator.stopMonitoring()
+        observer.cancel()
+        if scenario == .cancel {
+            XCTAssertNil(outcome)
+        } else {
+            XCTAssertEqual(outcome?.result, scenario == .complete ? .complete : .needsReplanning)
+        }
+        if scenario != .complete {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.transcript.json").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Reviewed.transcript.json").path))
+        }
+        if outcome?.result == .complete {
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Reviewed.mp3")), Data("single synthetic original".utf8))
+            for suffix in [".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".txt"] {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting" + suffix).path))
+                XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Reviewed" + suffix).path))
+            }
+            let finished = try await coordinator.reviewRecordingOperation(id: entity.id)
+            XCTAssertNil(finished)
+        }
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "Unrelated external change")
+    }
     func testReviewedResumeCannotConsumeChangedMetadata() async throws {
         let (root, coordinator, _) = try await fixture()
         let entity = SharedEntityIdentity(id: try await coordinator.reference(to: "Meeting.mp3").entityID, kind: .recording)

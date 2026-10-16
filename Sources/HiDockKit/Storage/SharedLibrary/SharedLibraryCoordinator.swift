@@ -178,6 +178,7 @@ public actor SharedLibraryCoordinator {
 
   private var monitor: SharedLibraryChangeMonitor?
   private var monitorRefresh: Task<Void, Never>?
+  private var monitorRefreshRequest: UUID?
   private var listeners: [UUID: AsyncStream<SharedLibraryChange>.Continuation] = [:]
   public init(
     root: URL, writerID: UUID, versionAccess: RecordingFileVersionAccess = .init(),
@@ -307,24 +308,44 @@ public actor SharedLibraryCoordinator {
     await existing?.close()
     let task = monitorRefresh
     monitorRefresh = nil
+    monitorRefreshRequest = nil
     task?.cancel()
     await task?.value
   }
   private func scheduleRefresh() {
     guard monitor != nil else { return }
     monitorRefresh?.cancel()
+    let request = UUID()
+    monitorRefreshRequest = request
     monitorRefresh = Task { [weak self] in
-      guard let self else { return }
-      do {
-        try await self.refresh()
-        try Task.checkCancellation()
-        let manifest = try await self.bind()
-        await self.reportFileChange(library: manifest.libraryID)
-      } catch {
-        guard !Task.isCancelled else { return }
-        await self.reportRefreshError(error.localizedDescription)
+      await self?.refreshFromMonitor(request)
+    }
+  }
+  private func refreshFromMonitor(_ request: UUID) async {
+    defer {
+      if monitorRefreshRequest == request {
+        monitorRefreshRequest = nil
+        monitorRefresh = nil
       }
     }
+    do {
+      try await refresh()
+      try Task.checkCancellation()
+      let manifest = try await bind()
+      reportFileChange(library: manifest.libraryID)
+    } catch {
+      guard !Task.isCancelled else { return }
+      reportRefreshError(error.localizedDescription)
+    }
+  }
+  private func waitForMonitoredRefresh() async throws {
+    // Our own coordinated writes can start a provider refresh. Its
+    // duration is not a stale-proof retry budget: wait cancellably for it to
+    // finish, then construct and validate entirely fresh physical authority.
+    while monitorRefreshRequest != nil {
+      try await Task.sleep(for: .milliseconds(25))
+    }
+    try Task.checkCancellation()
   }
   private func reportFileChange(library: UUID) {
     guard monitor != nil, !Task.isCancelled else { return }
@@ -3104,6 +3125,7 @@ public actor SharedLibraryCoordinator {
     return try await SharedLibraryProjectionWriter.project(context, writer: writerID, only: [review.filename])
   }
   private func projectionContext(for selected: SharedEntityIdentity? = nil) async throws -> SharedLibraryProjectionContext {
+    try await waitForMonitoredRefresh()
     guard transitions == 0 else { throw SharedProjectionWriteError.stale }
     let manifest = try await bind(force: true)
     guard try await mayEdit(), let gate, let directory = witnessDirectory else { throw SharedLibraryCoordinatorError.enrollmentPending }
@@ -3227,6 +3249,7 @@ public actor SharedLibraryCoordinator {
                                            reviewedFolder: SharedLibraryViewSnapshot? = nil) async throws
     -> SharedMaterializationAuthority
   {
+    try await waitForMonitoredRefresh()
     guard transitions == 0 else { throw SharedLibraryOperationError.staleAuthority }
     let epoch = authorityEpoch
     let manifest = try await bind(force: true)
