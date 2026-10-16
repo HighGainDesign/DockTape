@@ -24,6 +24,31 @@ struct RecordingListPane: View {
 
     // MARK: - Recordings Content
 
+    @ViewBuilder private var metadataLoadStatus: some View {
+        if state.library.isLoadingMetadata || state.library.refreshError != nil || state.library.metadataLoadState == .stopped {
+            Divider()
+            HStack {
+                if state.library.isLoadingMetadata {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting for library files…")
+                    Spacer()
+                    Button("Stop Loading") { state.library.cancelMetadataLoad() }
+                        .accessibilityLabel("Stop loading the recording library")
+                } else {
+                    Text(state.library.metadataLoadState == .stopped
+                        ? "Loading stopped. Available recordings are still shown."
+                        : "Some recordings could not be loaded. Check your cloud drive and retry.")
+                        .help(state.library.refreshError ?? "")
+                    Spacer()
+                    Button("Retry") { Task { await state.retryLibraryLoad() } }
+                        .accessibilityLabel("Retry loading the recording library")
+                }
+            }
+            .font(.caption)
+            .padding(8)
+        }
+    }
+
     private var recordingsContent: some View {
         VStack(spacing: 0) {
             let recs = filteredRecordings
@@ -41,13 +66,21 @@ struct RecordingListPane: View {
                         )
                         .tag(rec.filename)
                         .contextMenu { recordingContextMenu(for: rec) }
-                        .draggable(rec.filename)
+                        .draggable(state.library.recordingSelection(rec))
                     }
                 }
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
             .overlay {
-                if state.library.recordings.isEmpty {
+                if state.library.recordings.isEmpty && state.library.isLoadingMetadata {
+                    ContentUnavailableView {
+                        Label("Loading Recordings", systemImage: "icloud.and.arrow.down")
+                    } description: { Text("Waiting for library files. Available recordings will appear here.") }
+                } else if state.library.recordings.isEmpty && (state.library.refreshError != nil || state.library.metadataLoadState == .stopped) {
+                    ContentUnavailableView {
+                        Label("Recordings Not Loaded", systemImage: "icloud.slash")
+                    } description: { Text("Check your cloud drive, then retry loading the library.") }
+                } else if state.library.recordings.isEmpty {
                     ContentUnavailableView {
                         Label("No Recordings", systemImage: "waveform.slash")
                     } description: {
@@ -63,6 +96,7 @@ struct RecordingListPane: View {
             }
             .searchable(text: $state.library.searchText, prompt: "Search recordings")
             .modifier(SearchFocusModifier(trigger: $state.library.isSearchFocused))
+            metadataLoadStatus
         }
         .navigationTitle(recordingTitle)
         .onChange(of: state.selectedView) { _, _ in
@@ -88,14 +122,9 @@ struct RecordingListPane: View {
         }
         .onKeyPress(.delete) {
             guard !state.library.selectedRecordings.isEmpty else { return .ignored }
-            Task {
-                for filename in state.library.selectedRecordings {
-                    if let rec = state.library.recordings.first(where: { $0.filename == filename }) {
-                        await state.deleteLocalRecording(rec)
-                    }
-                }
-                state.library.selectedRecordings.removeAll()
-            }
+            let library = state.library
+            let selections = library.recordings.filter { library.selectedRecordings.contains($0.filename) }.map { library.recordingSelection($0) }
+            Task { await state.deleteLocalRecordings(selections: selections) }
             return .handled
         }
         .onKeyPress(.return) {
@@ -108,10 +137,11 @@ struct RecordingListPane: View {
         }
         .alert("Delete Originals?", isPresented: $state.showMergeDeletePrompt) {
             Button("Keep Originals") {
-                state.mergeFilenames = []
+                state.clearMergeSelection()
             }
             Button("Delete Originals", role: .destructive) {
-                Task { await state.deleteMergeOriginals() }
+                guard let request = state.captureMergeOriginalsRequest() else { return }
+                Task { await state.deleteMergeOriginals(request: request) }
             }
         } message: {
             Text("The \(state.mergeFilenames.count) original recordings can be deleted now or kept for reference.")
@@ -235,10 +265,11 @@ struct RecordingListPane: View {
 
         Divider()
 
+        let recordingSelection = state.library.recordingSelection(rec)
         if rec.folder != nil {
             Button {
                 Task {
-                    await state.moveRecording(rec, toFolder: nil)
+                    await state.moveRecording(selection: recordingSelection, toFolder: nil)
                 }
             } label: {
                 Label("Move to Library Root", systemImage: "tray.and.arrow.up")
@@ -247,13 +278,13 @@ struct RecordingListPane: View {
 
         // Move to folder submenu
         if !state.library.folders.isEmpty {
-            let availableFolders = state.library.folders.filter { $0 != rec.folder }
+            let availableFolders = state.library.folderSelections.filter { $0.name != rec.folder }
             if !availableFolders.isEmpty {
                 Menu("Move to Folder") {
-                    ForEach(availableFolders, id: \.self) { folder in
-                        Button(folder) {
+                    ForEach(availableFolders) { folder in
+                        Button(folder.name) {
                             Task {
-                                await state.moveRecording(rec, toFolder: folder)
+                                await state.moveRecording(selection: recordingSelection, toFolder: folder)
                             }
                         }
                     }
@@ -302,7 +333,7 @@ struct RecordingListPane: View {
         Divider()
 
         Button(role: .destructive) {
-            Task { await state.deleteLocalRecording(rec) }
+            Task { await state.deleteLocalRecording(selection: recordingSelection) }
         } label: {
             Label("Delete", systemImage: "trash")
         }

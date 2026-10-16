@@ -20,5 +20,9 @@
 	<true/>
 	<key>com.apple.security.files.user-selected.read-write</key>
 	<true/>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>UX8BPNLPX5.design.highgain.docktape</string>
+	</array>
 </dict>
 </plist>

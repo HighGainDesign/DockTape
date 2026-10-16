@@ -86,39 +86,39 @@ final class TemplateStoreTests: XCTestCase {
 
     // MARK: - CRUD
 
-    func testAddUserTemplate() async {
+    func testAddUserTemplate() async throws {
         let store = TemplateStore(baseDirectory: tempDir)
         let t = Template.makeUserTemplate(name: "Custom", description: "desc", promptText: "prompt")
-        await store.addUserTemplate(t)
+        try await store.addUserTemplate(t)
         let all = await store.allTemplates()
         XCTAssertEqual(all.count, 8)
     }
 
-    func testUpdateBuiltInOverride() async {
+    func testUpdateBuiltInOverride() async throws {
         let store = TemplateStore(baseDirectory: tempDir)
         var meeting = await store.template(forID: "meeting")!
         meeting.promptText = "My custom meeting prompt"
-        await store.update(meeting)
+        try await store.update(meeting)
         let updated = await store.template(forID: "meeting")!
         XCTAssertEqual(updated.promptText, "My custom meeting prompt")
     }
 
-    func testResetBuiltInToDefault() async {
+    func testResetBuiltInToDefault() async throws {
         let store = TemplateStore(baseDirectory: tempDir)
         let originalPrompt = TemplateStore.builtInDefaults.first(where: { $0.id == "meeting" })!.promptText
         var meeting = await store.template(forID: "meeting")!
         meeting.promptText = "Overridden prompt"
-        await store.update(meeting)
-        await store.resetToDefault(id: "meeting")
+        try await store.update(meeting)
+        try await store.resetToDefault(id: "meeting")
         let reset = await store.template(forID: "meeting")!
         XCTAssertEqual(reset.promptText, originalPrompt)
     }
 
-    func testDeleteUserTemplate() async {
+    func testDeleteUserTemplate() async throws {
         let store = TemplateStore(baseDirectory: tempDir)
         let t = Template.makeUserTemplate(name: "Temp", description: "desc", promptText: "prompt")
-        await store.addUserTemplate(t)
-        await store.delete(id: t.id)
+        try await store.addUserTemplate(t)
+        try await store.delete(id: t.id)
         let all = await store.allTemplates()
         XCTAssertEqual(all.count, 7)
         let deleted = await store.template(forID: t.id)
@@ -132,19 +132,19 @@ final class TemplateStoreTests: XCTestCase {
 
         // Add a user template
         let userT = Template.makeUserTemplate(name: "Saved", description: "persisted", promptText: "keep me")
-        await store1.addUserTemplate(userT)
+        try await store1.addUserTemplate(userT)
 
         // Override a built-in
         var meeting = await store1.template(forID: "meeting")!
         meeting.promptText = "Persisted meeting prompt"
-        await store1.update(meeting)
+        try await store1.update(meeting)
 
         // Give save tasks time to complete
         try await Task.sleep(nanoseconds: 100_000_000)
 
         // Load into a fresh store
         let store2 = TemplateStore(baseDirectory: tempDir)
-        await store2.load()
+        try await store2.load()
 
         let reloaded = await store2.allTemplates()
         XCTAssertEqual(reloaded.count, 8)
@@ -167,7 +167,7 @@ final class TemplateStoreTests: XCTestCase {
         defaults.set("Migrated memo prompt", forKey: "templatePrompt_memo")
 
         let store = TemplateStore(baseDirectory: tempDir)
-        await store.migrateFromUserDefaults(defaults)
+        try await store.migrateFromUserDefaults(defaults)
 
         let meeting = await store.template(forID: "meeting")!
         XCTAssertEqual(meeting.promptText, "Migrated meeting prompt")

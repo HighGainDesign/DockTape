@@ -62,8 +62,10 @@ final class AppState {
     var device: DeviceState
     var playback: PlaybackState
     var transcription: TranscriptionState
+    let templateEditor = TemplateEditingState()
     var summarization: SummarizationState
     var templateStore: TemplateStore
+    var sharedLibrary: SharedLibraryState
 
     var selectedView: SidebarSelection = .allRecordings
     var selectedDetailTab: DetailTab = .info
@@ -71,6 +73,15 @@ final class AppState {
     var triggerCustomPrompt: Bool = false
     var triggerMerge: Bool = false
     var mergeFilenames: [String] = []
+    struct MergeRequest {
+        fileprivate let id: UUID
+        fileprivate let library: LibraryState
+        fileprivate let coordinator: SharedLibraryCoordinator?
+        fileprivate let filenames: [String]
+        fileprivate let references: [String: SharedRecordingReference]
+    }
+    private var mergeSelection: MergeRequest?
+    private var completedMergeRequest: MergeRequest?
     var showMergeDeletePrompt: Bool = false
     var showMigrationPrompt: Bool = false
     var syncProgress: Double? = nil  // 0.0–1.0 during sync, nil when idle
@@ -90,8 +101,14 @@ final class AppState {
     private var pollingTask: Task<Void, Never>?
     private(set) var playbackTranscriptTask: Task<Void, Never>?
     private var playbackTranscriptRequestID = UUID()
+    private var libraryRefreshRequest = UUID()
+    private var librarySetupRequest = UUID()
 
-    init() {
+    init(baseDirectory: URL? = nil,
+         sharedIdentity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity = { try await SharedWriterIdentityFactory().load() },
+         sharedWitnessDirectory: URL? = nil,
+         sharedTrash: @escaping @Sendable (URL) throws -> Void = { try SharedLibraryMaterializer.moveToTrash($0) }) {
+        self.sharedLibrary = SharedLibraryState(identity: sharedIdentity, witnessDirectory: sharedWitnessDirectory, trash: sharedTrash)
         let defaults = UserDefaults.standard
 
         // One-time migration: determine storage mode for pre-iCloud installs
@@ -128,7 +145,7 @@ final class AppState {
         } else {
             customURL = defaults.url(forKey: "libraryLocation")
         }
-        let baseDir = StorageLocationResolver.resolve(mode: mode, customURL: customURL)
+        let baseDir = baseDirectory ?? StorageLocationResolver.resolve(mode: mode, customURL: customURL)
 
         let store = RecordingStore(baseDirectory: baseDir)
         let transcriptStore = TranscriptStore(baseDirectory: store.baseDirectory)
@@ -145,61 +162,241 @@ final class AppState {
         self.autoSyncClock = defaults.object(forKey: "autoSyncClock") as? Bool ?? true
     }
 
-    func setup() async throws {
-        try await library.setup()
-        try await summarization.summaryStore.loadAll()
-        await templateStore.load()
-        await templateStore.migrateFromUserDefaults(.standard)
-
-        // Populate transcript statuses for recordings that already have transcripts on disk
-        let transcribedFiles = await transcription.transcriptStore.allTranscribedFilenames()
-        for filename in transcribedFiles {
-            if transcription.statuses[filename] == nil {
-                transcription.statuses[filename] = .done
-            }
+    private func requireWritableLibrary() -> Bool {
+        if sharedLibrary.phase == .ready { return true }
+        if sharedLibrary.phase == .legacy,
+           !FileManager.default.fileExists(atPath: library.store.baseDirectory.appendingPathComponent(".docktape").path) { return true }
+        if sharedLibrary.hasInterruptedSetup {
+            errorMessage = "Shared library setup was interrupted. Finish enabling it in Settings on this Mac."
+        } else {
+            errorMessage = sharedLibrary.phase == .readOnly
+                ? "This library is read-only. Join it in Settings and wait for the other Macs to connect."
+                : "Wait for shared library setup to finish, or retry it in Settings."
         }
+        return false
+    }
 
-        // Populate summary existence set
-        let summarizedFiles = await summarization.summaryStore.allSummarizedFilenames()
-        summarization.hasSummary = Set(summarizedFiles)
+    func enableSharedLibrary(for requestedLibrary: LibraryState? = nil) async -> Bool {
+        let requestedLibrary = requestedLibrary ?? library
+        guard library === requestedLibrary else { return false }
+        guard !device.isDeviceBusy, !transcription.isTranscribing, !summarization.isSummarizing, !sharedLibrary.isBusy else {
+            errorMessage = "Wait for the current operation to finish before enabling a shared library."
+            return false
+        }
+        let root = requestedLibrary.store.baseDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        var currentLibrary = requestedLibrary
+        var enabledCoordinator: SharedLibraryCoordinator?
+        func stillBound() -> Bool {
+            !Task.isCancelled && library === currentLibrary && sharedLibrary.root == root &&
+                (enabledCoordinator == nil || sharedLibrary.coordinator === enabledCoordinator)
+        }
+        do {
+            let coordinator = try await sharedLibrary.connect(root: root, enable: true)
+            guard stillBound() else { return false }
+            enabledCoordinator = coordinator
+            if let coordinator {
+                attachSharedStores(coordinator)
+                currentLibrary = library
+            }
+            try await setup()
+            guard stillBound() else { return false }
+            if let coordinator { _ = try await coordinator.projectOutputs() }
+            guard stillBound() else { return false }
+            return true
+        } catch {
+            guard stillBound(), !(error is CancellationError) else { return false }
+            errorMessage = "Shared library setup failed: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func attachSharedStores(_ coordinator: SharedLibraryCoordinator) {
+        playback.stop()
+        playback.acquireLease = { filename, url, reference in
+            let expected = coordinator.root.appendingPathComponent(filename).standardizedFileURL.resolvingSymlinksInPath()
+            guard url.standardizedFileURL.resolvingSymlinksInPath() == expected else { throw SharedLibraryCoordinatorError.differentBinding }
+            let view = try await coordinator.recording(at: filename, reference: reference)
+            let token = try await coordinator.pinJob(.init(id: view.state.id, kind: .recording))
+            return .init(validate: { try await coordinator.validateJob(token) }, release: { await coordinator.finishJob(token) })
+        }
+        let previous = library
+        previous.cancelMetadataLoad()
+        let store = RecordingStore(baseDirectory: coordinator.root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        let transcripts = TranscriptStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator))
+        library = LibraryState(store: store, transcriptStore: transcripts, sharedCoordinator: coordinator)
+        library.selectedFolder = previous.selectedFolder
+        library.selectedRecording = previous.selectedRecording
+        library.selectedRecordings = previous.selectedRecordings
+        transcription = TranscriptionState(transcriptStore: transcripts, recordingStore: store, shared: coordinator)
+        summarization = SummarizationState(summaryStore: SummaryStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator)), shared: coordinator)
+        let currentLibrary = library, currentTranscription = transcription, currentSummary = summarization
+        library.onSharedContent = { [weak self, weak currentLibrary] in
+            guard let self, let currentLibrary, self.library === currentLibrary,
+                  self.sharedLibrary.coordinator === coordinator else { return }
+            try? await currentSummary.summaryStore.loadAll(from: currentLibrary.store)
+            let transcribed = await currentTranscription.transcriptStore.allTranscribedFilenames()
+            let summarized = await currentSummary.summaryStore.allSummarizedFilenames()
+            guard self.library === currentLibrary, self.sharedLibrary.coordinator === coordinator else { return }
+            var statuses = Dictionary(uniqueKeysWithValues: transcribed.map { ($0, TranscriptStatus.done) })
+            for (file, status) in currentTranscription.statuses where status == .inProgress { statuses[file] = .inProgress }
+            currentTranscription.statuses = statuses
+            currentSummary.hasSummary = Set(summarized)
+        }
+        templateStore = TemplateStore(baseDirectory: coordinator.root, shared: SharedTemplateAdapter(coordinator: coordinator))
+        if let manager = device.deviceManager { device.syncEngine = SyncEngine(deviceManager: manager, store: store) }
+    }
+
+    func setup() async throws {
+        let request = UUID(); librarySetupRequest = request
+        let requestedLibrary = library
+        let coordinator: SharedLibraryCoordinator?
+        do { coordinator = try await sharedLibrary.connect(root: requestedLibrary.store.baseDirectory) }
+        catch {
+            guard librarySetupRequest == request, library === requestedLibrary else { return }
+            throw error
+        }
+        guard librarySetupRequest == request, library === requestedLibrary else { return }
+        if let coordinator, requestedLibrary.sharedCoordinator !== coordinator { attachSharedStores(coordinator) }
+        let currentLibrary = library, currentTranscription = transcription, currentSummary = summarization
+        let currentTemplates = templateStore, bound = sharedLibrary.coordinator
+        func stillBound() -> Bool { !Task.isCancelled && librarySetupRequest == request && library === currentLibrary && sharedLibrary.coordinator === bound }
+
+        do {
+            // Legacy physical hints stay cheap; shared content presence arrives
+            // with the progressively validated recording catalog below.
+            if bound == nil {
+                try await currentLibrary.transcriptStore.loadAll()
+                try await currentSummary.summaryStore.loadAll()
+                guard stillBound() else { return }
+                let transcribedFiles = await currentTranscription.transcriptStore.allTranscribedFilenames()
+                let summarizedFiles = await currentSummary.summaryStore.allSummarizedFilenames()
+                guard stillBound() else { return }
+                for filename in transcribedFiles where currentTranscription.statuses[filename] == nil {
+                    currentTranscription.statuses[filename] = .done
+                }
+                currentSummary.hasSummary = Set(summarizedFiles)
+            }
+            try await currentLibrary.setup()
+            guard stillBound() else { return }
+            if bound != nil {
+                try await currentLibrary.transcriptStore.loadAll(from: currentLibrary.store)
+                try await currentSummary.summaryStore.loadAll(from: currentLibrary.store)
+            }
+            guard stillBound() else { return }
+            try await currentTemplates.load()
+            guard stillBound() else { return }
+            if bound != nil { sharedLibrary.revision &+= 1 }
+            if bound == nil { try await currentTemplates.migrateFromUserDefaults(.standard) }
+            guard stillBound() else { return }
+            try await sharedLibrary.listen { [weak self] in await self?.refreshAll(refreshShared: false, monitored: true) }
+        } catch {
+            guard stillBound() else { return }
+            currentLibrary.refreshError = error.localizedDescription
+            throw error
+        }
+    }
+
+    @discardableResult
+    func retryLibraryLoad() async -> Bool {
+        let root = library.store.baseDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        func stillRoot() -> Bool { library.store.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() == root }
+        do {
+            try await setup()
+            guard stillRoot(), library.metadataLoadState == .idle, library.refreshError == nil, !sharedLibrary.isBusy else { return false }
+            statusMessage = "Library loaded."
+            return true
+        } catch {
+            guard stillRoot(), !Task.isCancelled else { return false }
+            library.refreshError = error.localizedDescription
+            return false
+        }
     }
 
     /// Refresh library, transcript statuses, and summary statuses from disk.
     /// Called on app activate to pick up external filesystem changes.
-    func refreshAll() async {
-        await library.refresh()
-        try? await transcription.transcriptStore.loadAll()
-        try? await summarization.summaryStore.loadAll()
-
-        // Re-sync statuses from disk
-        let transcribedFiles = await transcription.transcriptStore.allTranscribedFilenames()
+    func refreshAll(refreshShared: Bool = true, monitored: Bool = false, beforePublication: @escaping @MainActor () async throws -> Void = {}) async {
+        guard !Task.isCancelled else { return }
+        // File-watcher work must not cancel the complete catalog refresh an
+        // interactive action is awaiting. Debounced watchers remain cancellable
+        // and use the current binding only after the active load has finished.
+        let waitingLibrary = library
+        if monitored {
+            while waitingLibrary.isLoadingMetadata {
+                do { try await Task.sleep(for: .milliseconds(25)) } catch { return }
+                guard library === waitingLibrary else { return }
+            }
+            guard waitingLibrary.metadataLoadState != .stopped else { return }
+        }
+        guard !Task.isCancelled, library === waitingLibrary else { return }
+        let request = UUID(); libraryRefreshRequest = request
+        let currentLibrary = library, currentTranscription = transcription, currentSummary = summarization
+        let currentTemplates = templateStore, bound = sharedLibrary.coordinator
+        func stillBound() -> Bool { !Task.isCancelled && libraryRefreshRequest == request && library === currentLibrary && sharedLibrary.coordinator === bound }
+        func report(_ error: Error) {
+            guard stillBound() else { return }
+            switch error {
+            case SharedProjectionWriteError.untracked:
+                sharedLibrary.message = "A file changed outside DockTape. Open Shared Library Review → External Files to compare and recover it."
+            case SharedProjectionWriteError.stale:
+                sharedLibrary.message = "The library changed while refreshing. Refresh again after sync settles."
+            default: sharedLibrary.message = error.localizedDescription
+            }
+        }
+        let completed = await currentLibrary.refresh(afterMetadata: { [self] in
+            guard stillBound(), let bound else { return }
+            do {
+                if refreshShared { try await bound.refresh() }
+                guard stillBound() else { return }
+                try await sharedLibrary.refreshStatus()
+                guard stillBound() else { return }
+                try await currentTemplates.load()
+                guard stillBound() else { return }
+                if sharedLibrary.phase == .ready {
+                    try await beforePublication()
+                    guard stillBound() else { return }
+                    _ = try await bound.projectOutputs()
+                }
+                guard stillBound() else { return }
+                sharedLibrary.message = nil
+            } catch { report(error) }
+        }, onFailure: { report($0) })
+        guard completed else { return }
+        guard stillBound() else { return }
+        if bound != nil { sharedLibrary.revision &+= 1 }
+        try? await currentTranscription.transcriptStore.loadAll(from: currentLibrary.store)
+        try? await currentSummary.summaryStore.loadAll(from: currentLibrary.store)
+        guard stillBound() else { return }
+        let transcribedFiles = await currentTranscription.transcriptStore.allTranscribedFilenames()
+        guard stillBound() else { return }
         var newStatuses: [String: TranscriptStatus] = [:]
-        for filename in transcribedFiles {
-            newStatuses[filename] = .done
-        }
-        // Preserve in-progress statuses from current session
-        for (file, status) in transcription.statuses where status == .inProgress {
-            newStatuses[file] = .inProgress
-        }
-        transcription.statuses = newStatuses
-
-        let summarizedFiles = await summarization.summaryStore.allSummarizedFilenames()
-        summarization.hasSummary = Set(summarizedFiles)
+        for filename in transcribedFiles { newStatuses[filename] = .done }
+        for (file, status) in currentTranscription.statuses where status == .inProgress { newStatuses[file] = .inProgress }
+        currentTranscription.statuses = newStatuses
+        let summarizedFiles = await currentSummary.summaryStore.allSummarizedFilenames()
+        guard stillBound() else { return }
+        currentSummary.hasSummary = Set(summarizedFiles)
     }
 
     /// Switch storage location and re-initialize all stores.
     /// Does NOT move files — the user manages that via Finder.
     @discardableResult
     func switchStorageLocation(to mode: StorageMode, customURL: URL? = nil) async -> Bool {
-        guard !device.isDeviceBusy, !transcription.isTranscribing, !summarization.isSummarizing else {
+        guard !device.isDeviceBusy, !transcription.isTranscribing, !summarization.isSummarizing, !sharedLibrary.isBusy else {
             errorMessage = "Wait for the current operation to finish before changing storage."
             return false
         }
+        // Cancel old sheets/prompts before the first suspension in switching.
+        // Already dispatched work retains its own stores, but cannot issue the
+        // next original deletion or update a newly selected library.
+        invalidateMergePresentation()
+        librarySetupRequest = UUID()
+        library.cancelMetadataLoad()
         // A pending cloud playback request belongs to the old library.
         playbackTranscriptRequestID = UUID()
         playbackTranscriptTask?.cancel()
         playbackTranscriptTask = nil
         playback.stop()
+        playback.acquireLease = nil
         let defaults = UserDefaults.standard
         defaults.set(mode.rawValue, forKey: "storageMode")
 
@@ -215,6 +412,7 @@ final class AppState {
 
         let baseDir = StorageLocationResolver.resolve(mode: mode, customURL: customURL)
 
+        await sharedLibrary.close()
         let store = RecordingStore(baseDirectory: baseDir)
         let transcriptStore = TranscriptStore(baseDirectory: store.baseDirectory)
 
@@ -245,6 +443,7 @@ final class AppState {
     // MARK: - Cross-cutting actions
 
     func downloadFile(_ file: FileEntry) async {
+        guard requireWritableLibrary() else { return }
         do {
             let wasImported = library.isDownloaded(file.filename)
             let importDirectory = library.store.baseDirectory
@@ -268,6 +467,7 @@ final class AppState {
     }
 
     func syncAll() async {
+        guard requireWritableLibrary() else { return }
         let importDirectory = library.store.baseDirectory
         syncProgress = 0
         do {
@@ -307,15 +507,61 @@ final class AppState {
     }
 
     func deleteLocalRecording(_ rec: RecordingMetadata) async {
-        if playback.playingFile == rec.filename {
-            playback.stop()
+        await deleteLocalRecording(selection: library.recordingSelection(rec))
+    }
+
+    func deleteLocalRecordings(selections: [RecordingSelection]) async {
+        let captured = library, coordinator = sharedLibrary.coordinator
+        guard selections.allSatisfy({ $0.libraryBinding == captured.binding }) else {
+            errorMessage = "The library changed. Select the recordings again."; return
         }
+        for selection in selections {
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            await deleteLocalRecording(selection: selection)
+        }
+        guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+        captured.selectedRecordings.removeAll()
+    }
+
+    func deleteLocalRecording(selection: RecordingSelection) async {
+        guard selection.libraryBinding == library.binding else {
+            errorMessage = "The library changed. Select the recording again."; return
+        }
+        guard requireWritableLibrary() else { return }
+        let currentLibrary = library, currentSummary = summarization
+        let coordinator = currentLibrary.sharedCoordinator
+        func stillBound() -> Bool { library === currentLibrary && sharedLibrary.coordinator === coordinator }
         do {
-            try await library.deleteRecording(rec)
-            try? await summarization.summaryStore.delete(for: rec.filename)
-            summarization.hasSummary.remove(rec.filename)
+            let filename: String
+            if let coordinator {
+                guard let reference = selection.reference else { throw SharedLibraryCoordinatorError.staleJob }
+                filename = try await coordinator.resolve(reference)
+            } else {
+                guard selection.reference == nil else { throw SharedLibraryCoordinatorError.differentBinding }
+                filename = selection.filename
+            }
+            guard stillBound() else { return }
+            if playback.playingFile == filename { playback.stop() }
+            let outcome = try await currentLibrary.deleteRecording(selection: selection)
+            guard stillBound() else { return }
+            if let outcome {
+                currentSummary.hasSummary.remove(outcome.filename)
+                if outcome.result == .complete {
+                    statusMessage = "Deleted \(outcome.filename)"
+                    if let message = outcome.projectionError { statusMessage += ". Library files need attention: " + message }
+                } else {
+                    statusMessage = "Deletion is pending. Open Shared Library Review → Pending Files to finish cleanup."
+                    sharedLibrary.reviewTab = .pendingFiles
+                    sharedLibrary.showsReview = true
+                }
+            } else {
+                try? await currentSummary.summaryStore.delete(for: filename)
+                guard stillBound() else { return }
+                currentSummary.hasSummary.remove(filename)
+                statusMessage = "Deleted \(filename)"
+            }
         } catch {
-            errorMessage = "Delete failed: \(error.localizedDescription)"
+            if stillBound() { errorMessage = "Delete failed: \(error.localizedDescription)" }
         }
     }
 
@@ -330,7 +576,7 @@ final class AppState {
 
     func playRecording(_ rec: RecordingMetadata) {
         let url = library.store.baseDirectory.appendingPathComponent(rec.filename)
-        playback.play(file: rec.filename, url: url)
+        playback.play(file: rec.filename, url: url, reference: rec.reference)
         playbackTranscriptRequestID = UUID()
         let request = playbackTranscriptRequestID
         playbackTranscriptTask?.cancel()
@@ -342,7 +588,8 @@ final class AppState {
     private func refreshPlaybackTranscript(for filename: String, requestID: UUID? = nil) async {
         let request = requestID ?? playbackTranscriptRequestID
         let readingLibrary = library
-        let transcript = await readingLibrary.transcript(for: filename)
+        let reference = playback.playingFile == filename ? playback.requestedReference : nil
+        let transcript = await readingLibrary.transcript(for: filename, reference: reference)
         guard library === readingLibrary, playbackTranscriptRequestID == request else { return }
         playback.setSegmentTimestamps(
             transcript?.segments.map { (start: $0.startTime, end: $0.endTime) } ?? [],
@@ -351,6 +598,7 @@ final class AppState {
     }
 
     func transcribeRecordings(_ recs: [RecordingMetadata]) async {
+        guard requireWritableLibrary() else { return }
         let recsToSummarize = recs
         await transcription.transcribe(
             recordings: recs,
@@ -377,6 +625,7 @@ final class AppState {
         provider: any LLMProvider,
         model: String
     ) {
+        guard requireWritableLibrary() else { return }
         summarization.summarize(
             recordings: recs,
             template: template,
@@ -413,6 +662,7 @@ final class AppState {
     /// Summarize with a specific template and optional custom prompt.
     /// Auto-transcribes first if the recording has no transcript.
     func summarizeWithTemplate(_ rec: RecordingMetadata, template: Template, customPrompt: String? = nil) {
+        guard requireWritableLibrary() else { return }
         guard let settings = makeSettingsProvider() else {
             errorMessage = "No API key configured. Go to Settings > AI to add one."
             return
@@ -458,45 +708,114 @@ final class AppState {
     }
 
     func renameRecording(_ rec: RecordingMetadata, to name: String) async {
-        let originalSelection = library.selectedRecordings
+        await renameRecording(selection: library.recordingSelection(rec), to: name)
+    }
+    func renameRecording(selection: RecordingSelection, to name: String) async {
+        guard selection.libraryBinding == library.binding else { errorMessage = "The library changed. Select the recording again."; return }
+        guard requireWritableLibrary() else { return }
+        let captured = library, coordinator = sharedLibrary.coordinator
+        let originalSelection = captured.selectedRecordings
         do {
-            let newFilename = try await library.renameRecording(rec, to: name)
-            try await didRelocateRecording(from: rec.filename, to: newFilename, originalSelection: originalSelection)
+            let newFilename = try await captured.renameRecording(selection: selection, to: name)
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            try await didRelocateRecording(from: selection.filename, to: newFilename, originalSelection: originalSelection, library: captured)
         } catch {
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             errorMessage = "Rename failed: \(error.localizedDescription)"
         }
     }
 
     func moveRecording(_ rec: RecordingMetadata, toFolder folder: String?) async {
-        let originalSelection = library.selectedRecordings
+        await moveRecording(selection: library.recordingSelection(rec), toFolder: folder.map { library.folderSelection(named: $0) })
+    }
+    func moveRecording(selection: RecordingSelection, toFolder folder: FolderSelection?) async {
+        guard selection.libraryBinding == library.binding, folder == nil || folder?.libraryBinding == library.binding else {
+            errorMessage = "The library changed. Select the recording and folder again."; return
+        }
+        guard requireWritableLibrary() else { return }
+        let captured = library, coordinator = sharedLibrary.coordinator
+        let originalSelection = captured.selectedRecordings
         do {
-            let newFilename = try await library.moveRecording(filename: rec.filename, toFolder: folder)
-            try await didRelocateRecording(from: rec.filename, to: newFilename, originalSelection: originalSelection)
+            let newFilename = try await captured.moveRecording(selection: selection, toFolder: folder)
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            try await didRelocateRecording(from: selection.filename, to: newFilename, originalSelection: originalSelection, library: captured)
         } catch {
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             errorMessage = "Move failed: \(error.localizedDescription)"
         }
     }
 
-    func renameFolder(from oldName: String, to newName: String) async {
-        let affected = library.recordings.filter { $0.filename.hasPrefix(oldName + "/") }
+    private func showPendingFolder(id: UUID?, purpose: SharedFolderOperationReview.Purpose, requestedName: String? = nil,
+                                   library captured: LibraryState, coordinator: SharedLibraryCoordinator?) async -> Bool {
+        guard let id, let coordinator, library === captured, sharedLibrary.coordinator === coordinator,
+              let review = try? await coordinator.reviewFolderOperation(id: id), review.purpose == purpose,
+              requestedName == nil || review.name == requestedName,
+              purpose != .delete || review.isDeletionRequest else { return false }
+        await refreshAll()
+        guard library === captured, sharedLibrary.coordinator === coordinator else { return true }
+        errorMessage = nil
+        statusMessage = purpose == .delete ? "Folder deletion is saved and pending. Open Shared Library Review → Pending Folders to continue."
+            : "Folder change is saved and pending. Open Shared Library Review → Pending Folders to continue."
+        sharedLibrary.reviewTab = .pendingFolders; sharedLibrary.showsReview = true
+        return true
+    }
+    func deleteFolder(named name: String) async {
+        await deleteFolder(selection: library.folderSelection(named: name))
+    }
+    func deleteFolder(selection: FolderSelection) async {
+        guard selection.libraryBinding == library.binding else { errorMessage = "The library changed. Reload before changing this folder."; return }
+        guard requireWritableLibrary() else { return }
+        let name = selection.name
+        let captured = library, coordinator = sharedLibrary.coordinator
+        if let playing = playback.playingFile, playing.hasPrefix(name + "/") { playback.stop() }
+        let affected = captured.recordings.filter { $0.filename.hasPrefix(name + "/") }
+        let id = selection.reference?.entityID
         do {
-            let actualName = try await library.renameFolder(from: oldName, to: newName)
+            try await captured.deleteFolder(selection: selection)
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            if selectedView == .folder(name) { selectedView = .allRecordings }
+            for recording in affected { summarization.hasSummary.remove(recording.filename) }
+        } catch {
+            if await showPendingFolder(id: id, purpose: .delete, library: captured, coordinator: coordinator) { return }
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
+            errorMessage = "Folder delete failed: \(error.localizedDescription)"
+        }
+    }
+    func renameFolder(from oldName: String, to newName: String) async {
+        await renameFolder(selection: library.folderSelection(named: oldName), to: newName)
+    }
+    func renameFolder(selection: FolderSelection, to newName: String) async {
+        guard selection.libraryBinding == library.binding else { errorMessage = "The library changed. Reload before changing this folder."; return }
+        guard requireWritableLibrary() else { return }
+        let oldName = selection.name
+        let captured = library, coordinator = sharedLibrary.coordinator
+        let affected = captured.recordings.filter { $0.filename.hasPrefix(oldName + "/") }
+        let id = selection.reference?.entityID
+        do {
+            let actualName = try await captured.renameFolder(selection: selection, to: newName)
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             if selectedView == .folder(oldName) { selectedView = .folder(actualName) }
             for rec in affected {
                 let newFilename = actualName + rec.filename.dropFirst(oldName.count)
                 try await didRelocateRecording(from: rec.filename, to: newFilename,
-                                                originalSelection: library.selectedRecordings)
+                                                originalSelection: captured.selectedRecordings, library: captured)
             }
         } catch {
+            if await showPendingFolder(id: id, purpose: .rename, requestedName: RecordingStore.sanitizeFilename(newName), library: captured, coordinator: coordinator) { return }
+            guard library === captured, sharedLibrary.coordinator === coordinator else { return }
             errorMessage = "Folder rename failed: \(error.localizedDescription)"
         }
     }
 
     private func didRelocateRecording(from oldFilename: String, to newFilename: String,
-                                      originalSelection: Set<String>) async throws {
+                                      originalSelection: Set<String>, library captured: LibraryState) async throws {
+        guard library === captured else { return }
+        let coordinator = sharedLibrary.coordinator, summaries = summarization
+        if coordinator == nil { try await summaries.summaryStore.rename(from: oldFilename, to: newFilename) }
+        else { try await summaries.summaryStore.loadAll() }
+        guard library === captured, sharedLibrary.coordinator === coordinator, summarization === summaries else { return }
         if playback.playingFile == oldFilename { playback.playingFile = newFilename }
         if transcription.transcribingFile == oldFilename { transcription.transcribingFile = newFilename }
-        try await summarization.summaryStore.rename(from: oldFilename, to: newFilename)
         if let status = transcription.statuses.removeValue(forKey: oldFilename) {
             transcription.statuses[newFilename] = status
         }
@@ -523,53 +842,144 @@ final class AppState {
             errorMessage = "Select at least 2 recordings to merge."
             return
         }
-        // Sort by recorded date (earliest first)
         let sorted = library.recordings
             .filter { selected.contains($0.filename) }
             .sorted { ($0.recordedAt ?? .distantFuture) < ($1.recordedAt ?? .distantFuture) }
         mergeFilenames = sorted.map(\.filename)
+        mergeSelection = MergeRequest(id: UUID(), library: library, coordinator: sharedLibrary.coordinator,
+            filenames: mergeFilenames, references: Dictionary(uniqueKeysWithValues: sorted.compactMap { recording in
+                recording.reference.map { (recording.filename, $0) }
+            }))
+        completedMergeRequest = nil
+        showMergeDeletePrompt = false
         triggerMerge = true
     }
 
-    /// Execute the merge with the given name. Called after the rename dialog.
-    func executeMerge(as name: String) async {
-        guard mergeFilenames.count >= 2 else { return }
+    /// Capture the displayed ordering before a UI action schedules its Task.
+    func captureMergeRequest() -> MergeRequest? {
+        guard let source = mergeSelection, isCurrentMergeRequest(source), mergeFilenames.count >= 2,
+              mergeFilenames.count == source.filenames.count,
+              Set(mergeFilenames) == Set(source.filenames) else { return nil }
+        return MergeRequest(id: source.id, library: source.library, coordinator: source.coordinator,
+            filenames: mergeFilenames, references: source.references)
+    }
 
-        statusMessage = "Merging \(mergeFilenames.count) recordings..."
+    func captureMergeOriginalsRequest() -> MergeRequest? {
+        guard let request = completedMergeRequest, isCurrentMergeRequest(request) else { return nil }
+        return request
+    }
+
+    private func isCurrentMergeRequest(_ request: MergeRequest) -> Bool {
+        mergeSelection?.id == request.id && library === request.library && sharedLibrary.coordinator === request.coordinator
+    }
+
+    private func invalidateMergePresentation() {
+        mergeSelection = nil
+        completedMergeRequest = nil
+        triggerMerge = false
+        showMergeDeletePrompt = false
+    }
+
+    /// Execute the captured dialog request against its original library.
+    func executeMerge(as name: String, request captured: MergeRequest? = nil) async {
+        guard let request = captured ?? captureMergeRequest() else {
+            if mergeFilenames.count >= 2 { errorMessage = "The library changed. Select the recordings to merge again." }
+            return
+        }
+        guard isCurrentMergeRequest(request), requireWritableLibrary() else { return }
+        statusMessage = "Merging \(request.filenames.count) recordings..."
         do {
-            let merged = try await library.store.mergeRecordings(filenames: mergeFilenames, as: name)
-            statusMessage = "Merged \(mergeFilenames.count) recordings into \(merged.filename)"
-            await library.refresh()
-            // Select the merged recording
-            library.selectedRecordings = [merged.filename]
-            // Prompt to delete originals
+            let merged = try await request.library.store.mergeRecordings(filenames: request.filenames, as: name, references: request.references)
+            guard isCurrentMergeRequest(request) else { return }
+            await request.library.refresh()
+            guard isCurrentMergeRequest(request) else { return }
+            statusMessage = "Merged \(request.filenames.count) recordings into \(merged.filename)"
+            request.library.selectedRecordings = [merged.filename]
+            completedMergeRequest = request
             showMergeDeletePrompt = true
         } catch {
+            guard isCurrentMergeRequest(request) else { return }
             errorMessage = "Merge failed: \(error.localizedDescription)"
         }
     }
 
-    /// Delete the original recordings after a merge.
-    func deleteMergeOriginals() async {
-        for filename in mergeFilenames {
-            do {
-                try await library.store.deleteRecordingAndSidecars(filename: filename)
-                try await transcription.transcriptStore.delete(for: filename)
-                try? await summarization.summaryStore.delete(for: filename)
-                summarization.hasSummary.remove(filename)
-            } catch {
-                errorMessage = "Failed to delete \(filename): \(error.localizedDescription)"
-            }
-        }
+    func clearMergeSelection() {
+        invalidateMergePresentation()
         mergeFilenames = []
-        await library.refresh()
     }
 
-    func updateSpeakerNames(for filename: String, names: [String: String]) async {
+    /// Delete the approved original identities, even after a same-library rename.
+    func deleteMergeOriginals(request captured: MergeRequest? = nil) async {
+        guard let request = captured ?? captureMergeOriginalsRequest() else {
+            if mergeFilenames.count >= 2 { errorMessage = "The library changed. The original recordings were left in place." }
+            return
+        }
+        func stillCurrent() -> Bool { isCurrentMergeRequest(request) && completedMergeRequest?.id == request.id }
+        guard stillCurrent(), requireWritableLibrary() else { return }
+        let transcriptStore = transcription.transcriptStore, summaryState = summarization
+        for original in request.filenames {
+            guard stillCurrent() else { return }
+            do {
+                let filename: String
+                if let shared = request.coordinator {
+                    guard let reference = request.references[original] else { throw SharedLibraryCoordinatorError.staleJob }
+                    filename = try await shared.resolve(reference)
+                } else { filename = original }
+                guard stillCurrent() else { return }
+                if playback.playingFile == filename { playback.stop() }
+                try await request.library.store.deleteRecordingAndSidecars(filename: filename, reference: request.references[original])
+                guard stillCurrent() else { return }
+                if request.coordinator == nil {
+                    try await transcriptStore.delete(for: filename)
+                    guard stillCurrent() else { return }
+                    try await summaryState.summaryStore.delete(for: filename)
+                    guard stillCurrent() else { return }
+                }
+                summaryState.hasSummary.remove(filename)
+            } catch {
+                guard stillCurrent() else { return }
+                errorMessage = "Failed to delete \(original): \(error.localizedDescription)"
+            }
+        }
+        await request.library.refresh()
+        guard stillCurrent() else { return }
+        clearMergeSelection()
+    }
+
+    struct RecordingEditRequest {
+        let library: LibraryState
+        let coordinator: SharedLibraryCoordinator?
+        let selection: RecordingSelection
+        let summaryStore: SummaryStore
+    }
+    func recordingEditRequest(for recording: RecordingMetadata) -> RecordingEditRequest {
+        .init(library: library, coordinator: sharedLibrary.coordinator,
+              selection: library.recordingSelection(recording), summaryStore: summarization.summaryStore)
+    }
+    enum RecordingEdit {
+        case names([String: String]), split(UUID, Bool), merge(String, String), toggle(UUID)
+    }
+    @discardableResult
+    func editRecording(_ request: RecordingEditRequest, action: RecordingEdit) async -> Bool {
+        guard library === request.library, sharedLibrary.coordinator === request.coordinator else { return false }
+        guard requireWritableLibrary() else { return false }
+        let selected = request.selection
         do {
-            try await library.updateSpeakerNames(for: filename, names: names)
+            try request.library.validate(selected)
+            switch action {
+            case .names(let names): try await request.library.updateSpeakerNames(selection: selected, names: names)
+            case .split(let id, let following):
+                try await request.library.transcriptStore.splitSpeaker(for: selected.filename, segmentID: id, allFollowing: following, reference: selected.reference)
+            case .merge(let source, let target):
+                try await request.library.transcriptStore.mergeSpeakers(for: selected.filename, source: source, into: target, reference: selected.reference)
+            case .toggle(let id):
+                try await request.summaryStore.toggleItem(id, inSummaryFor: selected.filename, reference: selected.reference)
+            }
+            return library === request.library && sharedLibrary.coordinator === request.coordinator
         } catch {
-            errorMessage = "Failed to save speaker names: \(error.localizedDescription)"
+            guard library === request.library, sharedLibrary.coordinator === request.coordinator else { return false }
+            errorMessage = "Failed to save recording edits: \(error.localizedDescription)"
+            return false
         }
     }
 

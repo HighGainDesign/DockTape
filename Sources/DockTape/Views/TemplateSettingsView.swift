@@ -8,12 +8,10 @@ struct TemplateSettingsView: View {
 
     @State private var templates: [Template] = []
     @State private var selectedID: String?
-    @State private var editingTemplate: Template?
+    private var editor: TemplateEditingState { state.templateEditor }
     @State private var showDeleteConfirmation = false
     @State private var templateToDelete: String?
-
-    // Debounce save
-    @State private var saveTask: Task<Void, Never>?
+    @State private var persistenceError: String?
 
     var body: some View {
         HSplitView {
@@ -23,9 +21,16 @@ struct TemplateSettingsView: View {
             detailPanel
                 .frame(minWidth: 280)
         }
-        .task {
-            await loadTemplates()
+        .task(id: ObjectIdentifier(state.templateStore)) { await loadTemplates() }
+        .onChange(of: state.sharedLibrary.revision) { _, _ in Task { await loadTemplates() } }
+        .sheet(item: Binding(get: { editor.comparison }, set: { editor.comparison = $0 })) { comparison in
+            templateComparison(comparison)
         }
+        .alert("Template Change Failed", isPresented: Binding(
+            get: { persistenceError != nil || editor.message != nil }, set: { if !$0 { persistenceError = nil; editor.message = nil } }
+        )) {
+            Button("OK", role: .cancel) { persistenceError = nil; editor.message = nil }
+        } message: { Text(persistenceError ?? editor.message ?? "") }
     }
 
     // MARK: - List Panel
@@ -55,8 +60,7 @@ struct TemplateSettingsView: View {
                                 .tag(t.id)
                                 .contextMenu {
                                     Button("Delete", role: .destructive) {
-                                        templateToDelete = t.id
-                                        showDeleteConfirmation = true
+                                        requestDelete(id: t.id)
                                     }
                                 }
                         }
@@ -65,7 +69,7 @@ struct TemplateSettingsView: View {
             }
             .listStyle(.sidebar)
             .onChange(of: selectedID) { _, newID in
-                editingTemplate = templates.first { $0.id == newID }
+                Task { await editor.select(id: newID, using: state.templateStore) }
             }
 
             Divider()
@@ -100,12 +104,12 @@ struct TemplateSettingsView: View {
 
     private var detailPanel: some View {
         Group {
-            if let template = editingTemplate {
+            if let template = editor.template {
                 templateForm(template)
             } else {
                 VStack {
                     Spacer()
-                    Text("Select a template")
+                    Text(editor.isLoading ? "Loading template…" : "Select a template")
                         .font(.title3)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -133,22 +137,32 @@ struct TemplateSettingsView: View {
                     .foregroundStyle(.secondary)
 
                 TextEditor(text: bindingForPrompt(template))
+                    .accessibilityLabel("Template prompt")
                     .font(.body.monospaced())
                     .frame(minHeight: 200)
                     .border(.separator)
             }
 
             HStack {
+                if editor.hasChanges { Text("Unsaved changes").font(.caption).foregroundStyle(.secondary) }
+                Spacer()
+                Button("Compare With Latest…") { Task { await editor.compareLatest(using: state.templateStore) } }
+                    .disabled(editor.isSaving)
+                Button(editor.isSaving ? "Saving…" : "Save Template") {
+                    Task { if await editor.save(using: state.templateStore) { await loadTemplates() } }
+                }.keyboardShortcut("s", modifiers: .command)
+                    .disabled(!editor.hasChanges || editor.isSaving)
+            }
+            HStack {
                 Spacer()
                 if template.isBuiltIn {
                     Button("Reset to Default") {
                         resetBuiltIn(id: template.id)
                     }
-                    .disabled(!isOverridden(template))
+                    .disabled(!isOverridden(template) || editor.isSaving)
                 } else {
                     Button("Delete Template", role: .destructive) {
-                        templateToDelete = template.id
-                        showDeleteConfirmation = true
+                        requestDelete(id: template.id)
                     }
                 }
             }
@@ -156,81 +170,66 @@ struct TemplateSettingsView: View {
         .formStyle(.grouped)
     }
 
-    // MARK: - Bindings with debounced save
+    // MARK: - Draft bindings
 
     private func bindingForName(_ template: Template) -> Binding<String> {
         Binding(
-            get: { editingTemplate?.name ?? template.name },
+            get: { editor.template?.name ?? template.name },
             set: { newValue in
-                editingTemplate?.name = newValue
-                debouncedSave()
+                editor.change { $0.name = newValue }
             }
         )
     }
 
     private func bindingForDescription(_ template: Template) -> Binding<String> {
         Binding(
-            get: { editingTemplate?.description ?? template.description },
+            get: { editor.template?.description ?? template.description },
             set: { newValue in
-                editingTemplate?.description = newValue
-                debouncedSave()
+                editor.change { $0.description = newValue }
             }
         )
     }
 
     private func bindingForPrompt(_ template: Template) -> Binding<String> {
         Binding(
-            get: { editingTemplate?.promptText ?? template.promptText },
+            get: { editor.template?.promptText ?? template.promptText },
             set: { newValue in
-                editingTemplate?.promptText = newValue
-                debouncedSave()
+                editor.change { $0.promptText = newValue }
             }
         )
     }
 
     // MARK: - Actions
 
-    private func debouncedSave() {
-        saveTask?.cancel()
-        saveTask = Task {
-            try? await Task.sleep(for: .milliseconds(500))
-            guard !Task.isCancelled, let template = editingTemplate else { return }
-            await state.templateStore.update(template)
-            await loadTemplates()
-        }
-    }
-
     private func addNewTemplate() {
-        let newTemplate = Template.makeUserTemplate(
-            name: "New Template",
-            description: "",
-            promptText: ""
-        )
+        let newTemplate = Template.makeUserTemplate(name: "New Template", description: "", promptText: "")
         Task {
-            await state.templateStore.addUserTemplate(newTemplate)
-            await loadTemplates()
-            selectedID = newTemplate.id
+            do {
+                try await state.templateStore.addUserTemplate(newTemplate)
+                await loadTemplates(); selectedID = newTemplate.id
+            } catch { persistenceError = error.localizedDescription }
         }
     }
 
     private func deleteTemplate(id: String) {
         Task {
-            await state.templateStore.delete(id: id)
-            if selectedID == id {
-                selectedID = nil
-                editingTemplate = nil
-            }
+            guard await editor.delete(id: id, using: state.templateStore) else { return }
+            if selectedID == id { selectedID = nil }
             templateToDelete = nil
             await loadTemplates()
         }
     }
 
-    private func resetBuiltIn(id: String) {
+    private func requestDelete(id: String) {
+        selectedID = id
         Task {
-            await state.templateStore.resetToDefault(id: id)
-            await loadTemplates()
-            editingTemplate = templates.first { $0.id == id }
+            await editor.select(id: id, using: state.templateStore)
+            guard editor.template?.id == id else { return }
+            templateToDelete = id; showDeleteConfirmation = true
         }
+    }
+    private func resetBuiltIn(id: String) {
+        Task { if await editor.reset(id: id, using: state.templateStore) { await loadTemplates() } }
     }
 
     private func isOverridden(_ template: Template) -> Bool {
@@ -242,10 +241,38 @@ struct TemplateSettingsView: View {
     }
 
     private func loadTemplates() async {
-        templates = await state.templateStore.allTemplates()
-        // Refresh editingTemplate if it's still selected
-        if let id = selectedID {
-            editingTemplate = templates.first { $0.id == id }
-        }
+        let store = state.templateStore
+        let current = await store.allTemplates()
+        guard state.templateStore === store else { return }
+        templates = current
+        await editor.select(id: selectedID, using: store)
+    }
+    private func templateComparison(_ comparison: TemplateEditingState.Comparison) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Compare Template Versions").font(.title2)
+            Text("Keep My Edits keeps only the fields you edited. Save Template applies them against this reviewed version.")
+                .foregroundStyle(.secondary)
+            HStack(alignment: .top, spacing: 16) {
+                templateVersion("Your draft", comparison.draft)
+                templateVersion("Latest in library", comparison.latest.template)
+            }
+            HStack {
+                Button("Cancel") { editor.comparison = nil }.keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Use Latest") { editor.acceptComparison(keepingEdits: false) }
+                Button("Keep My Edits") { editor.acceptComparison(keepingEdits: true) }.keyboardShortcut(.defaultAction)
+            }
+        }.padding(24).frame(minWidth: 680, minHeight: 420)
+    }
+    private func templateVersion(_ title: String, _ template: Template) -> some View {
+        GroupBox(title) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(template.name).font(.headline)
+                    Text(template.description).foregroundStyle(.secondary)
+                    Text(template.promptText).textSelection(.enabled)
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
+            }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

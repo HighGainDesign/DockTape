@@ -26,6 +26,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
     private var searchToolbarItem: NSSearchToolbarItem?
     private var isDeviceContext: Bool = false
     private var settingsWindow: NSWindow?
+    private var sharedReviewWindow: SharedLibraryReviewWindowController?
 
     init(appState: AppState) {
         self.appState = appState
@@ -68,6 +69,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         for item in mainMenu.items {
             if let submenu = item.submenu {
                 for subItem in submenu.items {
+                    if subItem.action == #selector(MainMenuActions.showSharedLibraryReview(_:)) { subItem.target = self }
                     if subItem.submenu?.title == "Summarize" {
                         subItem.submenu?.delegate = self
                     }
@@ -255,11 +257,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
                 appState.device.selectedDeviceFiles.removeAll()
             }
         } else {
-            let recs = selectedLibraryRecordings
-            Task {
-                for rec in recs { await appState.deleteLocalRecording(rec) }
-                appState.library.selectedRecordings.removeAll()
-            }
+            let selections = selectedLibraryRecordings.map { appState.library.recordingSelection($0) }
+            Task { await appState.deleteLocalRecordings(selections: selections) }
         }
     }
 
@@ -404,6 +403,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
     private func startObservingState() {
         func observe() {
             withObservationTracking {
+                _ = self.appState.sharedLibrary.showsReview
                 _ = self.appState.selectedView
                 _ = self.appState.library.selectedRecordings.count
                 _ = self.appState.device.selectedDeviceFiles.count
@@ -411,6 +411,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
                 _ = self.appState.playback.playingFile
             } onChange: {
                 Task { @MainActor [weak self] in
+                    if let self, self.appState.sharedLibrary.showsReview {
+                        self.appState.sharedLibrary.showsReview = false
+                        self.showSharedLibraryReview(nil)
+                    }
                     self?.updateToolbarContext()
                     observe()
                 }
@@ -479,6 +483,7 @@ extension MainWindowController: NSMenuItemValidation {
         let isPlaying = appState.playback.playingFile != nil
 
         switch menuItem.action {
+        case #selector(MainMenuActions.showSharedLibraryReview(_:)): return appState.sharedLibrary.coordinator != nil
         case #selector(MainMenuActions.transcribe(_:)): return hasLibrarySelection
         case #selector(MainMenuActions.summarizeTemplate(_:)): return hasLibrarySelection
         case #selector(MainMenuActions.importFromDevice(_:)): return hasDeviceSelection
@@ -511,6 +516,14 @@ extension MainWindowController: NSMenuItemValidation {
     }
 
     // Menu action methods
+    @objc func showSharedLibraryReview(_ sender: Any?) {
+        guard appState.sharedLibrary.coordinator != nil else { return }
+        if sharedReviewWindow == nil { sharedReviewWindow = SharedLibraryReviewWindowController(state: appState) }
+        sharedReviewWindow?.showWindow(nil)
+        sharedReviewWindow?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
     @objc func showSettings(_ sender: Any?) {
         if let existing = settingsWindow, existing.isVisible {
             existing.makeKeyAndOrderFront(nil)

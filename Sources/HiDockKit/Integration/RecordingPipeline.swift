@@ -8,8 +8,11 @@ public actor RecordingPipeline {
     private let recordingStore: RecordingStore
     private let transcriptStore: TranscriptStore
 
-    private var transcriber: FluidTranscriber?
-    private var diarizer: SortformerFluidDiarizer?
+    private var transcriber: (any TranscriptionEngine)?
+    private var diarizer: (any DiarizationEngine)?
+    private let shared: SharedLibraryCoordinator?
+    private let usesDefaultDiarizer: Bool
+    public private(set) var projectionError: String?
 
     /// Events emitted during pipeline execution for UI/CLI display.
     public enum Event: Sendable {
@@ -30,6 +33,20 @@ public actor RecordingPipeline {
         let store = RecordingStore(baseDirectory: baseDirectory)
         self.recordingStore = store
         self.transcriptStore = TranscriptStore(baseDirectory: store.baseDirectory)
+        self.shared = nil
+        self.usesDefaultDiarizer = true
+    }
+
+    /// Reuse the caller's actual stores; supplied engines are already prepared.
+    public init(recordingStore: RecordingStore, transcriptStore: TranscriptStore,
+                shared: SharedLibraryCoordinator? = nil, transcriber: (any TranscriptionEngine)? = nil,
+                diarizer: (any DiarizationEngine)? = nil) {
+        self.recordingStore = recordingStore
+        self.transcriptStore = transcriptStore
+        self.shared = shared
+        self.transcriber = transcriber
+        self.diarizer = diarizer
+        self.usesDefaultDiarizer = transcriber == nil
     }
 
     /// The directory where recordings and transcripts are stored.
@@ -39,8 +56,10 @@ public actor RecordingPipeline {
 
     /// Initialize storage directories and load existing metadata.
     public func setup() async throws {
+        guard recordingStore.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() == transcriptStore.baseDirectory.standardizedFileURL.resolvingSymlinksInPath(),
+              shared == nil || shared?.root == recordingStore.baseDirectory.standardizedFileURL.resolvingSymlinksInPath() else { throw SharedLibraryCoordinatorError.differentBinding }
         try await recordingStore.setup()
-        try await transcriptStore.loadAll()
+        try await transcriptStore.loadAll(from: recordingStore)
     }
 
     // MARK: - Full Pipeline (Download + Transcribe)
@@ -57,30 +76,23 @@ public actor RecordingPipeline {
         let files = try await deviceManager.queryFileList()
         var metas: [RecordingMetadata] = []
 
+        let imports = SyncEngine(deviceManager: deviceManager, store: recordingStore)
         for file in files {
-            let alreadyHave = await recordingStore.isDownloaded(filename: file.filename)
-            if alreadyHave {
-                onEvent?(.skippedDownload(filename: file.filename))
-                // Find by MP3 filename
-                let mp3Name = file.filename.replacingOccurrences(of: ".hda", with: ".mp3")
-                if let meta = await recordingStore.allRecordings().first(where: { $0.filename == mp3Name }) {
-                    metas.append(meta)
-                }
-                continue
-            }
-
+            try Task.checkCancellation()
             let sizeMB = String(format: "%.1f", Double(file.size) / 1_048_576)
-            onEvent?(.downloading(filename: file.filename, sizeMB: sizeMB))
-
             do {
-                let hdaData = try await deviceManager.downloadFile(entry: file)
-                let meta = try await recordingStore.storeRecording(hdaData: hdaData, entry: file)
-                metas.append(meta)
-                onEvent?(.downloaded(filename: meta.filename))
-
-                if deleteAfterDownload {
-                    try await deviceManager.deleteFile(entry: file)
+                let meta = try await imports.downloadFile(file, deleteAfterDownload: deleteAfterDownload) { progress in
+                    if progress.phase == .downloading { onEvent?(.downloading(filename: file.filename, sizeMB: sizeMB)) }
                 }
+                if let meta {
+                    metas.append(meta)
+                    onEvent?(.downloaded(filename: meta.filename))
+                } else {
+                    onEvent?(.skippedDownload(filename: file.filename))
+                    if let existing = try await recordingStore.existingRecording(for: file) { metas.append(existing) }
+                }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 onEvent?(.downloadFailed(filename: file.filename, error: error.localizedDescription))
             }
@@ -107,28 +119,38 @@ public actor RecordingPipeline {
     }
 
     /// Transcribe a single recording by MP3 filename.
-    public func transcribeRecording(filename: String) async throws -> Transcript {
-        guard let meta = await recordingStore.allRecordings().first(where: { $0.filename == filename }) else {
-            throw HiDockError.fileNotFound(filename)
+    public func transcribeRecording(filename requestedFilename: String, numSpeakers: Int? = nil, reference: SharedRecordingReference? = nil) async throws -> Transcript {
+        let filename: String
+        if let reference { guard let shared else { throw SharedLibraryCoordinatorError.differentBinding }; filename = try await shared.resolve(reference) }
+        else { filename = requestedFilename }
+        if shared == nil { try LegacyLibraryFileAccess.requireLegacyRoot(recordingStore.baseDirectory) }
+        guard let meta = await recordingStore.allRecordings().first(where: { $0.filename == filename }) else { throw HiDockError.fileNotFound(filename) }
+        let url = recordingStore.baseDirectory.appendingPathComponent(filename)
+        var job: SharedLibraryJobToken?
+        do {
+            if let shared {
+                let view: SharedLibraryViewSnapshot
+                if let reference {
+                    view = try await shared.read(.init(id: reference.entityID, kind: .recording))
+                    guard view.libraryID == reference.libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
+                } else { view = try await shared.recording(at: filename) }
+                job = try await shared.pinJob(.init(id: view.state.id, kind: .recording), output: .transcript, audioURL: url)
+            }
+            try await prepareModels()
+            let mode = job?.recordingMode ?? meta.mode
+            let transcript = try await TranscriptionPipeline.transcribe(audioURL: url, recordingFilename: filename,
+                transcriber: transcriber!, diarizer: mode == "Wip" ? nil : diarizer, numSpeakers: mode == "Wip" ? 1 : numSpeakers)
+            try Task.checkCancellation()
+            try await transcriptStore.save(transcript, mp3Filename: filename, job: job)
+            if let shared {
+                if let job { await shared.finishJob(job) }
+                do { _ = try await shared.projectOutputs(); projectionError = nil } catch { projectionError = error.localizedDescription }
+            } else { try exportPlainText(transcript, basename: (filename as NSString).deletingPathExtension) }
+            return transcript
+        } catch {
+            if let shared, let job { await shared.finishJob(job) }
+            throw error
         }
-
-        try await prepareModels()
-
-        let mp3URL = await recordingStore.mp3URL(for: meta)
-        // Skip diarization for voice memos (single speaker)
-        let skipDiarization = meta.mode == "Wip"
-        let transcript = try await TranscriptionPipeline.transcribe(
-            audioURL: mp3URL,
-            recordingFilename: filename,
-            transcriber: transcriber!,
-            diarizer: skipDiarization ? nil : diarizer
-        )
-
-        try Task.checkCancellation()
-        try await transcriptStore.save(transcript, mp3Filename: filename)
-        try exportPlainText(transcript, basename: (filename as NSString).deletingPathExtension)
-
-        return transcript
     }
 
     // MARK: - Queries
@@ -155,6 +177,31 @@ public actor RecordingPipeline {
         numSpeakers: Int? = nil,
         onEvent: (@Sendable (Event) -> Void)?
     ) async throws {
+        if let shared {
+            var count = 0
+            for meta in metas {
+                try Task.checkCancellation()
+                var filename = meta.filename
+                let start = CFAbsoluteTimeGetCurrent()
+                do {
+                    guard let reference = meta.reference else { throw SharedSidecarError.reloadRequired }
+                    filename = try await shared.resolve(reference)
+                    let view = try await shared.read(.init(id: reference.entityID, kind: .recording))
+                    guard view.libraryID == reference.libraryID else { throw SharedLibraryCoordinatorError.differentBinding }
+                    if try SharedSidecarAdapter.transcript(view, filename: filename) != nil {
+                        onEvent?(.skippedTranscription(filename: filename)); count += 1; continue
+                    }
+                    onEvent?(.transcribing(filename: filename, duration: DurationCalculator.formatDuration(meta.estimatedDuration)))
+                    let result = try await transcribeRecording(filename: filename, numSpeakers: numSpeakers, reference: reference)
+                    count += 1
+                    onEvent?(.transcribed(filename: filename, segments: result.segments.count, speakers: result.speakerIDs.count,
+                        elapsed: String(format: "%.1f", CFAbsoluteTimeGetCurrent() - start)))
+                } catch is CancellationError { throw CancellationError() }
+                catch { onEvent?(.transcriptionFailed(filename: filename, error: error.localizedDescription)) }
+            }
+            onEvent?(.complete(fileCount: count)); return
+        }
+        try LegacyLibraryFileAccess.requireLegacyRoot(recordingStore.baseDirectory)
         onEvent?(.loadingModels)
         try await prepareModels()
         onEvent?(.modelsReady)
@@ -215,7 +262,7 @@ public actor RecordingPipeline {
             try await t.prepare()
             transcriber = t
         }
-        if diarizer == nil {
+        if diarizer == nil && usesDefaultDiarizer {
             let d = SortformerFluidDiarizer()
             do {
                 try await d.prepare()

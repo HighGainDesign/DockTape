@@ -28,7 +28,7 @@ struct SummaryTabView: View {
     }
 
     private var contentID: String {
-        state.library.store.baseDirectory.appendingPathComponent(recording.filename).absoluteString
+        state.library.contentID(for: recording.filename, fallbackRevision: state.sharedLibrary.revision)
     }
 
     var body: some View {
@@ -64,6 +64,9 @@ struct SummaryTabView: View {
         .task(id: "\(contentID)|\(summaryRetry)") {
             await reloadSummary()
         }
+        .task(id: "\(contentID)|templates-\(state.sharedLibrary.revision)") {
+            await refreshTemplateChoices()
+        }
         .onChange(of: state.summarization.summarizingFile) { old, new in
             if old == recording.filename && new != recording.filename {
                 summaryRetry += 1
@@ -77,7 +80,7 @@ struct SummaryTabView: View {
         let store = state.summarization.summaryStore
         guard !Task.isCancelled, state.library.selectedRecording == filename, contentID == identity else { return }
         await summaryState.load(for: identity) { waiting in
-            try await store.loadSummary(for: filename, onWaiting: waiting)
+            try await store.loadSummary(for: filename, reference: recording.reference, onWaiting: waiting)
         }
         guard !Task.isCancelled, state.library.selectedRecording == filename, contentID == identity else { return }
         hasTranscript = await state.transcription.transcriptStore.hasTranscript(for: filename)
@@ -88,6 +91,21 @@ struct SummaryTabView: View {
            let template = await state.templateStore.template(forID: mapLegacyTemplateID(existing.templateUsed)) {
             guard !Task.isCancelled, state.library.selectedRecording == filename, contentID == identity else { return }
             selectedTemplate = template
+        }
+    }
+
+    /// Refresh shared template choices without replacing this view or discarding
+    /// a custom prompt draft. A deleted selection falls back to the mode default.
+    private func refreshTemplateChoices() async {
+        let identity = contentID, revision = state.sharedLibrary.revision
+        let store = state.templateStore
+        let choices = await store.allTemplates()
+        let fallback = await store.defaultTemplate(forMode: recording.mode)
+        guard !Task.isCancelled, state.templateStore === store,
+              contentID == identity, state.sharedLibrary.revision == revision else { return }
+        templates = choices
+        if let selected = selectedTemplate {
+            selectedTemplate = choices.first { $0.id == selected.id } ?? fallback
         }
     }
 
@@ -299,6 +317,7 @@ struct SummaryTabView: View {
 
     private func sectionView(_ section: Summary.Section) -> some View {
         let isActionable = Self.actionableSections.contains(section.heading)
+        let editRequest = state.recordingEditRequest(for: recording)
 
         return VStack(alignment: .leading, spacing: 8) {
             Text(section.heading)
@@ -317,11 +336,7 @@ struct SummaryTabView: View {
                         HStack(alignment: .top, spacing: 8) {
                             Button {
                                 Task {
-                                    try? await state.summarization.summaryStore.toggleItem(
-                                        item.id,
-                                        inSummaryFor: recording.filename
-                                    )
-                                    await reloadSummary()
+                                    if await state.editRecording(editRequest, action: .toggle(item.id)) { await reloadSummary() }
                                 }
                             } label: {
                                 Image(systemName: item.isCompleted

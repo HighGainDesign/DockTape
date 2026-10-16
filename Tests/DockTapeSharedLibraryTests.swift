@@ -1,0 +1,1663 @@
+// © 2026 High Gain Design. All rights reserved.
+import AppKit
+import HiDockKit
+
+@main
+struct DockTapeSharedLibraryTests {
+    struct Failure: Error, CustomStringConvertible { let description: String }
+    static func expect(_ value: Bool, _ message: String) throws { if !value { throw Failure(description: message) } }
+    actor Provider: LLMProvider {
+        nonisolated let name = "Synthetic"
+        nonisolated let defaultModel = "fixture"
+        nonisolated let availableModels = ["fixture"]
+        func verifyKey() async throws {}
+        var calls = 0
+        let action: @Sendable () async throws -> Void
+        init(action: @escaping @Sendable () async throws -> Void = {}) { self.action = action }
+        func summarize(transcript: String, systemPrompt: String, model: String) async throws -> String {
+            calls += 1
+            try await action()
+            return "Synthetic summary"
+        }
+    }
+    actor Gate {
+        var waiting = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        func wait() async { waiting = true; await withCheckedContinuation { continuation = $0 } }
+        func release() { continuation?.resume(); continuation = nil }
+    }
+    @MainActor static func main() async {
+        do {
+            if CommandLine.arguments.contains("--queued-content-edit-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeQueuedContent-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await queuedContentEditChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--unpublished-content-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeUnpublishedContent-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                for action in [ColdMetadataAction.complete, .stop, .switchLibrary] {
+                    try await coldMetadataStartupChecks(parent: parent.appendingPathComponent(String(describing: action)), action: action, unpublishedContent: true)
+                }
+            } else if CommandLine.arguments.contains("--bootstrap-continuation-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeBootstrapContinuation-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await bootstrapContinuationChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--delete-dispatch-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeDeleteDispatch-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await capturedDeleteChecks(parent: parent)
+                try await batchDeleteChecks(parent: parent.appendingPathComponent("normal-batch"), switchLibrary: false)
+                try await batchDeleteChecks(parent: parent.appendingPathComponent("late-batch"), switchLibrary: true)
+            } else if CommandLine.arguments.contains("--recording-relocation-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeRecordingRelocation-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await recordingRelocationChecks(parent: parent)
+                try await capturedRecordingRelocationChecks(parent: parent.appendingPathComponent("captured"))
+                try await lateRecordingRelocationChecks(parent: parent.appendingPathComponent("late"))
+                try await malformedRecordingSelectionChecks(parent: parent.appendingPathComponent("malformed"))
+            } else if CommandLine.arguments.contains("--folder-selection-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeFolderSelection-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await folderSelectionChecks(parent: parent)
+                try await capturedFolderSelectionChecks(parent: parent.appendingPathComponent("captured"))
+            } else if CommandLine.arguments.contains("--background-metadata-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeBackgroundMetadata-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await backgroundMetadataChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--merge-binding-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeMergeBinding-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await legacyMergeSwitchChecks(parent: parent)
+                try await legacyMergeSwitchChecks(parent: parent.appendingPathComponent("replacement"), replaceRequest: true)
+                try await pendingMergeResultChecks(parent: parent.appendingPathComponent("pending"))
+                try await queuedMergeRequestChecks(parent: parent.appendingPathComponent("queued"))
+                try await mergeSelectionChecks(parent: parent.appendingPathComponent("ordinary"), identity: {
+                    try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("ordinary-writer.json"), installationAnchor: "ordinary merge binding").load()
+                })
+            } else if CommandLine.arguments.contains("--completed-child-folder-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeCompletedChildFolder-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await completedChildFolderChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--folder-rename-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeFolderRename-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = { try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "rename fixture").load() }
+                for index in 0..<8 { try await folderRenameChecks(parent: parent.appendingPathComponent(String(index)), identity: identity) }
+            } else if CommandLine.arguments.contains("--cold-metadata-retry-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeColdMetadataRetry-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await coldMetadataRetryChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--cold-metadata-refresh-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeColdMetadataRefresh-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await coldMetadataRefreshChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--cold-metadata-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeColdMetadata-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                for action in [ColdMetadataAction.complete, .stop, .switchLibrary] {
+                    try await coldMetadataStartupChecks(parent: parent.appendingPathComponent(String(describing: action)), deletedOnly: CommandLine.arguments.contains("--deleted-only"), action: action)
+                }
+            } else if CommandLine.arguments.contains("--delete-selection-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeDeleteSelection-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await deleteSelectionChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--pending-delete-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapePendingDelete-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = {
+                    try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "pending-delete fixture").load()
+                }
+                try await retainedDeletionVisibilityChecks(parent: parent, identity: identity)
+                try await deleteSelectionChecks(parent: parent.appendingPathComponent("delete-selection"))
+            } else if CommandLine.arguments.contains("--publication-overlap-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapePublication-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await publicationOverlapChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--refresh-notifications-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeRefresh-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await refreshStatusChecks(parent: parent)
+        try await bootstrapContinuationChecks(parent: parent.appendingPathComponent("bootstrap-continuation"))
+            } else { try await run() }
+        }
+        catch { fputs("Shared AppState checks failed: \(error)\n", stderr); exit(1) }
+    }
+    @MainActor static func run() async throws {
+        _ = NSApplication.shared
+        UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeSharedApp-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("synthetic audio".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+        let legacy = RecordingStore(baseDirectory: root)
+        try await legacy.setup()
+        try await legacy.setMeta(mode: "Rec", deviceFilename: "device.hda", for: "Meeting.mp3")
+        try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture",
+            hasSpeakerLabels: true, segments: [.init(startTime: 0, endTime: 1, text: "Fixture", speakerID: "s")]), mp3Filename: "Meeting.mp3")
+        try await SummaryStore(baseDirectory: root).save(Summary(recordingFilename: "Meeting.mp3", model: "fixture", provider: "fixture",
+            templateUsed: "fixture", sections: [.init(heading: "Summary", content: "Fixture summary")]), mp3Filename: "Meeting.mp3")
+        let identityFile = parent.appendingPathComponent("writer.json")
+        let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = {
+            try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "synthetic installation").load()
+        }
+        let witnesses = parent.appendingPathComponent("witnesses")
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: witnesses)
+        try await state.setup()
+        try expect(state.sharedLibrary.coordinator == nil, "Legacy startup must not enable metadata or acquire identity")
+        try expect(!FileManager.default.fileExists(atPath: identityFile.path), "Legacy startup must not create a writer identity")
+        try expect(await state.enableSharedLibrary(), "Explicit enable must connect the app to shared authority")
+        try expect(state.sharedLibrary.coordinator != nil, "All shared stores must use one coordinator")
+        let entity = try await state.sharedLibrary.coordinator!.recording(at: "Meeting.mp3").state.id
+        let playbackCoordinator = state.sharedLibrary.coordinator!
+        guard let selected = state.library.recordings.first(where: { $0.filename == "Meeting.mp3" }), let selectedReference = selected.reference else {
+            throw Failure(description: "Shared playback selection needs a captured reference")
+        }
+        state.playRecording(selected)
+        try expect(state.playback.requestedReference == selectedReference, "AppState must pass the selected recording ID into playback")
+        let playbackDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while state.playback.isPreparing {
+            guard ContinuousClock.now < playbackDeadline else { state.playback.stop(); throw Failure(description: "Synthetic playback preparation did not settle") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        state.playback.stop()
+        let gate = Gate()
+        let heldPlayer = PlaybackState(prepareFile: { _, _ in await gate.wait(); return true })
+        heldPlayer.acquireLease = { filename, _, reference in
+            let view = try await playbackCoordinator.recording(at: filename, reference: reference)
+            let token = try await playbackCoordinator.pinJob(.init(id: view.state.id, kind: .recording))
+            return .init(validate: { try await playbackCoordinator.validateJob(token) }, release: { await playbackCoordinator.finishJob(token) })
+        }
+        heldPlayer.play(file: "Meeting.mp3", url: root.appendingPathComponent("Meeting.mp3"), reference: selectedReference)
+        let playerDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !(await gate.waiting) {
+            guard ContinuousClock.now < playerDeadline else { throw Failure(description: "Playback preparation did not start") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let observer = SharedLibraryCoordinator(root: root, writerID: playbackCoordinator.writerID, witnessDirectory: witnesses)
+        let protected = try await observer.operationAuthority(entity: .init(id: entity, kind: .recording), paths: ["Meeting.mp3"])
+        try expect(protected.hasPendingWork, "Playback preparation must protect the original across instances")
+        heldPlayer.stop()
+        let releaseDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while try await observer.operationAuthority(entity: .init(id: entity, kind: .recording), paths: ["Meeting.mp3"]).hasPendingWork {
+            guard ContinuousClock.now < releaseDeadline else { throw Failure(description: "Playback stop did not release lease") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await gate.release()
+        _ = try await state.library.transcriptStore.loadTranscript(for: "Meeting.mp3")
+        try await state.library.updateSpeakerNames(for: "Meeting.mp3", names: ["s": "Alice"])
+        await state.refreshAll()
+        let transcriptFile = root.appendingPathComponent("Meeting.transcript.json")
+        var json = try Data(contentsOf: transcriptFile)
+        let publicationDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !String(decoding: json, as: UTF8.self).contains("Alice"),
+              ContinuousClock.now < publicationDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+            json = try Data(contentsOf: transcriptFile)
+        }
+        try expect(String(decoding: json, as: UTF8.self).contains("Alice"), "App edits must publish canonical sidecars without another refresh")
+        let revision = state.sharedLibrary.revision
+        let coordinator = state.sharedLibrary.coordinator!
+        let peer = SharedLibraryCoordinator(root: root, writerID: coordinator.writerID, witnessDirectory: witnesses)
+        let before = try await peer.recording(at: "Meeting.mp3")
+        _ = try await peer.edit(.init(base: before, changes: [.assign(field: "metadata.mode", value: .text("\"Mee\""))]))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await state.library.store.mode(for: "Meeting.mp3") != "Mee" || state.sharedLibrary.revision <= revision {
+            guard ContinuousClock.now < deadline else { throw Failure(description: "Independent coordinator edit did not refresh app metadata") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try expect(await state.library.store.mode(for: "Meeting.mp3") == "Mee", "Activation refresh must reread shared metadata")
+        try expect(state.sharedLibrary.revision > revision, "Visible content must receive a new revision")
+        guard let recording = state.library.recordings.first else { throw Failure(description: "Missing app recording") }
+        await state.renameRecording(recording, to: "Renamed")
+        let renameOutcome = await state.library.store.sharedOperation
+        try expect(state.errorMessage == nil, "App rename must not attempt duplicate legacy sidecar changes: " + (state.errorMessage ?? "no error") + "; result=\(String(describing: renameOutcome?.result)); projection=\(String(describing: renameOutcome?.projectionError))")
+        try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.summary.json").path), "App rename must preserve summary companion")
+        let after = try await coordinator.recording(at: "Renamed.mp3")
+        try expect(after.state.id == entity, "App rename must preserve recording identity")
+        let baseline = try await coordinator.read(.init(id: entity, kind: .recording))
+        let oldSummaryID = baseline.state.currentDocument(for: .summary)?.id
+        let staleProvider = Provider(action: {
+            let current = try await coordinator.read(.init(id: entity, kind: .recording))
+            let newer = Transcript(recordingFilename: "Renamed.mp3", transcriptionModel: "new input", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: "Changed input")])
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            _ = try await coordinator.edit(.init(base: current, changes: [.generation(try SharedDocument(id: UUID(), json: encoder.encode(newer)), component: .transcript)]))
+        })
+        _ = try await state.summarization.summaryStore.loadSummary(for: "Renamed.mp3")
+        state.summarizeRecordings(state.library.recordings, template: TemplateStore.builtInDefaults[0], provider: staleProvider, model: "fixture")
+        let raceDeadline = ContinuousClock.now.advanced(by: .seconds(4))
+        while state.summarization.isSummarizing {
+            guard ContinuousClock.now < raceDeadline else { throw Failure(description: "Summary race timed out") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try expect(await staleProvider.calls == 1, "Ready summary race must reach the synthetic provider: " + (state.errorMessage ?? "no error"))
+        let raced = try await coordinator.read(.init(id: entity, kind: .recording))
+        try expect(raced.state.currentDocument(for: .summary)?.id == oldSummaryID, "Actual summary queue must not save output from an old transcript")
+        state.errorMessage = nil
+        let validProvider = Provider()
+        state.summarizeRecordings(state.library.recordings, template: TemplateStore.builtInDefaults[0], provider: validProvider, model: "fixture")
+        let validDeadline = ContinuousClock.now.advanced(by: .seconds(4))
+        while state.summarization.isSummarizing {
+            guard ContinuousClock.now < validDeadline else { throw Failure(description: "Valid summary timed out") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let completed = try await coordinator.read(.init(id: entity, kind: .recording))
+        try expect(completed.state.currentDocument(for: .summary)?.id != oldSummaryID && state.errorMessage == nil, "Valid app summary must publish once from its pinned transcript")
+        await state.sharedLibrary.close()
+        let reopened = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: witnesses)
+        try await reopened.setup()
+        try expect(reopened.sharedLibrary.coordinator != nil, "Existing metadata must reconnect without re-enabling")
+        try expect(reopened.library.recordings.map(\.filename) == ["Renamed.mp3"], "Reopened app must display current library")
+        let secondRoot = parent.appendingPathComponent("second-mac")
+        try FileManager.default.copyItem(at: root, to: secondRoot)
+        let identityB: @Sendable () async throws -> SharedLibraryWriterIdentity = {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("writer-B.json"), installationAnchor: "synthetic second installation").load()
+        }
+        let reader = AppState(baseDirectory: secondRoot, sharedIdentity: identityB, sharedWitnessDirectory: parent.appendingPathComponent("witnesses-B"))
+        try await reader.setup()
+        try expect(reader.sharedLibrary.phase == .readOnly, "Unenrolled Mac must read without writing")
+        let provider = Provider()
+        reader.summarizeRecordings(reader.library.recordings, template: TemplateStore.builtInDefaults[0], provider: provider, model: "fixture")
+        let summaryDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while reader.summarization.isSummarizing {
+            guard ContinuousClock.now < summaryDeadline else { throw Failure(description: "Readonly summary did not stop") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try expect(await provider.calls == 0, "Readonly app must reject a job before contacting even a synthetic LLM")
+        try await reader.sharedLibrary.requestAccess()
+        try expect(reader.sharedLibrary.phase == .readOnly, "Joining must wait for existing Macs")
+        await reader.sharedLibrary.close()
+        let otherRoot = parent.appendingPathComponent("other-library")
+        try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
+        try Data("Other synthetic audio".utf8).write(to: otherRoot.appendingPathComponent("Other.mp3"))
+        try expect(await reopened.switchStorageLocation(to: .custom, customURL: otherRoot), "Shared-to-legacy switch must reconnect stores")
+        try expect(reopened.sharedLibrary.coordinator == nil, "A new legacy folder must release the old binding")
+        try expect(reopened.library.recordings.map(\.filename) == ["Other.mp3"], "New root must not show old library content")
+        try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Renamed.mp3").path), "Storage switching must not move recordings")
+        await reopened.sharedLibrary.close()
+        try await mergeSelectionChecks(parent: parent, identity: identity)
+        try await legacyMergeSwitchChecks(parent: parent.appendingPathComponent("merge-binding"))
+        try await legacyMergeSwitchChecks(parent: parent.appendingPathComponent("merge-replacement"), replaceRequest: true)
+        try await pendingMergeResultChecks(parent: parent.appendingPathComponent("pending-merge-binding"))
+        try await queuedMergeRequestChecks(parent: parent.appendingPathComponent("queued-merge-binding"))
+        try await recordingRelocationChecks(parent: parent.appendingPathComponent("recording-relocation"))
+        try await capturedRecordingRelocationChecks(parent: parent.appendingPathComponent("recording-relocation-captured"))
+        try await lateRecordingRelocationChecks(parent: parent.appendingPathComponent("recording-relocation-late"))
+        try await malformedRecordingSelectionChecks(parent: parent.appendingPathComponent("recording-relocation-malformed"))
+        try await folderSelectionChecks(parent: parent.appendingPathComponent("folder-selection"))
+        try await capturedFolderSelectionChecks(parent: parent.appendingPathComponent("folder-captured"))
+        try await folderRenameChecks(parent: parent, identity: identity)
+        try await folderDeleteLibraryChecks(parent: parent)
+        try await completedChildFolderChecks(parent: parent.appendingPathComponent("completed-child-folder"))
+        try await refreshStatusChecks(parent: parent)
+        try await retainedDeletionVisibilityChecks(parent: parent, identity: identity)
+        try await deleteSelectionChecks(parent: parent.appendingPathComponent("delete-selection"))
+        try await capturedDeleteChecks(parent: parent.appendingPathComponent("delete-dispatch"))
+        try await batchDeleteChecks(parent: parent.appendingPathComponent("normal-batch"), switchLibrary: false)
+        try await batchDeleteChecks(parent: parent.appendingPathComponent("late-batch"), switchLibrary: true)
+        try await publicationOverlapChecks(parent: parent.appendingPathComponent("publication-overlap"))
+        try await queuedContentEditChecks(parent: parent.appendingPathComponent("queued-content"))
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-metadata"))
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-stop"), action: .stop)
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("cold-switch"), action: .switchLibrary)
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("unpublished-complete"), unpublishedContent: true)
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("unpublished-stop"), action: .stop, unpublishedContent: true)
+        try await coldMetadataStartupChecks(parent: parent.appendingPathComponent("unpublished-switch"), action: .switchLibrary, unpublishedContent: true)
+        try await coldMetadataRefreshChecks(parent: parent.appendingPathComponent("cold-refresh"))
+        try await coldMetadataRetryChecks(parent: parent.appendingPathComponent("cold-retry"))
+        try await backgroundMetadataChecks(parent: parent.appendingPathComponent("background-metadata"))
+        try await backgroundMetadataChecks(parent: parent.appendingPathComponent("background-stop"), stop: true)
+        print("Actual shared AppState checks passed: explicit enable, identity isolation, semantic edits/publication, refresh, rename/companions, reconnect and ID-bound merge/original deletion and folder rename/delete.")
+    }
+    @MainActor static func backgroundMetadataChecks(parent: URL, stop: Bool = false) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("Synthetic background refresh audio".utf8).write(to: root.appendingPathComponent("B.mp3"))
+        let identity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "background fixture").load()
+        let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: parent.appendingPathComponent("witnesses"))
+        _ = try await seed.enable(); _ = try await seed.projectOutputs()
+        let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: parent.appendingPathComponent("witnesses"))
+        try await state.setup()
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        let gate = Gate()
+        var cancelled = false
+        let owner = Task { await state.library.refresh(afterMetadata: { await gate.wait(); cancelled = Task.isCancelled }) }
+        while !(await gate.waiting) { try await Task.sleep(for: .milliseconds(10)) }
+        var backgroundEntered = false
+        let background = Task { await state.refreshAll(refreshShared: false, monitored: true, beforePublication: { backgroundEntered = true }) }
+        for _ in 0..<50 {
+            if backgroundEntered { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        if stop || CommandLine.arguments.contains("--stop-background") {
+            state.library.cancelMetadataLoad()
+            await background.value
+            let stayedStopped = state.library.metadataLoadState == .stopped
+            await gate.release(); _ = await owner.value
+            await state.sharedLibrary.close()
+            try expect(stayedStopped && !backgroundEntered, "An already queued watcher must not restart loading after Stop without Retry")
+            print("Actual background stop passed: queued monitor respects Stop until explicit Retry.")
+            return
+        }
+        await gate.release()
+        let ownerCompleted = await owner.value
+        await background.value
+        await state.sharedLibrary.close()
+        try expect(!cancelled && ownerCompleted, "A monitored refresh must not supersede the metadata load awaited by an interactive action")
+        try expect(backgroundEntered && state.library.recordings.map(\.filename) == ["B.mp3"], "Queued monitor refresh must still execute after the interactive load")
+        print("Actual background metadata passed: monitor refresh waits for interactive load without cancelling it.")
+    }
+
+    @MainActor static func coldMetadataRetryChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in ["A.mp3", "B.mp3"] { try Data("Retry synthetic original".utf8).write(to: root.appendingPathComponent(name)) }
+        var template = TemplateStore.builtInDefaults[0]; template.promptText = "Resident retry template override"
+        try await TemplateStore(baseDirectory: root).update(template)
+        let identity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "retry metadata fixture").load()
+        let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: parent.appendingPathComponent("witnesses"))
+        _ = try await seed.enable(); _ = try await seed.projectOutputs()
+        let a = try await seed.reference(to: "A.mp3")
+        let head = root.appendingPathComponent(".docktape/records/" + a.entityID.uuidString.lowercased() + "/" + identity.writer.uuidString.lowercased() + ".json")
+        let original = try Data(contentsOf: head)
+        try Data("Malformed retry fixture head".utf8).write(to: head, options: .atomic)
+        let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: parent.appendingPathComponent("witnesses"))
+        var failed = false
+        do { try await state.setup() } catch { failed = true }
+        let partial = state.library.recordings.map(\.filename)
+        let errorVisible = state.library.refreshError != nil && !state.library.isLoadingMetadata
+        try original.write(to: head, options: .atomic)
+        let retried = await state.retryLibraryLoad()
+        let restored = await state.templateStore.template(forID: template.id)
+        let entries = Set(state.library.recordings.map(\.filename))
+        await state.sharedLibrary.close()
+        try expect(failed && errorVisible && partial == ["B.mp3"], "Invalid A metadata must report a real failure and preserve usable B")
+        try expect(retried && entries == ["A.mp3", "B.mp3"], "Retry restores the complete recording list")
+        try expect(restored?.promptText == template.promptText, "Retry must finish app setup, including the shared templates skipped by the failed startup")
+        print("Actual cold metadata retry passed: corrupt A preserves B/error state; retry restores full app setup.")
+    }
+
+    @MainActor static func coldMetadataRefreshChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in ["A.mp3", "B.mp3"] { try Data("Refresh synthetic original".utf8).write(to: root.appendingPathComponent(name)) }
+        let identity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "refresh metadata fixture").load()
+        let witnesses = parent.appendingPathComponent("witnesses")
+        let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: witnesses)
+        _ = try await seed.enable(); _ = try await seed.projectOutputs()
+        let a = try await seed.reference(to: "A.mp3")
+        let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: witnesses)
+        try await state.setup()
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        let head = root.appendingPathComponent(".docktape/records/" + a.entityID.uuidString.lowercased() + "/" + identity.writer.uuidString.lowercased() + ".json")
+        let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let holder = Task {
+            try await CoordinatedFileAccess().withWrite(at: head) { _ in
+                started.signal()
+                guard release.wait(timeout: .now() + 15) == .success else { throw Failure(description: "Refresh head hold timed out") }
+            }
+        }
+        let acquired = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async { continuation.resume(returning: started.wait(timeout: .now() + 2) == .success) }
+        }
+        guard acquired else { release.signal(); _ = try? await holder.value; throw Failure(description: "Missing refresh head hold") }
+        var finished = false
+        let refreshing = Task { await state.refreshAll(); finished = true }
+        for _ in 0..<100 {
+            if state.library.isLoadingMetadata { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let waitingVisible = state.library.isLoadingMetadata
+        let residentB = state.library.recordings.contains { $0.filename == "B.mp3" && $0.reference != nil }
+        state.library.cancelMetadataLoad()
+        for _ in 0..<100 {
+            if finished { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let cancelledBeforeRelease = finished
+        release.signal(); try await holder.value; await refreshing.value
+        await state.sharedLibrary.close()
+        try expect(waitingVisible, "An explicit app Refresh must show cancellable loading while A authority is held")
+        try expect(residentB, "Existing verified B remains available during a refresh")
+        try expect(cancelledBeforeRelease, "Stop Loading must cancel the entire refresh before held metadata is released")
+        try expect(state.library.metadataLoadState == .stopped, "Late refresh completion must not clear the user's stopped state")
+        print("Actual cold metadata refresh passed: waiting feedback, resident B and stop-before-release.")
+    }
+
+    enum ColdMetadataAction { case complete, stop, switchLibrary }
+    @MainActor static func queuedContentEditChecks(parent: URL) async throws {
+        let a = parent.appendingPathComponent("a"), b = parent.appendingPathComponent("b")
+        let segments = [Transcript.Segment(startTime: 0, endTime: 1, text: "Synthetic", speakerID: "s"),
+                        Transcript.Segment(startTime: 1, endTime: 2, text: "Other", speakerID: "other")]
+        let item = Summary.Item(text: "Owned action")
+        func seed(_ root: URL, _ filename: String) async throws {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try Data("Owned queued edit original".utf8).write(to: root.appendingPathComponent(filename))
+            try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: filename, transcriptionModel: "fixture", hasSpeakerLabels: true,
+                segments: segments, speakerNames: ["s": "Original", "other": "Other"]), mp3Filename: filename)
+            try await SummaryStore(baseDirectory: root).save(Summary(recordingFilename: filename, model: "fixture", provider: "fixture", templateUsed: "fixture",
+                sections: [.init(heading: "Action Items", content: "", items: [item])]), mp3Filename: filename)
+        }
+        try await seed(a, "Meeting.mp3"); try await seed(b, "Meeting.mp3")
+        let state = AppState(baseDirectory: a); try await state.setup()
+        _ = await state.library.transcript(for: "Meeting.mp3")
+        _ = await state.summarization.summaryStore.summary(for: "Meeting.mp3")
+        let selected = state.library.recordings.first!
+        let edit = state.recordingEditRequest(for: selected)
+        let actions: [AppState.RecordingEdit] = [.names(["s": "Wrong library name"]), .split(segments[0].id, true), .merge("s", "other"), .toggle(item.id)]
+        let deferred = { for action in actions { _ = await state.editRecording(edit, action: action) } }
+        try expect(await state.switchStorageLocation(to: .custom, customURL: b), "Switch before deferred content edit")
+        _ = await state.library.transcript(for: "Meeting.mp3")
+        _ = await state.summarization.summaryStore.summary(for: "Meeting.mp3")
+        let transcriptBytes = try Data(contentsOf: b.appendingPathComponent("Meeting.transcript.json"))
+        let summaryBytes = try Data(contentsOf: b.appendingPathComponent("Meeting.summary.json"))
+        await deferred()
+        try expect(try Data(contentsOf: b.appendingPathComponent("Meeting.transcript.json")) == transcriptBytes, "A queued speaker edit must not modify a replacement library")
+        try expect(try Data(contentsOf: b.appendingPathComponent("Meeting.summary.json")) == summaryBytes, "A queued summary edit must not modify a replacement library")
+        await state.sharedLibrary.close()
+
+        let sharedRoot = parent.appendingPathComponent("shared")
+        try await seed(sharedRoot, "Meeting.mp3"); try await seed(sharedRoot, "Other.mp3")
+        let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("writer.json"), installationAnchor: "queued content fixture").load()
+        }
+        let shared = AppState(baseDirectory: sharedRoot, sharedIdentity: identity, sharedWitnessDirectory: parent.appendingPathComponent("witnesses"))
+        try await shared.setup(); try expect(await shared.enableSharedLibrary(), "Enable owned same-name edit fixture")
+        let coordinator = shared.sharedLibrary.coordinator!
+        await coordinator.stopMonitoring()
+        let old = shared.library.recordings.first { $0.filename == "Meeting.mp3" }!
+        _ = try await shared.library.transcriptStore.loadTranscript(for: old.filename, reference: old.reference)
+        _ = try await shared.summarization.summaryStore.loadSummary(for: old.filename, reference: old.reference)
+        let oldEdit = shared.recordingEditRequest(for: old)
+        _ = try await coordinator.relocateRecording(filename: "Meeting.mp3", title: "Former", reference: old.reference)
+        let replacement = try await coordinator.reference(to: "Other.mp3")
+        _ = try await coordinator.relocateRecording(filename: "Other.mp3", title: "Meeting", reference: replacement)
+        _ = await shared.library.refresh()
+        _ = try await shared.library.transcriptStore.loadTranscript(for: "Meeting.mp3", reference: replacement)
+        _ = try await shared.summarization.summaryStore.loadSummary(for: "Meeting.mp3", reference: replacement)
+        let before = try await coordinator.recording(at: "Meeting.mp3", reference: replacement)
+        for action in actions { _ = await shared.editRecording(oldEdit, action: action) }
+        let after = try await coordinator.recording(at: "Meeting.mp3", reference: replacement)
+        try expect(after.state == before.state, "All deferred edit actions preserve a same-name replacement recording")
+        let current = shared.library.recordings.first { $0.reference == replacement }!
+        let accepted = await shared.editRecording(shared.recordingEditRequest(for: current), action: .names(["s": "Current name", "other": "Other"]))
+        try expect(accepted, "A current captured editor still saves")
+        let updated = try await shared.library.transcriptStore.loadTranscript(for: "Meeting.mp3", reference: replacement)
+        try expect(updated?.speakerNames["s"] == "Current name", "Current editor persists through shared authority")
+        await shared.sharedLibrary.close()
+        print("Queued names/split/merge/checkbox edits preserve replacement library and stable identity; current editor saves.")
+    }
+
+    @MainActor static func coldMetadataStartupChecks(parent: URL, deletedOnly: Bool = false, action: ColdMetadataAction = .complete, unpublishedContent: Bool = false) async throws {
+        for deleted in deletedOnly ? [true] : [false, true] {
+            let folder = parent.appendingPathComponent(deleted ? "deleted" : "alive")
+            let root = folder.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Empty"), withIntermediateDirectories: true)
+            for name in ["A.mp3", "B.mp3"] {
+                try Data("synthetic cold metadata original".utf8).write(to: root.appendingPathComponent(name))
+                if !unpublishedContent || name != "B.mp3" {
+                    try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: name, transcriptionModel: "fixture", hasSpeakerLabels: false,
+                        segments: [.init(startTime: 0, endTime: 1, text: "Resident " + name)]), mp3Filename: name)
+                }
+            }
+            if !unpublishedContent {
+                try await SummaryStore(baseDirectory: root).save(Summary(recordingFilename: "B.mp3", model: "fixture", provider: "fixture", templateUsed: "fixture",
+                    sections: [.init(heading: "Summary", content: "Resident B summary")]), mp3Filename: "B.mp3")
+            }
+            let identity = try await SharedLibraryWriterIdentityStore(file: folder.appendingPathComponent("identity.json"), installationAnchor: "cold metadata fixture").load()
+            let witnesses = folder.appendingPathComponent("witnesses")
+            let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: witnesses)
+            _ = try await seed.enable()
+            let a = try await seed.recording(at: "A.mp3")
+            if deleted { _ = try await seed.edit(.init(base: a, changes: [.delete])) }
+            if unpublishedContent {
+                try await TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: seed)).save(
+                    Transcript(recordingFilename: "B.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+                        segments: [.init(startTime: 0, endTime: 1, text: "Resident B.mp3")]), mp3Filename: "B.mp3")
+                try await SummaryStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: seed)).save(
+                    Summary(recordingFilename: "B.mp3", model: "fixture", provider: "fixture", templateUsed: "fixture",
+                        sections: [.init(heading: "Summary", content: "Resident B summary")]), mp3Filename: "B.mp3")
+                try expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("B.transcript.json").path)
+                    && !FileManager.default.fileExists(atPath: root.appendingPathComponent("B.summary.json").path),
+                    "Accepted first generations must still be awaiting output publication")
+            } else { _ = try await seed.projectOutputs() }
+            let audioA = try Data(contentsOf: root.appendingPathComponent("A.mp3"))
+            let head = root.appendingPathComponent(".docktape/records/" + a.state.id.uuidString.lowercased() + "/" + identity.writer.uuidString.lowercased() + ".json")
+            let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+            let holding = Task {
+                try await CoordinatedFileAccess().withWrite(at: head) { _ in
+                    started.signal()
+                    guard release.wait(timeout: .now() + 15) == .success else { throw Failure(description: "Cold metadata fixture hold timed out") }
+                }
+            }
+            let acquired = await withCheckedContinuation { continuation in
+                DispatchQueue.global().async { continuation.resume(returning: started.wait(timeout: .now() + 2) == .success) }
+            }
+            guard acquired else { release.signal(); _ = try? await holding.value; throw Failure(description: "Fixture did not acquire A owner head") }
+            let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: witnesses,
+                sharedTrash: { _ in throw Failure(description: "Cold metadata fixture must never dispose an original") })
+            var setupFinished = false
+            let setup = Task { try await state.setup(); setupFinished = true }
+            var sawResidentBeforeBadges = false
+            for _ in 0..<150 {
+                let resident = state.library.recordings.contains { $0.filename == "B.mp3" }
+                let badges = state.transcription.statuses["B.mp3"] == .done && state.summarization.hasSummary.contains("B.mp3")
+                sawResidentBeforeBadges = sawResidentBeforeBadges || (resident && !badges)
+                if resident && badges && state.library.folderSelection(named: "Empty").reference != nil { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            if sawResidentBeforeBadges { print("Observed B catalog before asynchronous badge publication; both became ready while A stayed held.") }
+            let residentB = state.library.recordings.first { $0.filename == "B.mp3" }
+            let emptyReady = state.library.folderSelection(named: "Empty").reference != nil
+            let unknownAVisible = state.library.recordings.contains { $0.filename == "A.mp3" }
+            let templatesBefore = state.sharedLibrary.revision
+            let bContentID = state.library.contentID(for: "B.mp3", fallbackRevision: 0)
+            let loadingVisible = state.library.isLoadingMetadata
+            let badgesReady = state.transcription.statuses["B.mp3"] == .done && state.summarization.hasSummary.contains("B.mp3")
+            var residentText: String?
+            if residentB != nil { residentText = try await state.transcription.transcriptStore.loadTranscript(for: "B.mp3")?.segments.first?.text }
+            var finishedBeforeRelease = true
+            var switched = true
+            var switchTask: Task<Bool, Never>?
+            let other = folder.appendingPathComponent("other-library")
+            if action == .stop {
+                state.library.cancelMetadataLoad()
+                for _ in 0..<100 {
+                    if setupFinished { break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                finishedBeforeRelease = setupFinished
+                await state.sharedLibrary.coordinator?.stopMonitoring()
+            } else if action == .switchLibrary {
+                try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+                try Data("Other library original".utf8).write(to: other.appendingPathComponent("Other.mp3"))
+                var switchFinished = false
+                switchTask = Task { let result = await state.switchStorageLocation(to: .custom, customURL: other); switchFinished = true; return result }
+                for _ in 0..<100 {
+                    if switchFinished { break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                finishedBeforeRelease = switchFinished
+            }
+            release.signal(); try await holding.value; try await setup.value
+            if let switchTask { switched = await switchTask.value }
+            let templatesReadyRevision = state.sharedLibrary.revision
+            await state.sharedLibrary.close()
+            if action == .complete {
+                try expect(templatesReadyRevision > templatesBefore, "Completing shared template setup must notify existing B views without resetting their content identity")
+                try expect(state.library.contentID(for: "B.mp3", fallbackRevision: 0) == bContentID, "Unrelated A catalog arrival must preserve B editor identity and its unsaved state")
+                try expect(state.library.contentID(for: "B.mp3", fallbackRevision: 100) == bContentID, "Unrelated global refresh must preserve shared B editor identity")
+                let b = try await seed.recording(at: "B.mp3")
+                guard let generation = b.state.currentDocument(for: .transcript) else { throw Failure(description: "Missing B transcript generation") }
+                _ = try await seed.edit(.init(base: b, changes: [.generationEdit(component: .transcript, generation: generation.id, key: "fixture-speaker", value: .text("Alice"))]))
+                await state.library.refresh()
+                try expect(state.library.contentID(for: "B.mp3", fallbackRevision: 0) != bContentID, "An actual B transcript change must invalidate B content")
+                let otherRoot = LibraryState(store: RecordingStore(baseDirectory: folder.appendingPathComponent("different-root")), transcriptStore: TranscriptStore(baseDirectory: root))
+                try expect(otherRoot.contentID(for: "B.mp3", fallbackRevision: 0) != bContentID, "Storage bindings must have distinct content identities")
+            }
+            try expect(emptyReady, "Independent empty folder identity arrives while unrelated authoritative metadata remains held")
+            try expect(residentB?.reference != nil, "First launch must expose resident B with stable identity while unrelated A metadata remains held (deleted=\(deleted))")
+            try expect(residentText == "Resident B.mp3", "B transcript must be usable while A metadata remains held")
+            try expect(loadingVisible && badgesReady, "Waiting feedback and resident transcript/summary badges appear before A is available")
+            try expect(!unknownAVisible, "Unknown lifecycle must not expose A's retained raw audio while metadata is pending")
+            try expect(finishedBeforeRelease, "Stop/switch must complete without waiting for the held owner head")
+            if action == .switchLibrary {
+                try expect(switched && state.library.store.baseDirectory == other && state.library.recordings.map(\.filename) == ["Other.mp3"], "Late old setup must not overwrite the new library")
+                try expect(!state.summarization.hasSummary.contains("B.mp3") && state.transcription.statuses["B.mp3"] == nil, "Old setup must not copy its badges into the new binding")
+            } else {
+                if action == .stop {
+                    try expect(state.library.metadataLoadState == .stopped && !state.library.recordings.contains { $0.filename == "A.mp3" }, "Canceled load cannot publish A after release")
+                    await state.retryLibraryLoad()
+                    await state.sharedLibrary.close()
+                    try expect(state.library.metadataLoadState == .idle && state.library.refreshError == nil, "Retry completes a fresh metadata request")
+                }
+                try expect(state.library.recordings.contains { $0.filename == "A.mp3" } == !deleted, "After metadata arrives/retries, respect A's accepted lifecycle")
+            }
+            try expect(try Data(contentsOf: root.appendingPathComponent("A.mp3")) == audioA, "Cold metadata must never mutate A original")
+        }
+        print("Actual cold metadata startup passed (\(action)): resident B/badges/loading independent; stop/retry/binding and retained-deletion safety.")
+    }
+
+    @MainActor static func publicationOverlapChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("synthetic publication audio".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+        try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture", hasSpeakerLabels: true,
+            segments: [.init(startTime: 0, endTime: 1, text: "Synthetic publication", speakerID: "s")]), mp3Filename: "Meeting.mp3")
+        let identity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "publication fixture").load()
+        let witnesses = parent.appendingPathComponent("witnesses")
+        let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: witnesses)
+        _ = try await seed.enable(); _ = try await seed.projectOutputs()
+        let original = try await seed.recording(at: "Meeting.mp3")
+        guard let generation = original.state.currentDocument(for: .transcript) else { throw Failure(description: "Missing publication fixture transcript") }
+        _ = try await seed.edit(.init(base: original, changes: [.generationEdit(component: .transcript, generation: generation.id, key: "s", value: .text("Alice"))]))
+        let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: witnesses)
+        try await state.setup()
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        let olderGate = Gate(), newerGate = Gate()
+        let older = Task { @MainActor in await state.refreshAll(refreshShared: false, beforePublication: { await olderGate.wait() }) }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await olderGate.waiting) {
+            guard ContinuousClock.now < deadline else { throw Failure(description: "Older publication did not reach barrier") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let newer = Task { @MainActor in await state.refreshAll(refreshShared: false, beforePublication: { await newerGate.wait() }) }
+        while !(await newerGate.waiting) {
+            guard ContinuousClock.now < deadline else { throw Failure(description: "Newer publication did not reach barrier") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await olderGate.release(); await older.value
+        let file = root.appendingPathComponent("Meeting.transcript.json")
+        let immediate = String(decoding: try Data(contentsOf: file), as: UTF8.self).contains("Alice")
+        try expect(!immediate, "A superseded request can return while the actual canonical publication is still pending")
+        await newerGate.release(); await newer.value
+        let current = String(decoding: try Data(contentsOf: file), as: UTF8.self).contains("Alice")
+        try expect(current, "The current refresh must publish the accepted semantic edit")
+        await state.sharedLibrary.close()
+        print("Actual publication overlap passed: superseded return precedes canonical output; current refresh publishes accepted edit.")
+    }
+
+    @MainActor static func retainedDeletionVisibilityChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {
+        let root = parent.appendingPathComponent("retained-deletion")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let audio = Data("synthetic retained original".utf8)
+        try audio.write(to: root.appendingPathComponent("Meeting.mp3"))
+        let witnesses = parent.appendingPathComponent("retained-deletion-witnesses")
+        let refuseTrash: @Sendable (URL) throws -> Void = { _ in throw Failure(description: "Pending fixture must never attempt disposal") }
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: witnesses, sharedTrash: refuseTrash)
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable retained-deletion app fixture")
+        guard let coordinator = state.sharedLibrary.coordinator else { throw Failure(description: "Missing retained-deletion binding") }
+        await coordinator.stopMonitoring()
+        let original = try await coordinator.recording(at: "Meeting.mp3")
+        let token = try await coordinator.pinJob(.init(id: original.state.id, kind: .recording))
+        guard let recording = state.library.recordings.first else { throw Failure(description: "Missing selected app recording") }
+        await state.deleteLocalRecording(recording)
+        let pending = try await coordinator.reviewRecordingOperation(id: original.state.id)
+        let accepted = try await coordinator.read(.init(id: original.state.id, kind: .recording))
+        try expect(accepted.state.lifecycle == .deleted, "Delete action must accept the logical deletion")
+        try expect(pending?.purpose == .delete && pending?.hasActiveWork == true, "An active job must retain the original after logical deletion")
+        try expect(state.errorMessage == nil, "An accepted pending deletion must not be reported as failed: " + (state.errorMessage ?? ""))
+        try expect(state.statusMessage.contains("Pending Files"), "Explain where the user can finish pending cleanup")
+        try expect(state.sharedLibrary.showsReview && state.sharedLibrary.reviewTab == .pendingFiles, "Open Pending Files for the accepted pending deletion")
+        try expect(state.library.recordings.isEmpty, "The Delete action must hide the accepted deletion without another refresh")
+        try expect(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")) == audio, "Visibility must never dispose or rewrite retained media")
+        await state.sharedLibrary.close()
+        let reopened = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: witnesses, sharedTrash: refuseTrash)
+        try await reopened.setup()
+        try expect(reopened.library.recordings.isEmpty, "Fresh launch must not rediscover a pending-deleted original as a new recording")
+        await reopened.sharedLibrary.close()
+        await coordinator.finishJob(token)
+        print("Actual retained-deletion visibility passed: refresh and fresh launch hide pending original; audio unchanged.")
+    }
+
+    actor ArmedDeleteRefreshGate {
+        var armed = false
+        var waiting = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        func arm() { armed = true }
+        func pauseIfArmed() async {
+            guard armed else { return }
+            armed = false; waiting = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+        func release() { continuation?.resume(); continuation = nil }
+    }
+    @MainActor static func batchDeleteChecks(parent: URL, switchLibrary: Bool) async throws {
+        let root = parent.appendingPathComponent("library"), next = parent.appendingPathComponent("next")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let original = Data("batch deletion original".utf8)
+        for name in ["A.mp3", "B.mp3"] { try original.write(to: root.appendingPathComponent(name)) }
+        let identity = parent.appendingPathComponent("identity.json")
+        let state = AppState(baseDirectory: root, sharedIdentity: {
+            try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "batch delete fixture").load()
+        }, sharedWitnessDirectory: parent.appendingPathComponent("local"), sharedTrash: { _ in throw Failure(description: "Pinned batch must retain synthetic audio") })
+        try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable batch Delete fixture")
+        guard let coordinator = state.sharedLibrary.coordinator else { throw Failure(description: "Missing batch coordinator") }
+        await coordinator.stopMonitoring()
+        let gate = ArmedDeleteRefreshGate()
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator, beforeLoadReturn: { await gate.pauseIfArmed() }))
+        let captured = LibraryState(store: store, transcriptStore: state.library.transcriptStore, sharedCoordinator: coordinator)
+        try await captured.setup(); state.library = captured
+        let selections = captured.recordings.sorted { $0.filename < $1.filename }.map { captured.recordingSelection($0) }
+        try expect(selections.count == 2, "Capture exactly two displayed batch items")
+        captured.selectedRecordings = ["A.mp3", "B.mp3"]
+        var jobs: [SharedLibraryJobToken] = []
+        for selection in selections {
+            guard let reference = selection.reference else { throw Failure(description: "Missing batch identity") }
+            jobs.append(try await coordinator.pinJob(.init(id: reference.entityID, kind: .recording)))
+        }
+        if switchLibrary { await gate.arm() }
+        let work = Task { @MainActor in await state.deleteLocalRecordings(selections: selections) }
+        if switchLibrary {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(12))
+            while !(await gate.waiting) {
+                guard ContinuousClock.now < deadline else { work.cancel(); await gate.release(); await work.value; throw Failure(description: "Batch did not reach first deletion metadata refresh") }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try FileManager.default.createDirectory(at: next, withIntermediateDirectories: true)
+            for name in ["A.mp3", "B.mp3"] { try Data("unrelated next original".utf8).write(to: next.appendingPathComponent(name)) }
+            let switched = await state.switchStorageLocation(to: .custom, customURL: next)
+            if !switched { await gate.release(); await work.value; throw Failure(description: "Batch root switch failed") }
+            state.library.selectedRecordings = ["B.mp3"]; state.library.selectedRecording = "B.mp3"
+            state.playback.playingFile = "B.mp3"; state.statusMessage = "Current library status"; state.errorMessage = "Current library error"
+            await gate.release()
+        }
+        await work.value
+        for selection in selections {
+            guard let reference = selection.reference else { throw Failure(description: "Lost batch identity") }
+            let view = try await coordinator.read(.init(id: reference.entityID, kind: .recording))
+            let shouldStayAlive = switchLibrary && selection.filename == "B.mp3"
+            try expect(shouldStayAlive ? view.state.lifecycle == .alive : view.state.lifecycle == .deleted, "Batch must delete only items started before its library switch: " + selection.filename)
+            try expect(try Data(contentsOf: root.appendingPathComponent(selection.filename)) == original, "Pinned original bytes remain intact")
+        }
+        if switchLibrary {
+            try expect(state.library.selectedRecordings == ["B.mp3"] && state.library.selectedRecording == "B.mp3", "Old batch must not clear new-library selection")
+            try expect(state.statusMessage == "Current library status" && state.errorMessage == "Current library error", "Old batch must not overwrite new feedback")
+            try expect(state.playback.playingFile == "B.mp3", "Old batch must not stop the new player")
+            for name in ["A.mp3", "B.mp3"] { try expect(try Data(contentsOf: next.appendingPathComponent(name)) == Data("unrelated next original".utf8), "New library bytes are unchanged") }
+        } else { try expect(captured.recordings.isEmpty && captured.selectedRecordings.isEmpty, "Normal batch deletes both selected items and clears its selection") }
+        for job in jobs { await coordinator.finishJob(job) }
+        await state.sharedLibrary.close()
+        print("Actual batch Delete passed: " + (switchLibrary ? "root switch stops remaining work and preserves new state." : "same-library batch deletes both selected IDs."))
+    }
+
+    @MainActor static func capturedDeleteChecks(parent: URL) async throws {
+        for scenario in ["shared-copy", "shared-to-legacy", "legacy-to-legacy"] {
+            let directory = parent.appendingPathComponent(scenario), root = directory.appendingPathComponent("library"), next = directory.appendingPathComponent("next")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let original = Data("captured deletion original".utf8)
+            try original.write(to: root.appendingPathComponent("Meeting.mp3"))
+            let identity = directory.appendingPathComponent("identity.json")
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "captured delete fixture").load()
+            }, sharedWitnessDirectory: directory.appendingPathComponent("local"), sharedTrash: { _ in
+                throw Failure(description: "Deletion binding fixture must retain synthetic audio")
+            })
+            try await state.setup()
+            if scenario != "legacy-to-legacy" { try expect(await state.enableSharedLibrary(), "Enable captured Delete fixture") }
+            guard let recording = state.library.recordings.first else { throw Failure(description: "Missing captured Delete source") }
+            let selection = state.library.recordingSelection(recording)
+            await state.sharedLibrary.coordinator?.stopMonitoring()
+            if scenario == "shared-copy" { try FileManager.default.copyItem(at: root, to: next) }
+            else {
+                try FileManager.default.createDirectory(at: next, withIntermediateDirectories: true)
+                try original.write(to: next.appendingPathComponent("Meeting.mp3"))
+            }
+            try expect(await state.switchStorageLocation(to: .custom, customURL: next), "Switch actual Delete library")
+            let coordinator = state.sharedLibrary.coordinator
+            await coordinator?.stopMonitoring()
+            var job: SharedLibraryJobToken?
+            if let coordinator, let reference = recording.reference { job = try await coordinator.pinJob(.init(id: reference.entityID, kind: .recording)) }
+            state.library.selectedRecordings = ["Meeting.mp3"]
+            await state.deleteLocalRecording(selection: selection)
+            try expect(state.errorMessage?.contains("library changed") == true, "Queued single Delete must refuse changed library instance")
+            state.errorMessage = nil
+            await state.deleteLocalRecordings(selections: [selection])
+            try expect(state.errorMessage?.contains("library changed") == true, "Queued batch Delete must refuse changed library instance")
+            do { _ = try await state.library.deleteRecording(selection: selection); throw Failure(description: "Direct LibraryState accepted a foreign-instance Delete") }
+            catch SharedLibraryCoordinatorError.differentBinding { }
+            if let coordinator, let reference = recording.reference {
+                let preserved = try await coordinator.read(.init(id: reference.entityID, kind: .recording))
+                try expect(preserved.state.lifecycle == .alive, "Queued Delete must not delete the same stable ID in a copied library")
+            }
+            try expect(state.library.selectedRecordings == ["Meeting.mp3"], "Refused batch cannot clear current selection")
+            for location in [root, next] { try expect(try Data(contentsOf: location.appendingPathComponent("Meeting.mp3")) == original, "Refused Delete leaves both originals intact") }
+            if let coordinator, let job { await coordinator.finishJob(job) }
+            await state.sharedLibrary.close()
+        }
+        print("Actual queued Delete passed: single/batch/model refuse copied shared and shared/legacy instance switches, preserving identities, bytes and current selection.")
+    }
+
+    @MainActor static func deleteSelectionChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        let legacy = RecordingStore(baseDirectory: root)
+        try await legacy.setup()
+        var bytes = Data(repeating: 0, count: 417)
+        bytes.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+        _ = try await legacy.importRecording(hdaData: bytes, entry: FileEntry(filename: "A.hda", size: UInt32(bytes.count)))
+        let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "delete-selection fixture").load()
+        }
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: parent.appendingPathComponent("witnesses"),
+            sharedTrash: { _ in throw Failure(description: "Protected deletion fixture must never attempt disposal") })
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable selected-deletion fixture")
+        guard let coordinator = state.sharedLibrary.coordinator, let stale = state.library.recordings.first,
+              let selected = stale.reference else { throw Failure(description: "Missing selected deletion identity") }
+        let displayedDelete = state.library.recordingSelection(stale)
+        await coordinator.stopMonitoring()
+        _ = try await state.library.store.renameRecording(filename: "A.mp3", to: "Renamed")
+        _ = try await state.library.store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Unrelated.hda", size: UInt32(bytes.count)))
+        _ = try await state.library.store.renameRecording(filename: "Unrelated.mp3", to: "A")
+        let other = try await coordinator.reference(to: "A.mp3")
+        let selectedJob = try await coordinator.pinJob(.init(id: selected.entityID, kind: .recording))
+        let otherJob = try await coordinator.pinJob(.init(id: other.entityID, kind: .recording))
+        await state.deleteLocalRecording(selection: displayedDelete)
+        let selectedAfter = try await coordinator.read(.init(id: selected.entityID, kind: .recording))
+        let otherAfter = try await coordinator.read(.init(id: other.entityID, kind: .recording))
+        try expect(selectedAfter.state.lifecycle == .deleted && otherAfter.state.lifecycle == .alive,
+            "Delete must follow the selected identity after filename reuse; selected=\(selectedAfter.state.lifecycle), other=\(otherAfter.state.lifecycle)")
+        try expect(state.errorMessage == nil, "Accepted selected deletion must be explained as pending, not failed")
+        try expect(state.library.recordings.map(\.filename) == ["A.mp3"], "Only the unrelated replacement should remain visible")
+        for name in ["A.mp3", "Renamed.mp3"] { try expect(try Data(contentsOf: root.appendingPathComponent(name)) == bytes, "Both vetoed fixture originals must be byte-identical") }
+        let otherRoot = parent.appendingPathComponent("other-library")
+        try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
+        let otherAudio = Data("Different library original".utf8)
+        try otherAudio.write(to: otherRoot.appendingPathComponent("A.mp3"))
+        try expect(await state.switchStorageLocation(to: .custom, customURL: otherRoot), "Switch selected-deletion library")
+        state.errorMessage = nil
+        await state.deleteLocalRecording(stale)
+        try expect(state.errorMessage?.hasPrefix("Delete failed:") == true, "A stale shared selection must be refused in a legacy library")
+        try expect(!state.sharedLibrary.showsReview, "A refused deletion must not open pending-success review")
+        try expect(try Data(contentsOf: otherRoot.appendingPathComponent("A.mp3")) == otherAudio, "A stale selection must preserve the same filename in another library")
+        try expect(await state.enableSharedLibrary(), "Enable second selected-deletion library")
+        guard let otherCoordinator = state.sharedLibrary.coordinator else { throw Failure(description: "Missing second deletion binding") }
+        await otherCoordinator.stopMonitoring()
+        let otherReference = try await otherCoordinator.reference(to: "A.mp3")
+        state.errorMessage = nil
+        await state.deleteLocalRecording(stale)
+        try expect(state.errorMessage?.hasPrefix("Delete failed:") == true, "A stale selection must also be refused in a different shared library")
+        let preserved = try await otherCoordinator.read(.init(id: otherReference.entityID, kind: .recording))
+        try expect(preserved.state.lifecycle == .alive, "The other library recording must remain alive")
+        try expect(!state.sharedLibrary.showsReview, "A rejected cross-library deletion must not masquerade as pending success")
+        try expect(try Data(contentsOf: otherRoot.appendingPathComponent("A.mp3")) == otherAudio, "Cross-library refusal must preserve the original")
+        await state.sharedLibrary.close()
+        await coordinator.finishJob(selectedJob); await coordinator.finishJob(otherJob)
+        print("Actual selected deletion passed: stable identity survives rename/reused filename; legacy/shared library-switch refusal preserves unrelated originals.")
+    }
+
+    final class HeldMetadataWrite: @unchecked Sendable {
+        private let condition = NSCondition()
+        private var entered = false
+        private var released = false
+        var waiting: Bool { condition.lock(); defer { condition.unlock() }; return entered }
+        func release() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+        func hold(_ file: URL) throws {
+            var failure: NSError?
+            var timedOut = false
+            NSFileCoordinator().coordinate(writingItemAt: file, options: .forReplacing, error: &failure) { _ in
+                condition.lock(); entered = true; condition.broadcast()
+                let limit = Date().addingTimeInterval(40)
+                while !released { if !condition.wait(until: limit) { timedOut = true; break } }
+                condition.unlock()
+            }
+            if let failure { throw failure }
+            if timedOut { throw Failure(description: "Owned metadata hold timed out") }
+        }
+    }
+    @MainActor static func legacyMergeSwitchChecks(parent: URL, replaceRequest: Bool = false) async throws {
+        let root = parent.appendingPathComponent("library"), next = parent.appendingPathComponent("next")
+        var bytes = Data(repeating: 0, count: 417); bytes.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+        for folder in [root, next] {
+            let store = RecordingStore(baseDirectory: folder); try await store.setup()
+            for name in ["A", "B"] { _ = try await store.importRecording(hdaData: bytes, entry: FileEntry(filename: name + ".hda", size: UInt32(bytes.count))) }
+        }
+        try await TranscriptStore(baseDirectory: next).save(Transcript(recordingFilename: "A.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Unrelated next-library transcript")]), mp3Filename: "A.mp3")
+        try await SummaryStore(baseDirectory: next).save(Summary(recordingFilename: "A.mp3", model: "fixture", provider: "fixture", templateUsed: "fixture",
+            sections: [.init(heading: "Retain", content: "Unrelated next-library summary")]), mp3Filename: "A.mp3")
+        let transcript = next.appendingPathComponent("A.transcript.json"), summary = next.appendingPathComponent("A.summary.json")
+        let transcriptBytes = try Data(contentsOf: transcript), summaryBytes = try Data(contentsOf: summary)
+        let state = AppState(baseDirectory: root, sharedIdentity: {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("writer.json"), installationAnchor: "synthetic merge binding").load()
+        }, sharedWitnessDirectory: parent.appendingPathComponent("local"))
+        try await state.setup(); state.library.selectedRecordings = ["A.mp3", "B.mp3"]; state.startMerge()
+        state.mergeFilenames = ["A.mp3", "B.mp3"] // Explicit user ordering in the merge sheet.
+        await state.executeMerge(as: "Joined")
+        try expect(state.showMergeDeletePrompt && FileManager.default.fileExists(atPath: root.appendingPathComponent("Joined.mp3").path), "Actual merge must finish before original cleanup")
+        let hold = HeldMetadataWrite(), metadata = root.appendingPathComponent("library.json")
+        let holder = Task.detached { try hold.hold(metadata) }
+        defer { hold.release() }
+        let work = Task { @MainActor in
+            let limit = ContinuousClock.now.advanced(by: .seconds(15))
+            while !hold.waiting {
+                try expect(ContinuousClock.now < limit, "Actual metadata hold must start")
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            await state.deleteMergeOriginals()
+        }
+        do {
+            let limit = ContinuousClock.now.advanced(by: .seconds(20))
+            while FileManager.default.fileExists(atPath: root.appendingPathComponent("A.mp3").path) {
+                try expect(ContinuousClock.now < limit, "First original must be removed before its metadata save waits")
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            if replaceRequest {
+                state.library.selectedRecordings = ["B.mp3", "Joined.mp3"]; state.startMerge()
+            } else {
+                try expect(await state.switchStorageLocation(to: .custom, customURL: next), "Switch during actual merge cleanup")
+                state.library.selectedRecordings = ["B.mp3"]
+            }
+            state.statusMessage = "Current library status"; state.errorMessage = "Current library error"
+            state.playback.playingFile = "B.mp3"
+            hold.release(); try await holder.value; try await work.value
+            for name in ["A.mp3", "B.mp3"] { try expect((try? Data(contentsOf: next.appendingPathComponent(name))) == bytes, "Merge cleanup must preserve new library original " + name) }
+            try expect((try? Data(contentsOf: transcript)) == transcriptBytes && (try? Data(contentsOf: summary)) == summaryBytes, "Old merge cannot remove new transcript or summary")
+            try expect((try? Data(contentsOf: root.appendingPathComponent("B.mp3"))) == bytes, "A library switch stops unstarted original cleanup")
+            let wanted: Set<String> = replaceRequest ? ["B.mp3", "Joined.mp3"] : ["B.mp3"]
+            try expect(state.library.selectedRecordings == wanted && state.statusMessage == "Current library status" && state.errorMessage == "Current library error" && state.playback.playingFile == "B.mp3", "Old cleanup cannot reset current selection, feedback or player")
+            if replaceRequest { try expect(state.captureMergeRequest() != nil && state.triggerMerge, "Old completion cannot clear a newly selected merge") }
+        } catch { hold.release(); _ = try? await holder.value; _ = try? await work.value; throw error }
+        await state.sharedLibrary.close()
+        print("Actual merge binding passed: genuine first-original metadata wait and library switch preserve unrelated files and new UI state.")
+    }
+
+    @MainActor static func pendingMergeResultChecks(parent: URL) async throws {
+        for action in ["switch", "replace", "cancel"] {
+            let directory = parent.appendingPathComponent(action), root = directory.appendingPathComponent("library"), next = directory.appendingPathComponent("next")
+            var bytes = Data(repeating: 0, count: 417); bytes.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+            for folder in [root, next] {
+                let store = RecordingStore(baseDirectory: folder); try await store.setup()
+                for name in ["A", "B"] { _ = try await store.importRecording(hdaData: bytes, entry: FileEntry(filename: name + ".hda", size: UInt32(bytes.count))) }
+            }
+            let state = AppState(baseDirectory: root)
+            try await state.setup(); state.library.selectedRecordings = ["A.mp3", "B.mp3"]; state.startMerge()
+            guard let request = state.captureMergeRequest() else { throw Failure(description: "Capture pending merge request") }
+            let hold = HeldMetadataWrite(), metadata = root.appendingPathComponent("library.json")
+            let holder = Task.detached { try hold.hold(metadata) }
+            defer { hold.release() }
+            let work = Task { @MainActor in
+                let limit = ContinuousClock.now.advanced(by: .seconds(15))
+                while !hold.waiting { try expect(ContinuousClock.now < limit, "Hold pending merge metadata"); try await Task.sleep(for: .milliseconds(10)) }
+                await state.executeMerge(as: "Joined", request: request)
+            }
+            do {
+                let limit = ContinuousClock.now.advanced(by: .seconds(20))
+                while !FileManager.default.fileExists(atPath: root.appendingPathComponent("Joined.mp3").path) {
+                    try expect(ContinuousClock.now < limit, "Merge must publish its own output before held metadata")
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                if action == "switch" { try expect(await state.switchStorageLocation(to: .custom, customURL: next), "Switch while actual merge waits") }
+                state.library.selectedRecordings = ["A.mp3", "B.mp3"]
+                if action == "cancel" { state.clearMergeSelection() } else { state.startMerge() }
+                state.statusMessage = "Current merge status"; state.errorMessage = "Current merge error"
+                hold.release(); try await holder.value; try await work.value
+                try expect(!state.showMergeDeletePrompt && state.captureMergeOriginalsRequest() == nil, "An old result cannot authorize current originals or present a stale prompt")
+                try expect(state.library.selectedRecordings == ["A.mp3", "B.mp3"] && state.statusMessage == "Current merge status" && state.errorMessage == "Current merge error", "Old merge result cannot replace the current selection or feedback")
+                if action != "cancel" { try expect(state.triggerMerge && state.captureMergeRequest() != nil, "New merge request survives old completion") }
+                for name in ["A.mp3", "B.mp3"] { try expect((try? Data(contentsOf: next.appendingPathComponent(name))) == bytes, "Unrelated pending-result root remains unchanged") }
+                if action == "switch" { try expect(!FileManager.default.fileExists(atPath: next.appendingPathComponent("Joined.mp3").path), "Started merge stays in its original root") }
+            } catch { hold.release(); _ = try? await holder.value; _ = try? await work.value; throw error }
+            await state.sharedLibrary.close()
+        }
+        print("Actual pending merge passed: switch/new request/cancel preserve current selection and feedback without stale original-delete prompts.")
+    }
+    @MainActor static func queuedMergeRequestChecks(parent: URL) async throws {
+        for kind in ["legacy", "shared-copy"] {
+            let directory = parent.appendingPathComponent(kind), root = directory.appendingPathComponent("library"), next = directory.appendingPathComponent("next"), recycled = directory.appendingPathComponent("synthetic-trash")
+            let store = RecordingStore(baseDirectory: root); try await store.setup()
+            var bytes = Data(repeating: 0, count: 417); bytes.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+            for name in ["A", "B"] { _ = try await store.importRecording(hdaData: bytes, entry: FileEntry(filename: name + ".hda", size: UInt32(bytes.count))) }
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: directory.appendingPathComponent("writer.json"), installationAnchor: "queued merge fixture").load()
+            }, sharedWitnessDirectory: directory.appendingPathComponent("local"), sharedTrash: { file in
+                try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: file, to: recycled.appendingPathComponent(UUID().uuidString))
+            })
+            try await state.setup()
+            if kind == "shared-copy" { try expect(await state.enableSharedLibrary(), "Enable queued shared merge fixture") }
+            await state.sharedLibrary.coordinator?.stopMonitoring()
+            state.library.selectedRecordings = ["A.mp3", "B.mp3"]; state.startMerge()
+            guard let old = state.captureMergeRequest() else { throw Failure(description: "Capture old queued merge") }
+            // No operation has started; a copied shared root retains the same
+            // library/entity IDs while its LibraryState instance is different.
+            try FileManager.default.copyItem(at: root, to: next)
+            try expect(await state.switchStorageLocation(to: .custom, customURL: next), "Switch before queued old merge dispatch")
+            await state.sharedLibrary.coordinator?.stopMonitoring()
+            state.library.selectedRecordings = ["A.mp3", "B.mp3"]; state.startMerge(); state.mergeFilenames = ["B.mp3", "A.mp3"]
+            state.statusMessage = "Current queued status"; state.errorMessage = "Current queued error"
+            await state.executeMerge(as: "Wrong", request: old); await state.deleteMergeOriginals(request: old)
+            try expect(!FileManager.default.fileExists(atPath: next.appendingPathComponent("Wrong.mp3").path) && state.triggerMerge && !state.showMergeDeletePrompt, "Old queued merge cannot run against a new selection with matching IDs")
+            try expect(state.library.selectedRecordings == ["A.mp3", "B.mp3"] && state.mergeFilenames == ["B.mp3", "A.mp3"] && state.statusMessage == "Current queued status" && state.errorMessage == "Current queued error", "Queued refusal preserves the displayed ordering and feedback")
+            guard let current = state.captureMergeRequest() else { throw Failure(description: "Retain current queued request") }
+            await state.executeMerge(as: "Current", request: current)
+            try expect(state.showMergeDeletePrompt && FileManager.default.fileExists(atPath: next.appendingPathComponent("Current.mp3").path), "Current ordinary merge still succeeds")
+            guard let originals = state.captureMergeOriginalsRequest() else { throw Failure(description: "Only completed current merge enables Delete Originals") }
+            await state.deleteMergeOriginals(request: originals)
+            for name in ["A.mp3", "B.mp3"] {
+                try expect((try? Data(contentsOf: root.appendingPathComponent(name))) == bytes, "Queued source root remains untouched")
+                try expect(!FileManager.default.fileExists(atPath: next.appendingPathComponent(name).path), "Current approved original cleanup still completes")
+            }
+            try expect(state.mergeFilenames.isEmpty && !state.showMergeDeletePrompt, "Ordinary current cleanup clears only its own merge")
+            await state.sharedLibrary.close()
+        }
+        print("Actual queued merge passed: stale legacy/copied shared requests refuse, current ordered merge and approved cleanup complete.")
+    }
+
+    @MainActor static func mergeSelectionChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {
+        let root = parent.appendingPathComponent("merge-library")
+        let legacy = RecordingStore(baseDirectory: root)
+        try await legacy.setup()
+        var bytes = Data(repeating: 0, count: 417)
+        bytes.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+        for name in ["A", "B"] { _ = try await legacy.importRecording(hdaData: bytes, entry: FileEntry(filename: name + ".hda", size: UInt32(bytes.count))) }
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: parent.appendingPathComponent("merge-witnesses"))
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable isolated merge library")
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        state.library.selectedRecordings = ["A.mp3", "B.mp3"]
+        state.startMerge()
+        _ = try await state.library.store.renameRecording(filename: "B.mp3", to: "Current B")
+        await state.executeMerge(as: "Joined")
+        try expect(state.showMergeDeletePrompt && FileManager.default.fileExists(atPath: root.appendingPathComponent("Joined.mp3").path), "Actual merge dialog must follow selected IDs after rename: " + (state.errorMessage ?? ""))
+        try expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("B.mp3").path), "Merge must not recreate the old source name")
+        guard let shared = state.sharedLibrary.coordinator else { throw Failure(description: "Missing merge coordinator") }
+        let oldB = try await shared.reference(to: "Current B.mp3")
+        let oldA = try await shared.reference(to: "A.mp3")
+        _ = try await state.library.store.renameRecording(filename: "Current B.mp3", to: "Later B")
+        _ = try await state.library.store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Unrelated.hda", size: UInt32(bytes.count)))
+        _ = try await state.library.store.renameRecording(filename: "Unrelated.mp3", to: "B")
+        let unrelated = try await shared.reference(to: "B.mp3")
+        var held: [SharedLibraryJobToken] = []
+        // Veto physical disposal for every possible target, so the assertion
+        // cannot send even a failing test's fixtures to the user's Trash.
+        for (reference, path) in [(oldA, "A.mp3"), (oldB, "Later B.mp3"), (unrelated, "B.mp3")] {
+            held.append(try await shared.pinJob(.init(id: reference.entityID, kind: .recording), audioURL: root.appendingPathComponent(path)))
+        }
+        await state.deleteMergeOriginals()
+        let deletedOriginal = try await shared.read(.init(id: oldB.entityID, kind: .recording))
+        let preservedNew = try await shared.read(.init(id: unrelated.entityID, kind: .recording))
+        try expect(deletedOriginal.state.lifecycle == .deleted && preservedNew.state.lifecycle == .alive, "Delete originals must follow IDs and leave a new recording at the old filename alone: " + (state.errorMessage ?? "no error") + " original=\(deletedOriginal.state.lifecycle) unrelated=\(preservedNew.state.lifecycle)")
+        for path in ["A.mp3", "Later B.mp3", "B.mp3"] {
+            try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent(path).path), "Active fixture leases must veto physical disposal")
+        }
+        for token in held { await shared.finishJob(token) }
+        state.library.selectedRecordings = ["B.mp3", "Joined.mp3"]
+        state.startMerge()
+        let other = parent.appendingPathComponent("merge-other-library")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        for name in ["B", "Joined"] { try bytes.write(to: other.appendingPathComponent(name + ".mp3")) }
+        try expect(await state.switchStorageLocation(to: .custom, customURL: other), "Switch isolated merge library")
+        await state.executeMerge(as: "Wrong library")
+        try expect(!FileManager.default.fileExists(atPath: other.appendingPathComponent("Wrong library.mp3").path), "A changed library must invalidate the open merge dialog")
+        try expect(state.errorMessage?.contains("library changed") == true, "Explain the changed merge binding")
+        await state.sharedLibrary.close()
+    }
+
+    @MainActor static func recordingRelocationChecks(parent: URL) async throws {
+        for scenario in ["source-move", "source-rename", "destination-move"] {
+            let directory = parent.appendingPathComponent(scenario), root = directory.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+            let original = Data("original relocation fixture".utf8), replacement = Data("replacement relocation fixture".utf8)
+            try original.write(to: root.appendingPathComponent("Meeting.mp3"))
+            let identity = directory.appendingPathComponent("identity.json"), local = directory.appendingPathComponent("local")
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "relocation fixture").load()
+            }, sharedWitnessDirectory: local, sharedTrash: { try FileManager.default.removeItem(at: $0) })
+            try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable actual relocation fixture")
+            guard let a = state.sharedLibrary.coordinator, let recording = state.library.recordings.first else { throw Failure(description: "Missing relocation fixture source") }
+            await a.stopMonitoring()
+            let other = SharedLibraryCoordinator(root: root, writerID: a.writerID, witnessDirectory: local, trash: { try FileManager.default.removeItem(at: $0) })
+            if scenario.hasPrefix("source") {
+                let moved = try await other.relocateRecording(filename: "Meeting.mp3", title: "Moved Original")
+                try expect(moved.result == .complete, "Original relocation completes before stale action")
+                try replacement.write(to: root.appendingPathComponent("Meeting.mp3"))
+                let entity = SharedEntityIdentity(id: UUID(), kind: .recording)
+                _ = try await other.edit(.init(base: try await other.read(entity), changes: [
+                    .assign(field: "initialPath", value: .text("Meeting.mp3")), .assign(field: "title", value: .text("Meeting")), .assign(field: "folder", value: .unset)]))
+                _ = try await other.projectOutputs()
+                if scenario == "source-move" { await state.moveRecording(recording, toFolder: "Folder") }
+                else { await state.renameRecording(recording, to: "Unexpected") }
+                try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path), "Stale source action must preserve the replacement at its name")
+                try expect(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")) == replacement, "Stale source action cannot move/rename replacement bytes")
+                try expect(try Data(contentsOf: root.appendingPathComponent("Moved Original.mp3")) == original, "Original moved identity remains intact")
+            } else {
+                let moved = try await other.renameFolder(from: "Folder", to: "Moved Folder")
+                try expect(moved.result == .complete, "Original destination folder moved")
+                try await other.createSharedFolder(named: "Folder")
+                await state.moveRecording(recording, toFolder: "Folder")
+                try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Meeting.mp3").path), "Stale destination must not move recording into the replacement folder")
+                try expect(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")) == original, "Destination refusal preserves source bytes")
+            }
+            try expect(state.errorMessage != nil, "A stale relocation selection needs reload feedback")
+            await state.sharedLibrary.close()
+        }
+        print("Actual recording relocation selection passed: stale source Move/Rename and stale destination refuse path reuse.")
+    }
+
+    @MainActor static func capturedRecordingRelocationChecks(parent: URL) async throws {
+        for kind in ["same-library-copy", "legacy"] {
+            let directory = parent.appendingPathComponent(kind), root = directory.appendingPathComponent("library"), next = directory.appendingPathComponent("next")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+            let original = Data("captured original".utf8)
+            try original.write(to: root.appendingPathComponent("Meeting.mp3"))
+            let identity = directory.appendingPathComponent("identity.json"), local = directory.appendingPathComponent("local")
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "captured relocation fixture").load()
+            }, sharedWitnessDirectory: local, sharedTrash: { try FileManager.default.removeItem(at: $0) })
+            try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable captured relocation fixture")
+            guard let recording = state.library.recordings.first else { throw Failure(description: "Missing captured source") }
+            await state.sharedLibrary.coordinator?.stopMonitoring()
+            let source = state.library.recordingSelection(recording), folder = state.library.folderSelection(named: "Folder")
+            let decoded = try JSONDecoder().decode(RecordingSelection.self, from: JSONEncoder().encode(source))
+            try expect(decoded == source, "Drag serialization preserves source identity and library instance")
+            if kind == "same-library-copy" { try FileManager.default.copyItem(at: root, to: next) }
+            else {
+                try FileManager.default.createDirectory(at: next.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+                try Data("unrelated legacy recording".utf8).write(to: next.appendingPathComponent("Meeting.mp3"))
+            }
+            try expect(await state.switchStorageLocation(to: .custom, customURL: next), "Switch actual recording action library")
+            await state.moveRecording(selection: source, toFolder: folder)
+            try expect(state.errorMessage?.contains("library changed") == true, "Queued move refuses a changed library instance")
+            state.errorMessage = nil
+            await state.renameRecording(selection: source, to: "Unexpected")
+            try expect(state.errorMessage?.contains("library changed") == true, "Open rename editor refuses a changed library instance")
+            try expect(FileManager.default.fileExists(atPath: next.appendingPathComponent("Meeting.mp3").path), "Unrelated root recording remains")
+            try expect(try Data(contentsOf: root.appendingPathComponent("Meeting.mp3")) == original, "Original binding stays intact")
+            await state.sharedLibrary.close()
+        }
+        print("Actual recording relocation binding passed: captured menu/editor/drag values refuse copied-library and shared-to-legacy root changes.")
+    }
+
+    @MainActor static func lateRecordingRelocationChecks(parent: URL) async throws {
+        for action in ["move", "rename"] {
+            for ending in ["complete", "reject"] {
+                let directory = parent.appendingPathComponent(action + ending), root = directory.appendingPathComponent("library"), next = directory.appendingPathComponent("next")
+                try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+                try Data("in-flight original".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+                try FileManager.default.createDirectory(at: next, withIntermediateDirectories: true)
+                let unrelated = Data("unrelated next-library file".utf8)
+                try unrelated.write(to: next.appendingPathComponent("Meeting.mp3"))
+                let identity = directory.appendingPathComponent("identity.json"), local = directory.appendingPathComponent("local")
+                let state = AppState(baseDirectory: root, sharedIdentity: {
+                    try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "late relocation fixture").load()
+                }, sharedWitnessDirectory: local, sharedTrash: { try FileManager.default.removeItem(at: $0) })
+                try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable late relocation fixture")
+                guard let a = state.sharedLibrary.coordinator else { throw Failure(description: "Missing late relocation coordinator") }
+                await a.stopMonitoring()
+                let pause = Gate()
+                let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: a), beforeSharedFileOperation: { await pause.wait() })
+                let captured = LibraryState(store: store, transcriptStore: state.library.transcriptStore, sharedCoordinator: a)
+                try await captured.setup(); state.library = captured
+                guard let recording = captured.recordings.first else { throw Failure(description: "Missing late source") }
+                let source = captured.recordingSelection(recording), destination = captured.folderSelection(named: "Folder")
+                let work = Task { @MainActor in
+                    if action == "move" { await state.moveRecording(selection: source, toFolder: destination) }
+                    else { await state.renameRecording(selection: source, to: "Renamed") }
+                }
+                let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+                while !(await pause.waiting) {
+                    if ContinuousClock.now >= deadline { await pause.release(); await work.value; throw Failure(description: "Relocation did not reach awaited store hook") }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                let switched = await state.switchStorageLocation(to: .custom, customURL: next)
+                if !switched { await pause.release(); await work.value; throw Failure(description: "Late relocation root switch failed") }
+                state.errorMessage = "Current library message"
+                state.library.selectedRecording = "Meeting.mp3"; state.library.selectedRecordings = ["Meeting.mp3"]
+                state.playback.playingFile = "Meeting.mp3"
+                if ending == "reject" {
+                    do { _ = try await a.relocateRecording(filename: "Meeting.mp3", title: "Changed Before Resume") }
+                    catch { await pause.release(); await work.value; throw error }
+                }
+                await pause.release(); await work.value
+                try expect(state.errorMessage == "Current library message", "Old relocation completion/error cannot overwrite new-library feedback")
+                try expect(state.library.selectedRecording == "Meeting.mp3" && state.library.selectedRecordings == ["Meeting.mp3"], "Old relocation cannot retarget new-library selection")
+                try expect(state.playback.playingFile == "Meeting.mp3", "Old relocation cannot retarget the new library player")
+                try expect(try Data(contentsOf: next.appendingPathComponent("Meeting.mp3")) == unrelated, "New library file remains unchanged")
+                let final = ending == "reject" ? "Changed Before Resume.mp3" : (action == "move" ? "Folder/Meeting.mp3" : "Renamed.mp3")
+                try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent(final).path), "Started work stays within its captured original library")
+                await state.sharedLibrary.close()
+            }
+        }
+        print("Actual in-flight relocation binding passed: old Move/Rename completion and rejection preserve the new library's feedback, selection and player.")
+    }
+
+    @MainActor static func malformedRecordingSelectionChecks(parent: URL) async throws {
+        for attack in ["traversal", "uncatalogued"] {
+            let directory = parent.appendingPathComponent(attack), root = directory.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+            try Data("displayed legacy recording".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+            let state = AppState(baseDirectory: root)
+            try await state.setup()
+            guard let recording = state.library.recordings.first else { throw Failure(description: "Missing displayed legacy recording") }
+            let legitimate = state.library.recordingSelection(recording)
+            let source = attack == "traversal" ? directory.appendingPathComponent("Outside.mp3") : root.appendingPathComponent("Late.mp3")
+            let original = Data("not selected by the drag".utf8)
+            try original.write(to: source)
+            var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(legitimate)) as! [String: Any]
+            object["filename"] = attack == "traversal" ? "../Outside.mp3" : "Late.mp3"
+            let decoded = try JSONDecoder().decode(RecordingSelection.self, from: JSONSerialization.data(withJSONObject: object))
+            await state.moveRecording(selection: decoded, toFolder: state.library.folderSelection(named: "Folder"))
+            try expect(FileManager.default.fileExists(atPath: source.path), "Decoded drag cannot move an outside or undisplayed legacy file")
+            try expect(try Data(contentsOf: source) == original && state.errorMessage != nil, "Malformed selection preserves original bytes and reports refusal")
+            await state.sharedLibrary.close()
+        }
+        print("Actual malformed recording selection passed: traversal and uncatalogued decoded legacy drags refuse.")
+    }
+
+    @MainActor static func folderSelectionChecks(parent: URL) async throws {
+        for action in ["delete", "rename"] {
+            let directory = parent.appendingPathComponent(action), root = directory.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+            let original = Data("synthetic selected folder original".utf8)
+            try original.write(to: root.appendingPathComponent("Folder/Clip.mp3"))
+            let local = directory.appendingPathComponent("local"), identity = directory.appendingPathComponent("identity.json")
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "folder selection fixture").load()
+            }, sharedWitnessDirectory: local, sharedTrash: { try FileManager.default.removeItem(at: $0) })
+            try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable folder selection fixture")
+            guard let a = state.sharedLibrary.coordinator else { throw Failure(description: "Missing folder selection coordinator") }
+            await a.stopMonitoring()
+            let other = SharedLibraryCoordinator(root: root, writerID: a.writerID, witnessDirectory: local, trash: { try FileManager.default.removeItem(at: $0) })
+            let moved = try await other.renameFolder(from: "Folder", to: "Moved")
+            try expect(moved.result == .complete, "Actual original folder move completes")
+            try await other.createSharedFolder(named: "Folder")
+            let current = try await other.snapshots(kinds: [.folder])
+            guard let replacement = current.first(where: { $0.state.value(for: "name") == .text("Folder") }) else { throw Failure(description: "Missing replacement folder") }
+            try expect(state.library.folders == ["Folder"], "Fixture retains its actual displayed folder catalog before sync refresh")
+            if action == "delete" { await state.deleteFolder(named: "Folder") }
+            else { await state.renameFolder(from: "Folder", to: "Unexpected") }
+            let after = try await other.read(.init(id: replacement.state.id, kind: .folder))
+            try expect(after.state.lifecycle == .alive && after.state.value(for: "name") == .text("Folder") && after.state.value(for: "deletionRequest") == nil,
+                "Stale displayed \(action) must not accept an operation on the replacement folder")
+            try expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path), "Replacement folder remains at its selected name")
+            try expect(try Data(contentsOf: root.appendingPathComponent("Moved/Clip.mp3")) == original, "Original moved folder bytes stay unchanged")
+            try expect(state.errorMessage != nil, "Stale displayed folder action needs a reload error")
+            await state.sharedLibrary.close()
+        }
+        print("Actual stable folder selection passed: stale displayed Rename/Delete cannot retarget a reused name.")
+    }
+
+    @MainActor static func capturedFolderSelectionChecks(parent: URL) async throws {
+        for scenario in ["editor", "same-library-copy", "legacy-root"] {
+            let directory = parent.appendingPathComponent(scenario), root = directory.appendingPathComponent("library")
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+            let original = Data("synthetic captured folder".utf8)
+            try original.write(to: root.appendingPathComponent("Folder/Clip.mp3"))
+            let local = directory.appendingPathComponent("local"), identity = directory.appendingPathComponent("identity.json")
+            let state = AppState(baseDirectory: root, sharedIdentity: {
+                try await SharedLibraryWriterIdentityStore(file: identity, installationAnchor: "captured folder fixture").load()
+            }, sharedWitnessDirectory: local, sharedTrash: { try FileManager.default.removeItem(at: $0) })
+            try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable captured folder fixture")
+            guard let a = state.sharedLibrary.coordinator else { throw Failure(description: "Missing captured folder coordinator") }
+            await a.stopMonitoring()
+            let selection = state.library.folderSelection(named: "Folder")
+            try expect(selection.reference != nil, "Displayed folder has an accepted identity")
+            if scenario == "editor" {
+                let other = SharedLibraryCoordinator(root: root, writerID: a.writerID, witnessDirectory: local)
+                _ = try await other.renameFolder(from: "Folder", to: "Moved")
+                try await other.createSharedFolder(named: "Folder")
+                await state.refreshAll()
+                try expect(state.library.folderSelection(named: "Folder").reference != selection.reference, "Fresh catalog identifies replacement")
+                await state.renameFolder(selection: selection, to: "Unexpected")
+                try expect(state.errorMessage != nil && FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path), "Editor retains original selection across refresh")
+                try expect(try Data(contentsOf: root.appendingPathComponent("Moved/Clip.mp3")) == original, "Editor cannot alter moved original")
+            } else {
+                let next = directory.appendingPathComponent("next")
+                if scenario == "same-library-copy" { try FileManager.default.copyItem(at: root, to: next) }
+                else {
+                    try FileManager.default.createDirectory(at: next.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+                    try original.write(to: next.appendingPathComponent("Folder/Clip.mp3"))
+                }
+                try expect(await state.switchStorageLocation(to: .custom, customURL: next), "Switch actual app binding before queued action")
+                let current = state.library.folderSelection(named: "Folder")
+                try expect(current.libraryBinding != selection.libraryBinding, "New LibraryState has a distinct binding")
+                if scenario == "same-library-copy" { try expect(current.reference == selection.reference, "Same library UUID still needs root-instance protection") }
+                await state.deleteFolder(selection: selection)
+                try expect(state.errorMessage != nil && FileManager.default.fileExists(atPath: next.appendingPathComponent("Folder").path), "Queued Delete cannot target new root")
+                await state.renameFolder(selection: selection, to: "Unexpected")
+                try expect(state.errorMessage != nil && FileManager.default.fileExists(atPath: next.appendingPathComponent("Folder").path), "Queued Rename cannot target new root")
+                try expect(try Data(contentsOf: next.appendingPathComponent("Folder/Clip.mp3")) == original && Data(contentsOf: root.appendingPathComponent("Folder/Clip.mp3")) == original, "Both fixture copies preserved")
+            }
+            await state.sharedLibrary.close()
+        }
+        print("Actual captured folder selection passed: refreshed editor and different-root/same-library-copy actions refuse.")
+    }
+
+    @MainActor static func folderRenameChecks(parent: URL, identity: @escaping @Sendable () async throws -> SharedLibraryWriterIdentity) async throws {
+        let root = parent.appendingPathComponent("folder-library")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder/Nested"), withIntermediateDirectories: true)
+        for name in ["Folder/A.mp3", "Folder/Nested/B.mp3"] { try Data("synthetic folder audio".utf8).write(to: root.appendingPathComponent(name)) }
+        let legacy = RecordingStore(baseDirectory: root)
+        try await legacy.setup()
+        try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Folder/A.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Preserved")]), mp3Filename: "Folder/A.mp3")
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: parent.appendingPathComponent("folder-witnesses"))
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable isolated folder library")
+        guard let shared = state.sharedLibrary.coordinator else { throw Failure(description: "Missing folder coordinator") }
+        await shared.stopMonitoring()
+        let reference = try await shared.reference(to: "Folder/A.mp3")
+        state.selectedView = .folder("Folder")
+        state.library.selectedFolder = "Folder"
+        await state.renameFolder(from: "Folder", to: "Renamed")
+        try expect(state.errorMessage == nil && state.selectedView == .folder("Renamed") && state.library.selectedFolder == "Renamed", "Actual folder action must retarget sidebar selection: " + (state.errorMessage ?? ""))
+        try expect(Set(state.library.recordings.map(\.filename)) == ["Renamed/A.mp3", "Renamed/Nested/B.mp3"], "Actual app must refresh all renamed descendant paths; paths=\(state.library.recordings.map(\.filename)), error=\(state.library.refreshError ?? "none"), loading=\(state.library.isLoadingMetadata)")
+        try expect(try await shared.reference(to: "Renamed/A.mp3") == reference, "App folder action must preserve child IDs")
+        let transcript = await state.transcription.transcriptStore.transcript(for: "Renamed/A.mp3")
+        try expect(transcript?.recordingFilename == "Renamed/A.mp3", "Actual transcript adapter must read the relocated companion")
+        await state.sharedLibrary.close()
+    }
+
+    @MainActor static func completedChildFolderChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library"), recycled = parent.appendingPathComponent("synthetic-trash")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder"), withIntermediateDirectories: true)
+        try Data("Synthetic completed child conversation".utf8).write(to: root.appendingPathComponent("Folder/Clip.mp3"))
+        let note = Data("Keep this ordinary folder note".utf8)
+        try note.write(to: root.appendingPathComponent("Folder/.note"))
+        try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Folder/Clip.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Retain child transcript state")]), mp3Filename: "Folder/Clip.mp3")
+        let state = AppState(baseDirectory: root, sharedIdentity: {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("writer.json"), installationAnchor: "synthetic completed child folder").load()
+        }, sharedWitnessDirectory: parent.appendingPathComponent("local"), sharedTrash: { file in
+            try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: file, to: recycled.appendingPathComponent(UUID().uuidString + "-" + file.lastPathComponent))
+        })
+        try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable actual completed-child folder library")
+        guard let shared = state.sharedLibrary.coordinator,
+              let recording = state.library.recordings.first(where: { $0.filename == "Folder/Clip.mp3" }) else { throw Failure(description: "Missing actual child recording") }
+        await shared.stopMonitoring()
+        let child = SharedEntityIdentity(id: try await shared.reference(to: recording.filename).entityID, kind: .recording)
+        await state.deleteLocalRecording(recording)
+        try expect(state.errorMessage == nil && state.library.recordings.isEmpty, "Actual app child deletion physically completes")
+        let deleted = try await shared.read(child)
+        let receipt = parent.appendingPathComponent("local/Operations/" + deleted.libraryID.uuidString + "/" + shared.writerID.uuidString + "/" + child.id.uuidString + ".json")
+        let receiptBytes = try Data(contentsOf: receipt)
+        try expect(deleted.state.lifecycle == .deleted, "Child remains an explicit tombstone")
+        state.selectedView = .folder("Folder"); state.library.selectedFolder = "Folder"
+        await state.renameFolder(from: "Folder", to: "After")
+        try expect(state.errorMessage == nil && state.selectedView == .folder("After") && state.library.selectedFolder == "After", "Actual parent rename succeeds and retargets selection after child deletion: " + (state.errorMessage ?? "none"))
+        try expect(try Data(contentsOf: root.appendingPathComponent("After/.note")) == note, "Ordinary note moves intact")
+        try expect(state.library.recordings.isEmpty && state.library.folders == ["After"], "Deleted child stays hidden while empty folder remains usable")
+        let unchanged = try await shared.read(child)
+        try expect(unchanged.state == deleted.state && (try Data(contentsOf: receipt)) == receiptBytes, "Parent action cannot restore child or renew its cleanup")
+        await state.renameFolder(from: "After", to: "Later")
+        try expect(state.errorMessage == nil && state.selectedView == .folder("Later"), "A subsequent ordinary rename remains usable")
+        // Only the fixture's simulated user removes the ordinary note. DockTape
+        // must preserve unknown content rather than silently clearing it.
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Later/.note"))
+        await state.deleteFolder(named: "Later")
+        try expect(state.errorMessage == nil && state.selectedView == .allRecordings && state.library.folders.isEmpty, "Actual root deletion completes after independent child cleanup")
+        try expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("Later").path), "Only acknowledged empty directory is removed")
+        await state.sharedLibrary.close()
+        print("Actual completed-child folder passed: child Trash, parent rename/selection, unchanged tombstone/receipt, subsequent rename and empty root deletion.")
+    }
+
+    @MainActor static func folderDeleteLibraryChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("folder-delete-library")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Folder/Nested"), withIntermediateDirectories: true)
+        for name in ["Folder/A.mp3", "Folder/Nested/B.mp3"] { try Data("synthetic deletion audio".utf8).write(to: root.appendingPathComponent(name)) }
+        let legacy = RecordingStore(baseDirectory: root)
+        try await legacy.setup()
+        let recycled = parent.appendingPathComponent("folder-delete-recycled")
+        let identity: @Sendable () async throws -> SharedLibraryWriterIdentity = {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("folder-delete-writer.json"), installationAnchor: "synthetic deletion installation").load()
+        }
+        let state = AppState(baseDirectory: root, sharedIdentity: identity, sharedWitnessDirectory: parent.appendingPathComponent("folder-delete-witnesses"), sharedTrash: { url in
+            try FileManager.default.createDirectory(at: recycled, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: url, to: recycled.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent))
+        })
+        try await state.setup()
+        try expect(await state.enableSharedLibrary(), "Enable actual app deletion library")
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        state.library.selectedFolder = "Folder"
+        state.selectedView = .folder("Folder")
+        await state.deleteFolder(named: "Folder")
+        try expect(state.errorMessage == nil && state.selectedView == .allRecordings && state.library.selectedFolder == nil && state.library.folders.isEmpty && state.library.recordings.isEmpty, "Actual app action must clear the removed folder and refresh descendants: " + (state.errorMessage ?? ""))
+        try expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("Folder").path), "Actual app action must complete acknowledged empty-directory cleanup")
+        await state.sharedLibrary.close()
+    }
+
+    @MainActor static func bootstrapContinuationChecks(parent: URL) async throws {
+        for scenario in ["finish", "changed", "foreign", "queued"] {
+            let home = parent.appendingPathComponent(scenario), root = home.appendingPathComponent("library")
+            let witness = home.appendingPathComponent("local")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let writer = try await SharedLibraryWriterIdentityStore(file: home.appendingPathComponent("writer.json"), installationAnchor: "synthetic interrupted setup").load()
+            for index in 0..<32 {
+                try Data("Synthetic setup audio \(index)".utf8).write(to: root.appendingPathComponent(String(format: "Clip-%02d.mp3", index)))
+            }
+            try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Clip-00.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+                segments: [.init(startTime: 0, endTime: 1, text: "Unchanged setup transcript")]), mp3Filename: "Clip-00.mp3")
+            let first = SharedLibraryCoordinator(root: root, writerID: writer.writer, witnessDirectory: witness)
+            let work = Task { try await first.enable() }
+            let format = root.appendingPathComponent(".docktape/format.json")
+            let limit = ContinuousClock.now.advanced(by: .seconds(15))
+            while !FileManager.default.fileExists(atPath: format.path) {
+                guard ContinuousClock.now < limit else { work.cancel(); _ = try? await work.value; throw Failure(description: "Initial enable did not publish its intent") }
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            work.cancel()
+            do { _ = try await work.value; throw Failure(description: "Initial setup finished before interruption") }
+            catch is CancellationError { }
+            guard case .pending(let pending) = try await LegacyLibraryBootstrap(root: root, writerID: writer.writer, witnessDirectory: witness).readiness(), !pending.complete else {
+                throw Failure(description: "Must exercise an actual unfinished initial setup")
+            }
+            let formatBefore = try Data(contentsOf: format)
+            let audio = root.appendingPathComponent("Clip-00.mp3"), original = try Data(contentsOf: audio)
+            let sidecar = root.appendingPathComponent("Clip-00.transcript.json")
+            let changedSidecar = try Data(contentsOf: sidecar) + Data("\n".utf8)
+            if scenario == "changed" { try changedSidecar.write(to: sidecar, options: .atomic) }
+            let chosen = scenario == "foreign"
+                ? try await SharedLibraryWriterIdentityStore(file: home.appendingPathComponent("foreign.json"), installationAnchor: "synthetic other setup installation").load() : writer
+            let state = AppState(baseDirectory: root, sharedIdentity: { chosen }, sharedWitnessDirectory: witness)
+            // Partial authoritative entities may make initial catalog setup fail.
+            // Settings must still explain the explicit recovery action.
+            do { try await state.setup() } catch { }
+            try expect(state.sharedLibrary.phase != .ready, "Startup cannot automatically finish an interrupted setup")
+            if scenario == "queued" {
+                // Invoke the action body after a real storage switch, as when
+                // its Task has not dispatched before the displayed binding changes.
+                let displayedLibrary = state.library
+                let deferredAction = { @MainActor in await state.enableSharedLibrary(for: displayedLibrary) }
+                let other = home.appendingPathComponent("unrelated-library")
+                try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+                try Data("Unrelated audio".utf8).write(to: other.appendingPathComponent("Other.mp3"))
+                try expect(await state.switchStorageLocation(to: .custom, customURL: other), "Actual storage switch must complete")
+                try expect(!state.sharedLibrary.hasInterruptedSetup, "Switching clears the previous Finish action")
+                state.statusMessage = "New library status"; state.errorMessage = "New library feedback"
+                try expect(!(await deferredAction()), "Queued Finish must not enable the newly selected library")
+                try expect(state.statusMessage == "New library status" && state.errorMessage == "New library feedback", "Rejected stale Finish preserves new feedback")
+                try expect(!FileManager.default.fileExists(atPath: other.appendingPathComponent(".docktape").path), "Stale Finish must not write to unrelated library")
+                try expect(try Data(contentsOf: format) == formatBefore, "Stale Finish must preserve original pending setup")
+                await state.sharedLibrary.close()
+                continue
+            }
+            if scenario == "foreign" {
+                try expect(!state.sharedLibrary.hasInterruptedSetup, "Other installations must not offer founder recovery")
+                try expect(!(await state.enableSharedLibrary()), "Another Mac cannot complete this setup")
+                try expect(try Data(contentsOf: format) == formatBefore, "Foreign retry must preserve the pending intent")
+            } else {
+                try expect(state.sharedLibrary.hasInterruptedSetup, "Founder startup must explain Finish Enabling in Settings")
+                let finished = await state.enableSharedLibrary()
+                if scenario == "finish" {
+                    try expect(finished && state.sharedLibrary.phase == .ready, "Actual app Finish Enabling must recover the original setup: " + (state.errorMessage ?? ""))
+                    try expect(state.library.recordings.count == 32, "Recovered actual app must show every original recording")
+                    try expect(try Data(contentsOf: audio) == original, "Finishing setup preserves audio")
+                    let transcript = try await state.library.transcriptStore.loadTranscript(for: "Clip-00.mp3")
+                    try expect(transcript?.plainText() == "Unchanged setup transcript", "Finishing setup preserves transcript content")
+                    try expect(!state.sharedLibrary.hasInterruptedSetup, "Completed setup clears recovery guidance")
+                } else {
+                    try expect(!finished && state.sharedLibrary.phase == .failed, "Changed inputs must refuse recovery")
+                    try expect(try Data(contentsOf: sidecar) == changedSidecar && Data(contentsOf: audio) == original, "Refused recovery must preserve changed sidecar and original audio")
+                    try expect(state.sharedLibrary.hasInterruptedSetup, "Failed founder continuation keeps the explicit Finish action available")
+                    try expect(try Data(contentsOf: format) == formatBefore, "Refused recovery preserves its original intent")
+                }
+            }
+            await state.sharedLibrary.close()
+            try expect(state.sharedLibrary.phase == .legacy && state.sharedLibrary.message == nil && !state.sharedLibrary.hasInterruptedSetup, "Closing the binding clears old setup guidance")
+        }
+        print("Actual initial setup continuation passed: explicit founder Finish, changed input refusal, foreign writer refusal, original content and close state.")
+    }
+
+    @MainActor static func refreshStatusChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("refresh-status")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("synthetic refresh audio".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
+        try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture", hasSpeakerLabels: false,
+            segments: [.init(startTime: 0, endTime: 1, text: "Current synthetic transcript")]), mp3Filename: "Meeting.mp3")
+        let identityFile = parent.appendingPathComponent("refresh-identity.json")
+        let identity = try await SharedLibraryWriterIdentityStore(file: identityFile, installationAnchor: "refresh fixture").load()
+        let witness = parent.appendingPathComponent("refresh-witnesses")
+        let seed = SharedLibraryCoordinator(root: root, writerID: identity.writer, witnessDirectory: witness)
+        _ = try await seed.enable(); try await seed.refresh(); _ = try await seed.projectOutputs()
+        let state = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: witness)
+        try await state.setup()
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        let held = Gate()
+        let older = Task { @MainActor in
+            await state.refreshAll(refreshShared: false, beforePublication: {
+                await held.wait()
+                throw SharedProjectionWriteError.stale
+            })
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await held.waiting) {
+            guard ContinuousClock.now < deadline else { throw Failure(description: "Old refresh did not reach publication") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let file = root.appendingPathComponent("Meeting.transcript.json")
+        let external = Data("{damaged external synthetic sidecar".utf8)
+        try external.write(to: file, options: .atomic)
+        await state.refreshAll(refreshShared: false)
+        let currentMessage = state.sharedLibrary.message
+        try expect(currentMessage?.contains("External Files") == true, "Newest refresh must report actual untracked sidecar")
+        await held.release(); await older.value
+        try expect(state.sharedLibrary.message == currentMessage, "Old refresh failure must not overwrite the newest actionable message")
+        try expect(try Data(contentsOf: file) == external, "Refresh feedback must never overwrite external bytes")
+        await state.refreshAll(refreshShared: false, beforePublication: { throw SharedProjectionWriteError.stale })
+        try expect(state.sharedLibrary.message != nil, "A current refresh failure remains visible")
+        let cancelledGate = Gate()
+        let savedMessage = state.sharedLibrary.message
+        let cancelled = Task { @MainActor in
+            await state.refreshAll(refreshShared: false, beforePublication: {
+                await cancelledGate.wait(); throw CancellationError()
+            })
+        }
+        let cancelDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await cancelledGate.waiting) {
+            guard ContinuousClock.now < cancelDeadline else { throw Failure(description: "Cancelled refresh did not reach publication") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        cancelled.cancel(); await cancelledGate.release(); await cancelled.value
+        try expect(state.sharedLibrary.message == savedMessage, "Cancelled refresh cannot replace current feedback")
+        // Returning from an older awaited request does not mean a newer
+        // request has finished publishing its feedback.
+        state.sharedLibrary.message = nil
+        let olderGate = Gate(), currentGate = Gate()
+        let superseded = Task { @MainActor in
+            await state.refreshAll(refreshShared: false, beforePublication: { await olderGate.wait() })
+        }
+        let olderDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await olderGate.waiting) {
+            guard ContinuousClock.now < olderDeadline else { throw Failure(description: "Superseded request did not reach publication") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let current = Task { @MainActor in
+            await state.refreshAll(refreshShared: false, beforePublication: { await currentGate.wait() })
+        }
+        let currentDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await currentGate.waiting) {
+            guard ContinuousClock.now < currentDeadline else { throw Failure(description: "Current request did not reach publication") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await olderGate.release(); await superseded.value
+        try expect(state.sharedLibrary.message == nil, "Older request must return without claiming the current request's result")
+        await currentGate.release(); await current.value
+        try expect(state.sharedLibrary.message?.contains("External Files") == true, "The newer request must eventually publish actionable recovery feedback")
+        try expect(try Data(contentsOf: file) == external, "Overlapping refreshes must preserve external bytes")
+        await state.sharedLibrary.close()
+        print("Actual refresh status ordering passed: late/cancelled failures cannot overwrite current external-file review; current failures remain visible; superseded requests return before newer feedback.")
+
+        let entity = SharedEntityIdentity(id: try await seed.recording(at: "Meeting.mp3").state.id, kind: .recording)
+        let reviews = try await seed.reviewSidecars(entity)
+        guard let review = reviews.first else { throw Failure(description: "Missing known synthetic damage") }
+        _ = try await seed.recoverSidecar(review, useChangedFile: false)
+        try await seed.refresh(); _ = try await seed.projectOutputs()
+        try await seed.refresh(); _ = try await seed.projectOutputs()
+        let observing = AppState(baseDirectory: root, sharedIdentity: { identity }, sharedWitnessDirectory: witness)
+        try await observing.setup()
+        try expect(observing.sharedLibrary.message == nil, "Fresh bound app starts without an external-file error")
+        let stream = await observing.sharedLibrary.coordinator!.events()
+        var observedEvents: [String] = []
+        let events = Task { @MainActor in
+            for await event in stream {
+                switch event {
+                case .files: observedEvents.append("files")
+                case .entity: observedEvents.append("entity")
+                case .failure(let error): observedEvents.append("error: " + error)
+                case .loading: break
+                }
+            }
+        }
+        defer { events.cancel() }
+        let liveExternal = Data("{new distinct external sidecar occurrence".utf8)
+        try await CoordinatedFileAccess().withWrite(at: file) { scope in
+            try scope.checkCancellation(); try liveExternal.write(to: scope.url, options: .atomic)
+        }
+        let notificationDeadline = ContinuousClock.now.advanced(by: .seconds(4))
+        while observing.sharedLibrary.message?.contains("External Files") != true {
+            guard ContinuousClock.now < notificationDeadline else { throw Failure(description: "Canonical sidecar-only change must notify the running app without Refresh or relaunch; message=\(observing.sharedLibrary.message ?? "none"); revision=\(observing.sharedLibrary.revision); events=\(observedEvents)") }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try expect(try Data(contentsOf: file) == liveExternal, "Live external detection preserves the changed file")
+        var revisions: [UInt64] = []
+        for _ in 0..<20 {
+            try await Task.sleep(for: .milliseconds(100))
+            revisions.append(observing.sharedLibrary.revision)
+        }
+        print("Post-notification revisions: \(revisions)")
+        try expect(Set(revisions.suffix(6)).count == 1, "External notifications must settle without a no-op publication loop: \(revisions)")
+        await observing.sharedLibrary.close()
+        print("Actual live sidecar notification passed without explicit refresh or relaunch.")
+        let interruptedRoot = parent.appendingPathComponent("interrupted-bootstrap")
+        try FileManager.default.createDirectory(at: interruptedRoot, withIntermediateDirectories: true)
+        try Data("synthetic bootstrap audio".utf8).write(to: interruptedRoot.appendingPathComponent("Meeting.mp3"))
+        try await TemplateStore(baseDirectory: interruptedRoot).update(TemplateStore.builtInDefaults[0])
+        let interruptedWitness = parent.appendingPathComponent("bootstrap-witness")
+        let interrupted = SharedLibraryCoordinator(root: interruptedRoot, writerID: identity.writer, witnessDirectory: interruptedWitness)
+        _ = try await interrupted.enable()
+        do { _ = try await interrupted.projectOutputs(beforeOutput: { index in if index == 1 { throw CancellationError() } }); throw Failure(description: "Expected publication interruption") }
+        catch is CancellationError {}
+        let recovering = AppState(baseDirectory: interruptedRoot, sharedIdentity: { identity }, sharedWitnessDirectory: interruptedWitness)
+        try await recovering.setup()
+        guard let recovery = recovering.sharedLibrary.coordinator else { throw Failure(description: "Missing bootstrap recovery binding") }
+        await recovery.stopMonitoring()
+        let model = recovering.sharedLibrary.externalReview
+        await model.refresh(using: recovery)
+        guard let row = model.items.first(where: { $0.bootstrap?.filename == ".templates.json" }) else { throw Failure(description: "Interrupted templates must have an actionable restore row") }
+        try expect(await model.apply(row, useChangedFile: false, using: recovery), "Actual review model must restore an interrupted aggregate")
+        await recovering.refreshAll()
+        await model.refresh(using: recovery)
+        try expect(model.items.isEmpty && recovering.sharedLibrary.message == nil, "Aggregate recovery must clear its row and app feedback")
+        await recovering.sharedLibrary.close()
+        print("Actual AppState interrupted-bootstrap review and restoration passed.")
+    }
+
+}

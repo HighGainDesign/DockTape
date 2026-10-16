@@ -6,7 +6,7 @@ import HiDockKit
 struct SidebarView: View {
     @Bindable var state: AppState
 
-    @State private var renamingFolder: String? = nil
+    @State private var renamingFolder: FolderSelection? = nil
     @State private var renameText: String = ""
     @State private var isCreatingFolder: Bool = false
     @State private var newFolderName: String = ""
@@ -33,24 +33,21 @@ struct SidebarView: View {
                         Image(systemName: "folder")
                     }
                     .tag(SidebarSelection.allRecordings)
-                    .dropDestination(for: String.self) { filenames, _ in
+                    .dropDestination(for: RecordingSelection.self) { selections, _ in
                         Task {
-                            for filename in filenames {
-                                if let rec = state.library.recordings.first(where: { $0.filename == filename }) {
-                                    await state.moveRecording(rec, toFolder: nil)
-                                }
-                            }
+                            for selection in selections { await state.moveRecording(selection: selection, toFolder: nil) }
                         }
                         return true
                     }
 
-                    ForEach(state.library.folders, id: \.self) { folder in
+                    ForEach(state.library.folderSelections) { selection in
+                        let folder = selection.name
                         Label {
                             HStack {
-                                if renamingFolder == folder {
+                                if renamingFolder == selection {
                                     TextField("Folder name", text: $renameText)
                                         .textFieldStyle(.roundedBorder)
-                                        .onSubmit { commitRename(oldName: folder) }
+                                        .onSubmit { commitRename(selection: renamingFolder ?? selection) }
                                         .onExitCommand { renamingFolder = nil }
                                 } else {
                                     Text(folder)
@@ -74,23 +71,16 @@ struct SidebarView: View {
                         .contextMenu {
                             Button("Rename...") {
                                 renameText = folder
-                                renamingFolder = folder
+                                renamingFolder = selection
                             }
                             Divider()
                             Button("Delete Folder", role: .destructive) {
-                                Task {
-                                    do { try await state.library.deleteFolder(named: folder) }
-                                    catch { state.errorMessage = error.localizedDescription }
-                                }
+                                Task { await state.deleteFolder(selection: selection) }
                             }
                         }
-                        .dropDestination(for: String.self) { filenames, _ in
+                        .dropDestination(for: RecordingSelection.self) { recordings, _ in
                             Task {
-                                for filename in filenames {
-                                    if let rec = state.library.recordings.first(where: { $0.filename == filename }) {
-                                        await state.moveRecording(rec, toFolder: folder)
-                                    }
-                                }
+                                for recording in recordings { await state.moveRecording(selection: recording, toFolder: selection) }
                             }
                             return true
                         }
@@ -146,6 +136,13 @@ struct SidebarView: View {
                 .background(.blue.opacity(0.05))
             }
 
+            if state.sharedLibrary.phase == .connecting {
+                HStack { ProgressView().controlSize(.small); Text("Opening shared library…").font(.caption) }.padding(8)
+            } else if state.sharedLibrary.phase == .readOnly {
+                Label("Shared library: read-only", systemImage: "lock").font(.caption).foregroundStyle(.secondary).padding(8)
+            } else if state.sharedLibrary.phase == .failed {
+                Label("Shared library needs attention in Settings", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange).padding(8)
+            }
             Divider()
             deviceStatusBar
         }
@@ -171,15 +168,28 @@ struct SidebarView: View {
     }
 
     private var libraryHeader: some View {
-        Text("Library")
+        HStack {
+            Text("Library")
+            Spacer()
+            if state.sharedLibrary.coordinator != nil {
+                if state.sharedLibrary.message != nil {
+                    Button("Needs Review") { state.sharedLibrary.showsReview = true }
+                        .font(.caption).buttonStyle(.borderless)
+                        .help(state.sharedLibrary.message ?? "Review shared library")
+                }
+                Button { state.sharedLibrary.showsReview = true } label: { Image(systemName: "arrow.triangle.branch") }
+                    .buttonStyle(.borderless).help("Review Shared Library")
+                    .accessibilityLabel("Review Shared Library")
+            }
+        }
     }
 
-    private func commitRename(oldName: String) {
+    private func commitRename(selection: FolderSelection) {
         let newName = renameText.trimmingCharacters(in: .whitespaces)
         renamingFolder = nil
-        guard !newName.isEmpty, newName != oldName else { return }
+        guard !newName.isEmpty, newName != selection.name else { return }
         Task {
-            await state.renameFolder(from: oldName, to: newName)
+            await state.renameFolder(selection: selection, to: newName)
         }
     }
 
