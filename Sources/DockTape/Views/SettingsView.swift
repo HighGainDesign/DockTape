@@ -47,15 +47,18 @@ struct SettingsView: View {
             }
 
             Section("Storage Location") {
-                Picker("Store recordings in", selection: $storageMode) {
+                Picker("Store recordings in", selection: Binding(
+                    get: { storageMode },
+                    set: { mode in
+                        storageMode = mode
+                        handleStorageModeChange(mode)
+                    }
+                )) {
                     Text("iCloud Drive").tag(StorageMode.icloud)
                     Text("This Mac").tag(StorageMode.local)
                     Text("Custom Folder\u{2026}").tag(StorageMode.custom)
                 }
                 .disabled(isProcessing)
-                .onChange(of: storageMode) { _, newMode in
-                    handleStorageModeChange(newMode)
-                }
 
                 if isProcessing {
                     Label("Can't change while processing is in progress.", systemImage: "hourglass")

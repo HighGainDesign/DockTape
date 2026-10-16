@@ -10,23 +10,36 @@ import SwiftUI
         window.contentMinSize = NSSize(width: 640, height: 420)
         window.isReleasedWhenClosed = false
         window.contentViewController = NSHostingController(rootView:
-            TabView(selection: Binding(get: { state.sharedLibrary.reviewTab }, set: { state.sharedLibrary.reviewTab = $0 })) {
-                SharedLibraryReviewView(state: state, onClose: { [weak window] in window?.close() })
-                    .tabItem { Text("Competing Edits") }
-                    .tag(SharedLibraryState.ReviewTab.competingEdits)
-                PendingRecordingFilesView(state: state, onClose: { [weak window] in window?.close() })
-                    .tabItem { Text("Pending Files") }
-                    .tag(SharedLibraryState.ReviewTab.pendingFiles)
-                PendingFolderFilesView(state: state, onClose: { [weak window] in window?.close() })
-                    .tabItem { Text("Pending Folders") }
-                    .tag(SharedLibraryState.ReviewTab.pendingFolders)
-                ExternalSidecarReviewView(state: state, onClose: { [weak window] in window?.close() })
-                    .tabItem { Text("External Files") }
-                    .tag(SharedLibraryState.ReviewTab.externalFiles)
-            })
+            SharedLibraryReviewTabs(appState: state, state: state.sharedLibrary,
+                onClose: { [weak window] in window?.close() }))
         window.setFrameAutosaveName("SharedLibraryReview")
         window.center()
         super.init(window: window)
     }
     @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
+}
+
+/// Keep selection in a View body so external review-tab changes participate in
+/// SwiftUI observation as well as updating the native tab selector.
+private struct SharedLibraryReviewTabs: View {
+    let appState: AppState
+    @Bindable var state: SharedLibraryState
+    let onClose: () -> Void
+
+    var body: some View {
+        TabView(selection: $state.reviewTab) {
+            SharedLibraryReviewView(state: appState, onClose: onClose)
+                .tabItem { Text("Competing Edits") }
+                .tag(SharedLibraryState.ReviewTab.competingEdits)
+            PendingRecordingFilesView(state: appState, onClose: onClose)
+                .tabItem { Text("Pending Files") }
+                .tag(SharedLibraryState.ReviewTab.pendingFiles)
+            PendingFolderFilesView(state: appState, onClose: onClose)
+                .tabItem { Text("Pending Folders") }
+                .tag(SharedLibraryState.ReviewTab.pendingFolders)
+            ExternalSidecarReviewView(state: appState, onClose: onClose)
+                .tabItem { Text("External Files") }
+                .tag(SharedLibraryState.ReviewTab.externalFiles)
+        }
+    }
 }

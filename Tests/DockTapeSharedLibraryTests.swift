@@ -573,10 +573,15 @@ struct DockTapeSharedLibraryTests {
                 sharedTrash: { _ in throw Failure(description: "Cold metadata fixture must never dispose an original") })
             var setupFinished = false
             let setup = Task { try await state.setup(); setupFinished = true }
+            var sawResidentBeforeBadges = false
             for _ in 0..<150 {
-                if state.library.recordings.contains(where: { $0.filename == "B.mp3" }) && state.library.folderSelection(named: "Empty").reference != nil { break }
+                let resident = state.library.recordings.contains { $0.filename == "B.mp3" }
+                let badges = state.transcription.statuses["B.mp3"] == .done && state.summarization.hasSummary.contains("B.mp3")
+                sawResidentBeforeBadges = sawResidentBeforeBadges || (resident && !badges)
+                if resident && badges && state.library.folderSelection(named: "Empty").reference != nil { break }
                 try await Task.sleep(for: .milliseconds(10))
             }
+            if sawResidentBeforeBadges { print("Observed B catalog before asynchronous badge publication; both became ready while A stayed held.") }
             let residentB = state.library.recordings.first { $0.filename == "B.mp3" }
             let emptyReady = state.library.folderSelection(named: "Empty").reference != nil
             let unknownAVisible = state.library.recordings.contains { $0.filename == "A.mp3" }
