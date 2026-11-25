@@ -2,6 +2,14 @@
 
 import Foundation
 
+/// Immutable baseline for one visible editor draft. A background store reload
+/// cannot change what the user reviewed, and a different store cannot use it.
+public struct TemplateEditContext: Sendable {
+    public let template: Template
+    let storeID: UUID
+    let snapshot: SharedLibraryViewSnapshot?
+}
+
 /// Actor that manages built-in and user-created summary templates.
 /// Built-in templates can be overridden (prompt text customized) but not deleted.
 /// User-created templates can be added, edited, and deleted.
@@ -12,11 +20,14 @@ public actor TemplateStore {
     private var builtInOverrides: [String: Template] = [:]
     private var userTemplates: [Template] = []
     private let baseDirectory: URL
+    private let shared: SharedTemplateAdapter?
+    private let storeID = UUID()
 
     // MARK: - Init
 
-    public init(baseDirectory: URL) {
+    public init(baseDirectory: URL, shared: SharedTemplateAdapter? = nil) {
         self.baseDirectory = baseDirectory
+        self.shared = shared
     }
 
     // MARK: - Built-in defaults
@@ -152,68 +163,201 @@ public actor TemplateStore {
 
     // MARK: - Mutations
 
-    /// Add a new user-created template.
-    public func addUserTemplate(_ template: Template) async {
-        userTemplates.append(template)
-        await save()
-    }
-
-    /// Update an existing template.
-    /// For built-ins, stores as an override. For user templates, replaces in place.
-    public func update(_ template: Template) async {
-        if template.isBuiltIn {
-            builtInOverrides[template.id] = template
-        } else {
-            if let index = userTemplates.firstIndex(where: { $0.id == template.id }) {
-                userTemplates[index] = template
-            }
+    /// Add a new user-created template without replacing another store's additions.
+    public func addUserTemplate(_ template: Template) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            persistenceTicket += 1
+            let accepted = try await shared.save(template, before: nil, adding: true)
+            cacheAccepted(accepted)
+            return
         }
-        await save()
+        try await mutateTemplate(template, adding: true)
     }
 
-    /// Delete a user-created template by ID. No-op for built-ins.
-    public func delete(id: String) async {
-        userTemplates.removeAll { $0.id == id }
-        await save()
+    /// Updates only changed editable fields against freshly coordinated JSON.
+    public func update(_ template: Template) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            persistenceTicket += 1
+            let accepted = try await shared.save(template, before: self.template(forID: template.id), adding: false)
+            cacheAccepted(accepted)
+            return
+        }
+        try await mutateTemplate(template, adding: false)
     }
 
-    /// Reset a built-in template to its default prompt, removing any override.
-    public func resetToDefault(id: String) async {
-        builtInOverrides.removeValue(forKey: id)
-        await save()
-    }
-
-    // MARK: - Persistence
-
-    private var storeURL: URL {
-        baseDirectory.appendingPathComponent(".templates.json")
-    }
-
-    /// Load templates from disk. Call once after init.
-    public func load() async {
-        guard FileManager.default.fileExists(atPath: storeURL.path) else { return }
-        do {
-            let data = try Data(contentsOf: storeURL)
-            let stored = try JSONDecoder().decode(StoredTemplates.self, from: data)
-            for t in stored.builtInOverrides {
-                builtInOverrides[t.id] = t
+    public func beginEditing(id: String, refreshing: Bool = false) async throws -> TemplateEditContext {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            let snapshot = try await shared.editingSnapshot(id: id, refreshing: refreshing)
+            let template: Template
+            if snapshot.state.lifecycle == .uninitialized,
+               let original = Self.builtInDefaults.first(where: { $0.id == id }) { template = original }
+            else {
+                guard snapshot.state.lifecycle == .alive else { throw SharedSidecarError.conflictedContent }
+                template = try SharedTemplateAdapter.render(snapshot)
             }
+            return .init(template: template, storeID: storeID, snapshot: snapshot)
+        }
+        if refreshing { try await load() }
+        guard let template = template(forID: id) else { throw SharedSidecarError.reloadRequired }
+        return .init(template: template, storeID: storeID, snapshot: nil)
+    }
+
+    /// Save only the fields changed from the editor's captured baseline.
+    /// Return the accepted baseline atomically, never a later mutable cache.
+    @discardableResult
+    public func update(_ template: Template, basedOn context: TemplateEditContext) async throws -> TemplateEditContext {
+        guard context.storeID == storeID, template.id == context.template.id,
+              template.isBuiltIn == context.template.isBuiltIn else { throw SharedLibraryCoordinatorError.differentBinding }
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            guard let snapshot = context.snapshot else { throw SharedLibraryCoordinatorError.differentBinding }
+            persistenceTicket += 1
+            let accepted = try await shared.saveDraft(template, before: context.template, base: snapshot)
+            cacheAccepted(accepted.template)
+            return .init(template: accepted.template, storeID: storeID, snapshot: accepted.snapshot)
+        }
+        guard context.snapshot == nil else { throw SharedLibraryCoordinatorError.differentBinding }
+        try await mutateTemplate(template, adding: false, baseline: context.template)
+        guard let accepted = self.template(forID: template.id) else { throw SharedSidecarError.reloadRequired }
+        return .init(template: accepted, storeID: storeID, snapshot: nil)
+    }
+
+    public func delete(id: String, basedOn context: TemplateEditContext) async throws {
+        guard context.storeID == storeID, context.template.id == id, !context.template.isBuiltIn else {
+            throw SharedLibraryCoordinatorError.differentBinding
+        }
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            guard let snapshot = context.snapshot else { throw SharedLibraryCoordinatorError.differentBinding }
+            persistenceTicket += 1
+            try await shared.deleteDraft(id: id, base: snapshot)
+            userTemplates.removeAll { $0.id == id }
+        } else { try await delete(id: id) }
+    }
+
+    public func delete(id: String) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            persistenceTicket += 1
+            try await shared.delete(id: id)
+            userTemplates.removeAll { $0.id == id }
+            return
+        }
+        guard !Self.builtInDefaults.contains(where: { $0.id == id }) else { return }
+        try await mutateStored { object in
+            var values = object["userTemplates"] as! [[String: Any]]
+            values.removeAll { $0["id"] as? String == id }
+            object["userTemplates"] = values
+        }
+    }
+
+    @discardableResult
+    public func resetToDefault(id: String, basedOn context: TemplateEditContext) async throws -> TemplateEditContext {
+        guard context.storeID == storeID, context.template.id == id, context.template.isBuiltIn else {
+            throw SharedLibraryCoordinatorError.differentBinding
+        }
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            guard let snapshot = context.snapshot else { throw SharedLibraryCoordinatorError.differentBinding }
+            persistenceTicket += 1
+            let accepted = try await shared.resetDraft(id: id, base: snapshot)
+            cacheAccepted(accepted.template)
+            return .init(template: accepted.template, storeID: storeID, snapshot: accepted.snapshot)
+        }
+        try await resetToDefault(id: id)
+        guard let original = Self.builtInDefaults.first(where: { $0.id == id }) else { throw SharedSidecarError.invalidContent }
+        return .init(template: original, storeID: storeID, snapshot: nil)
+    }
+
+    public func resetToDefault(id: String) async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            persistenceTicket += 1
+            if let accepted = try await shared.reset(id: id) { cacheAccepted(accepted) }
+            return
+        }
+        guard Self.builtInDefaults.contains(where: { $0.id == id }) else { return }
+        try await mutateStored { object in
+            var values = object["builtInOverrides"] as! [[String: Any]]
+            values.removeAll { $0["id"] as? String == id }
+            object["builtInOverrides"] = values
+        }
+    }
+
+    private func cacheAccepted(_ template: Template) {
+        persistenceTicket += 1
+        if template.isBuiltIn { builtInOverrides[template.id] = template }
+        else if let index = userTemplates.firstIndex(where: { $0.id == template.id }) { userTemplates[index] = template }
+        else { userTemplates.append(template) }
+    }
+
+    private func mutateTemplate(_ template: Template, adding: Bool, baseline captured: Template? = nil) async throws {
+        let bytes = try JSONEncoder().encode(template)
+        let baseline = try (captured ?? self.template(forID: template.id)).map { try JSONEncoder().encode($0) }
+        let collection = template.isBuiltIn ? "builtInOverrides" : "userTemplates"
+        try await mutateStored { object in
+            let desired = try JSONSerialization.jsonObject(with: bytes) as! [String: Any]
+            let before = try baseline.map { try JSONSerialization.jsonObject(with: $0) as! [String: Any] } ?? [:]
+            var values = object[collection] as! [[String: Any]]
+            if let index = values.firstIndex(where: { $0["id"] as? String == template.id }) {
+                if adding {
+                    let existing = try JSONDecoder().decode(Template.self, from: JSONSerialization.data(withJSONObject: values[index]))
+                    guard existing == template else { throw HiDockError.storageError("A template with this ID already exists. Edit it instead.") }
+                    return
+                }
+                var current = values[index]
+                for field in ["name", "description", "promptText", "isBuiltIn"] {
+                    let old = try before[field].map { try JSONSerialization.data(withJSONObject: $0, options: [.fragmentsAllowed]) }
+                    let new = try desired[field].map { try JSONSerialization.data(withJSONObject: $0, options: [.fragmentsAllowed]) }
+                    if old != new { current[field] = desired[field] }
+                }
+                values[index] = current
+            } else if adding || template.isBuiltIn { values.append(desired) }
+            object[collection] = values
+        }
+    }
+
+    private var persistenceTicket: UInt64 = 0
+    private var storeURL: URL { baseDirectory.appendingPathComponent(".templates.json") }
+
+    public func load() async throws {
+        if let shared {
+            try shared.requireRoot(baseDirectory)
+            persistenceTicket += 1; let ticket = persistenceTicket
+            let values = try await shared.load()
+            if persistenceTicket == ticket {
+                builtInOverrides = Dictionary(uniqueKeysWithValues: values.filter(\.isBuiltIn).map { ($0.id, $0) })
+                userTemplates = values.filter { !$0.isBuiltIn }
+            }
+            return
+        }
+        persistenceTicket += 1; let ticket = persistenceTicket
+        let bytes = try await RecordingFileAccess().readDataIfPresent(at: storeURL)
+        let stored = try bytes.map { try JSONDecoder().decode(StoredTemplates.self, from: $0) }
+            ?? StoredTemplates(builtInOverrides: [], userTemplates: [])
+        guard persistenceTicket == ticket else { return }
+        let ids = (stored.builtInOverrides + stored.userTemplates).map(\.id)
+        guard Set(ids).count == ids.count else { throw HiDockError.storageError("Template IDs are duplicated. Resolve the file before editing.") }
+        builtInOverrides = Dictionary(uniqueKeysWithValues: stored.builtInOverrides.map { ($0.id, $0) })
+        userTemplates = stored.userTemplates
+    }
+
+    private func mutateStored(_ mutation: @escaping @Sendable (inout [String: Any]) throws -> Void) async throws {
+        persistenceTicket += 1; let ticket = persistenceTicket
+        let initial = try JSONEncoder().encode(StoredTemplates(builtInOverrides: [], userTemplates: []))
+        let bytes = try await LegacyLibraryFileAccess().mutateObject(at: storeURL, root: baseDirectory, initialObject: initial) { object in
+            let original = try JSONDecoder().decode(StoredTemplates.self, from: JSONSerialization.data(withJSONObject: object))
+            let ids = (original.builtInOverrides + original.userTemplates).map(\.id)
+            guard Set(ids).count == ids.count else { throw HiDockError.storageError("Template IDs are duplicated. Resolve the file before editing.") }
+            try mutation(&object)
+        }
+        let stored = try JSONDecoder().decode(StoredTemplates.self, from: bytes)
+        if persistenceTicket == ticket {
+            builtInOverrides = Dictionary(uniqueKeysWithValues: stored.builtInOverrides.map { ($0.id, $0) })
             userTemplates = stored.userTemplates
-        } catch {
-            // Start fresh on decode error
-        }
-    }
-
-    private func save() async {
-        let stored = StoredTemplates(
-            builtInOverrides: Array(builtInOverrides.values),
-            userTemplates: userTemplates
-        )
-        do {
-            let data = try JSONEncoder().encode(stored)
-            try data.write(to: storeURL, options: .atomic)
-        } catch {
-            // Silently ignore write errors
         }
     }
 
@@ -221,28 +365,16 @@ public actor TemplateStore {
 
     /// Migrate prompt overrides from UserDefaults into built-in overrides.
     /// Clears the UserDefaults keys after migration.
-    public func migrateFromUserDefaults(_ defaults: UserDefaults) async {
+    public func migrateFromUserDefaults(_ defaults: UserDefaults) async throws {
         let migrations: [(key: String, templateID: String)] = [
-            ("templatePrompt_meeting", "meeting"),
-            ("templatePrompt_call", "consultation"),
-            ("templatePrompt_memo", "memo"),
-            ("templatePrompt_recording", "meeting"),
-        ]
-
-        var didMigrate = false
+            ("templatePrompt_meeting", "meeting"), ("templatePrompt_call", "consultation"),
+            ("templatePrompt_memo", "memo"), ("templatePrompt_recording", "meeting")]
         for (key, id) in migrations {
-            if let custom = defaults.string(forKey: key), !custom.isEmpty {
-                if var template = template(forID: id) {
-                    template.promptText = custom
-                    builtInOverrides[id] = template
-                    didMigrate = true
-                }
-                defaults.removeObject(forKey: key)
-            }
-        }
-
-        if didMigrate {
-            await save()
+            guard let custom = defaults.string(forKey: key), !custom.isEmpty,
+                  var template = template(forID: id) else { continue }
+            template.promptText = custom
+            try await update(template)
+            defaults.removeObject(forKey: key)
         }
     }
 

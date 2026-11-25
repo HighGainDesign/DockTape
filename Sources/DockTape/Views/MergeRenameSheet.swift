@@ -46,6 +46,7 @@ struct MergeRenameSheet: View {
 
             HStack {
                 Button("Cancel") {
+                    state.clearMergeSelection()
                     dismiss()
                 }
                 .keyboardShortcut(.cancelAction)
@@ -53,9 +54,11 @@ struct MergeRenameSheet: View {
                 Spacer()
 
                 Button("Merge") {
+                    guard let request = state.captureMergeRequest() else { dismiss(); return }
+                    let name = mergeName
                     dismiss()
                     Task {
-                        await state.executeMerge(as: mergeName)
+                        await state.executeMerge(as: name, request: request)
                     }
                 }
                 .keyboardShortcut(.defaultAction)

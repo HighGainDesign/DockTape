@@ -28,6 +28,14 @@ public struct Transcript: Codable, Sendable, Identifiable {
     /// Language detected or specified.
     public var language: String?
 
+    /// Exact accepted shared generation for editor lifetime. This is read
+    /// provenance only; canonical transcript JSON never stores it.
+    public internal(set) var sharedGenerationID: UUID? = nil
+    private enum CodingKeys: String, CodingKey {
+        case recordingFilename, createdAt, transcriptionModel, hasSpeakerLabels
+        case segments, speakerNames, language
+    }
+
     public init(
         recordingFilename: String,
         createdAt: Date = Date(),

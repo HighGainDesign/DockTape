@@ -13,10 +13,9 @@ struct DetailPane: View {
 
     private var transcript: Transcript? { transcriptState.content }
     private var transcriptLoadedFor: String? { transcriptState.filename }
-    @State private var renamingRecording: RecordingMetadata?
+    @State private var renamingRecording: RecordingSelection?
     @State private var renameText: String = ""
     @State private var confirmRetranscribe: RecordingMetadata?
-    @State private var userTemplates: [Template] = []
     @State private var customPromptText: String = ""
     @State private var showCustomPromptSheet: Bool = false
     @State private var customPromptRecording: RecordingMetadata?
@@ -95,6 +94,10 @@ struct DetailPane: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(rec.displayTitle)
                         .font(.title2.weight(.semibold))
+                    if state.library.pendingSelectedRecordings.contains(rec.filename) {
+                        Text("Waiting for recording files…")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     if let date = rec.recordedAt {
                         HStack(spacing: 4) {
                             Text(date, style: .date)
@@ -125,8 +128,7 @@ struct DetailPane: View {
             tabContent(for: rec)
         }
         .task(id: "\(contentID(for: rec.filename))|\(transcriptRetry)") {
-            guard await reloadTranscript(for: rec.filename) else { return }
-            userTemplates = await state.templateStore.userCreatedTemplates()
+            guard await reloadTranscript(for: rec) else { return }
             guard !Task.isCancelled, state.library.selectedRecording == rec.filename else { return }
 
             if !userHasPickedTab {
@@ -149,7 +151,7 @@ struct DetailPane: View {
             // Reload transcript and auto-switch when transcription completes
             if newStatus == .done {
                 Task {
-                    guard await reloadTranscript(for: rec.filename) else { return }
+                    guard await reloadTranscript(for: rec) else { return }
                     programmaticTabSwitchCount += 1
                     state.selectedDetailTab = .transcript
                 }
@@ -165,7 +167,7 @@ struct DetailPane: View {
             if trigger, renamingRecording == nil {
                 let filename = (rec.filename as NSString).lastPathComponent
                 renameText = (filename as NSString).deletingPathExtension
-                renamingRecording = rec
+                renamingRecording = state.library.recordingSelection(rec)
                 state.triggerRename = false
             }
         }
@@ -184,8 +186,9 @@ struct DetailPane: View {
             TextField("Name", text: $renameText)
             Button("Cancel", role: .cancel) { renamingRecording = nil }
             Button("Save") {
-                if let rec = renamingRecording {
-                    Task { await state.renameRecording(rec, to: renameText) }
+                if let selection = renamingRecording {
+                    let name = renameText
+                    Task { await state.renameRecording(selection: selection, to: name) }
                 }
                 renamingRecording = nil
             }
@@ -248,15 +251,16 @@ struct DetailPane: View {
     /// Track the requested file separately from legacy sidecar identity fields.
     /// A late read or editor callback must not display another recording's text.
     private func contentID(for filename: String) -> String {
-        state.library.store.baseDirectory.appendingPathComponent(filename).absoluteString
+        state.library.contentID(for: filename, fallbackRevision: state.sharedLibrary.revision)
     }
 
-    private func reloadTranscript(for filename: String) async -> Bool {
+    private func reloadTranscript(for recording: RecordingMetadata) async -> Bool {
+        let filename = recording.filename
         let identity = contentID(for: filename)
         guard !Task.isCancelled, state.library.selectedRecording == filename else { return false }
         let store = state.library.transcriptStore
         await transcriptState.load(for: identity) { waiting in
-            try await store.loadTranscript(for: filename, onWaiting: waiting)
+            try await store.loadTranscript(for: filename, reference: recording.reference, onWaiting: waiting)
         }
         return !Task.isCancelled && state.library.selectedRecording == filename
             && contentID(for: filename) == identity && transcriptState.filename == identity
@@ -283,8 +287,10 @@ struct DetailPane: View {
 
         case .transcript:
             if transcriptLoadedFor == contentID(for: rec.filename), !transcriptState.isLoading, let transcript {
+                let editRequest = state.recordingEditRequest(for: rec)
                 TranscriptViewer(
                     transcript: transcript,
+                    draft: state.library.speakerDraft(for: rec),
                     playbackState: state.playback.playingFile == rec.filename ? state.playback : nil,
                     onSeek: { time in
                         if state.playback.playingFile == rec.filename {
@@ -296,20 +302,17 @@ struct DetailPane: View {
                     },
                     onSaveSpeakerNames: { names in
                         Task {
-                            await state.updateSpeakerNames(for: rec.filename, names: names)
-                            _ = await reloadTranscript(for: rec.filename)
+                            if await state.editRecording(editRequest, action: .names(names)) { _ = await reloadTranscript(for: rec) }
                         }
                     },
                     onSplitSpeaker: { segID, allFollowing in
                         Task {
-                            try? await state.library.transcriptStore.splitSpeaker(for: rec.filename, segmentID: segID, allFollowing: allFollowing)
-                            _ = await reloadTranscript(for: rec.filename)
+                            if await state.editRecording(editRequest, action: .split(segID, allFollowing)) { _ = await reloadTranscript(for: rec) }
                         }
                     },
                     onMergeSpeaker: { sourceSID, targetSID in
                         Task {
-                            try? await state.library.transcriptStore.mergeSpeakers(for: rec.filename, source: sourceSID, into: targetSID)
-                            _ = await reloadTranscript(for: rec.filename)
+                            if await state.editRecording(editRequest, action: .merge(sourceSID, targetSID)) { _ = await reloadTranscript(for: rec) }
                         }
                     }
                 )

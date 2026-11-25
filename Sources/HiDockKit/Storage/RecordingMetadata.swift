@@ -5,7 +5,8 @@ import Foundation
 /// Metadata for a recording, derived entirely from the MP3 file on disk.
 /// No persistence — the filesystem is the source of truth.
 public struct RecordingMetadata: Sendable, Identifiable {
-    public var id: String { filename }
+    public var id: String { reference.map { $0.libraryID.uuidString + ":" + $0.entityID.uuidString } ?? filename }
+    public let reference: SharedRecordingReference?
 
     /// MP3 filename on disk (e.g., "REC_20240315_143000.mp3" or "Meeting with Bob.mp3").
     public let filename: String
@@ -31,14 +32,22 @@ public struct RecordingMetadata: Sendable, Identifiable {
         mode: String,
         fileSizeBytes: UInt64,
         estimatedDuration: TimeInterval,
-        folder: String? = nil
+        folder: String? = nil,
+        reference: SharedRecordingReference? = nil
     ) {
+        self.reference = reference
         self.filename = filename
         self.recordedAt = recordedAt
         self.mode = mode
         self.fileSizeBytes = fileSizeBytes
         self.estimatedDuration = estimatedDuration
         self.folder = folder
+    }
+
+    public func retargeted(to filename: String) -> RecordingMetadata {
+        let folder = (filename as NSString).deletingLastPathComponent
+        return .init(filename: filename, recordedAt: recordedAt, mode: mode, fileSizeBytes: fileSizeBytes,
+                     estimatedDuration: estimatedDuration, folder: folder.isEmpty ? nil : folder, reference: reference)
     }
 
     /// Display title: formatted date if the filename is still in device format, otherwise the user's chosen name.

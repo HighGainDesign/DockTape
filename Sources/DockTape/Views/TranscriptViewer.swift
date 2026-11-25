@@ -5,6 +5,7 @@ import HiDockKit
 
 struct TranscriptViewer: View {
     let transcript: Transcript
+    @Bindable var draft: TranscriptSpeakerDraft
     var playbackState: PlaybackState?
     var activeSegmentIndex: Int? = nil
     var onSeek: ((TimeInterval) -> Void)?
@@ -12,22 +13,26 @@ struct TranscriptViewer: View {
     var onSplitSpeaker: ((_ segmentID: UUID, _ allFollowing: Bool) -> Void)?
     var onMergeSpeaker: ((_ sourceSID: String, _ targetSID: String) -> Void)?
 
-    @State private var filterSpeaker: String? = nil
-    @State private var speakerNames: [String: String] = [:]
-    @State private var editingSpeaker: String? = nil
-    @State private var editText: String = ""
-    @State private var mergeConfirmation: MergeConfirmation? = nil
     @FocusState private var editFieldFocused: Bool
-
-    private struct MergeConfirmation: Identifiable {
-        let id = UUID()
-        let sourceSID: String
-        let targetSID: String
-        let name: String
+    private var speakerNames: [String: String] {
+        get { draft.names }
+        nonmutating set { draft.names = newValue }
+    }
+    private var editingSpeaker: String? {
+        get { draft.editingSpeaker }
+        nonmutating set { draft.editingSpeaker = newValue }
+    }
+    private var editText: String {
+        get { draft.editText }
+        nonmutating set { draft.editText = newValue }
+    }
+    private var mergeConfirmation: TranscriptSpeakerDraft.MergeConfirmation? {
+        get { draft.mergeConfirmation }
+        nonmutating set { draft.mergeConfirmation = newValue }
     }
 
     private var hasNameChanges: Bool {
-        speakerNames != transcript.speakerNames
+        draft.hasChanges
     }
 
     var body: some View {
@@ -47,7 +52,7 @@ struct TranscriptViewer: View {
 
                 HStack {
                     if transcript.speakerIDs.count > 1 {
-                        Picker("Speaker", selection: $filterSpeaker) {
+                        Picker("Speaker", selection: $draft.filterSpeaker) {
                             Text("All Speakers").tag(String?.none)
                             Divider()
                             ForEach(transcript.speakerIDs, id: \.self) { sid in
@@ -124,10 +129,16 @@ struct TranscriptViewer: View {
             }
         }
         .onAppear {
-            speakerNames = transcript.speakerNames
+            draft.synchronize(with: transcript)
         }
-        .onChange(of: transcript.speakerNames) { _, newNames in
-            speakerNames = newNames
+        .onChange(of: transcript.speakerNames) { _, _ in
+            draft.synchronize(with: transcript)
+        }
+        .onChange(of: transcript.segments.map(\.id)) { _, _ in
+            draft.synchronize(with: transcript)
+        }
+        .onChange(of: transcript.sharedGenerationID) { _, _ in
+            draft.synchronize(with: transcript)
         }
         .alert("Merge Speakers?", isPresented: Binding(
             get: { mergeConfirmation != nil },
@@ -181,7 +192,7 @@ struct TranscriptViewer: View {
                 Circle()
                     .fill(speakerColor(sid))
                     .frame(width: 8, height: 8)
-                TextField("Speaker name", text: $editText)
+                TextField("Speaker name", text: $draft.editText)
                     .textFieldStyle(.roundedBorder)
                     .font(.body)
                     .frame(width: 150)
@@ -239,7 +250,7 @@ struct TranscriptViewer: View {
         }
         if let existingID = speakerNames.first(where: { $0.key != sid && $0.value == trimmed })?.key {
             editingSpeaker = nil
-            mergeConfirmation = MergeConfirmation(sourceSID: sid, targetSID: existingID, name: trimmed)
+            mergeConfirmation = .init(sourceSID: sid, targetSID: existingID, name: trimmed)
             return
         }
         speakerNames[sid] = trimmed
@@ -247,7 +258,7 @@ struct TranscriptViewer: View {
     }
 
     private var filteredSegments: [Transcript.Segment] {
-        if let speaker = filterSpeaker {
+        if let speaker = draft.filterSpeaker {
             return transcript.segments.filter { $0.speakerID == speaker }
         }
         return transcript.segments

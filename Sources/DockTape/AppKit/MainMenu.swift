@@ -5,6 +5,7 @@ import HiDockKit
 
 @objc protocol MainMenuActions {
     func showSettings(_ sender: Any?)
+    func showSharedLibraryReview(_ sender: Any?)
     func transcribe(_ sender: Any?)
     func summarizeTemplate(_ sender: NSMenuItem)
     func importFromDevice(_ sender: Any?)
@@ -93,6 +94,8 @@ enum MainMenu {
 
         // View menu
         let viewMenu = NSMenu(title: "View")
+        addItem(viewMenu, "Review Shared Library…", action: #selector(MainMenuActions.showSharedLibraryReview(_:)), key: "r", modifiers: [.command, .option])
+        viewMenu.addItem(.separator())
         addItem(viewMenu, "Toggle Sidebar", action: #selector(NSSplitViewController.toggleSidebar(_:)), key: "s", modifiers: [.command, .control])
         viewMenu.addItem(.separator())
         addItem(viewMenu, "Show All Recordings", action: #selector(MainMenuActions.showAllRecordings(_:)), key: "1", modifiers: .command)

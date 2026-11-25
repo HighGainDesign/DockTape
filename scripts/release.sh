@@ -84,6 +84,22 @@ entitlements = plistlib.loads(path.read_bytes())
 entitlements.pop("com.apple.security.get-task-allow", None)
 path.write_bytes(plistlib.dumps(entitlements))
 PY
+CLI_BUNDLE="$APP_PATH/Contents/Helpers/DockTapeCLI.bundle"
+test -x "$CLI_BUNDLE/Contents/MacOS/hidock"
+test -f "$CLI_BUNDLE/Contents/embedded.provisionprofile"
+python3 - "$APP_PATH/Contents/Info.plist" "$CLI_BUNDLE/Contents/Info.plist" <<'PLIST'
+import plistlib, sys
+from pathlib import Path
+app, cli = [plistlib.loads(Path(path).read_bytes()) for path in sys.argv[1:]]
+for key in ['CFBundleIdentifier', 'CFBundleVersion', 'CFBundleShortVersionString']:
+    assert app[key] == cli[key], f'CLI {key} must match its provisioned host'
+assert cli['CFBundleExecutable'] == 'hidock'
+PLIST
+codesign --force --options runtime --timestamp \
+    --sign "$SIGNING_IDENTITY" \
+    --entitlements "$APP_ENTITLEMENTS" \
+    "$CLI_BUNDLE"
+codesign --verify --strict --verbose "$CLI_BUNDLE"
 codesign --force --deep --options runtime --timestamp \
     --sign "$SIGNING_IDENTITY" \
     --entitlements "$APP_ENTITLEMENTS" \
