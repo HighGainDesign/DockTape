@@ -94,6 +94,10 @@ struct DetailPane: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(rec.displayTitle)
                         .font(.title2.weight(.semibold))
+                    if state.library.pendingSelectedRecordings.contains(rec.filename) {
+                        Text("Waiting for recording files…")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     if let date = rec.recordedAt {
                         HStack(spacing: 4) {
                             Text(date, style: .date)
@@ -286,6 +290,7 @@ struct DetailPane: View {
                 let editRequest = state.recordingEditRequest(for: rec)
                 TranscriptViewer(
                     transcript: transcript,
+                    draft: state.library.speakerDraft(for: rec),
                     playbackState: state.playback.playingFile == rec.filename ? state.playback : nil,
                     onSeek: { time in
                         if state.playback.playingFile == rec.filename {

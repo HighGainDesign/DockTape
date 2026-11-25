@@ -146,6 +146,12 @@ public actor RecordingStore {
         scanRecordings(in: baseDirectory, relativeTo: baseDirectory)
     }
 
+    /// One accepted metadata observation, including live paths whose files may
+    /// still be arriving. Consumers must not mistake those paths for downloads.
+    public func recordingCatalog() -> (recordings: [RecordingMetadata], references: [String: SharedRecordingReference], deleted: Set<UUID>, isComplete: Bool) {
+        (allRecordings(), recordingReferences, sharedVisibility?.deleted ?? [], shared == nil || contentIsComplete)
+    }
+
     /// Return recordings in a specific folder (relative folder name).
     public func recordings(inFolder folderName: String) -> [RecordingMetadata] {
         let folderURL = baseDirectory.appendingPathComponent(folderName)

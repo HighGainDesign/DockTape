@@ -201,9 +201,11 @@ public actor SharedSidecarAdapter {
             default: throw SharedSidecarError.invalidContent
             }
         }
-        return Transcript(recordingFilename: filename, createdAt: transcript.createdAt,
+        var result = Transcript(recordingFilename: filename, createdAt: transcript.createdAt,
                           transcriptionModel: transcript.transcriptionModel, hasSpeakerLabels: transcript.hasSpeakerLabels,
                           segments: transcript.segments, speakerNames: transcript.speakerNames, language: transcript.language)
+        result.sharedGenerationID = document.id
+        return result
     }
     static func summary(_ view: SharedLibraryViewSnapshot, filename: String) throws -> Summary? {
         guard let state = try content(view, component: .summary), let document = state.currentDocument(for: .summary) else { return nil }

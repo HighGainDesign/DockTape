@@ -15,6 +15,10 @@ struct PendingRecordingFilesView: View {
                 Text("Pending Recording Files").font(.title2)
                 Spacer()
                 if model.isLoading || model.isWorking { ProgressView().controlSize(.small).accessibilityLabel("Updating file review") }
+                if model.isLoading && !model.isWorking {
+                    Button("Stop Checking") { model.cancelLoading() }
+                        .accessibilityLabel("Stop checking pending files")
+                }
                 Button("Reload") { Task { await reload() } }.keyboardShortcut("r", modifiers: .command)
                     .disabled(model.isLoading || model.isWorking)
             }.padding()
@@ -51,7 +55,7 @@ struct PendingRecordingFilesView: View {
                             HStack {
                                 if !item.waitingForMacs.isEmpty {
                                     Button(item.purpose == .delete ? "Approve Deletion on This Mac" : "Approve Audio Replacement") { perform(.acknowledge, item) }
-                                        .disabled(!item.canAcknowledge || model.isWorking)
+                                        .disabled(!item.canAcknowledge || model.isWorking || model.isLoading)
                                         .accessibilityLabel((item.purpose == .delete ? "Approve deletion of " : "Approve audio replacement for ") + item.title + " on this Mac")
                                 }
                                 if item.canReplan {
@@ -61,7 +65,7 @@ struct PendingRecordingFilesView: View {
                                     }.disabled(model.isWorking || model.isLoading)
                                 }
                                 Button("Resume") { perform(.resume, item) }
-                                    .disabled(!item.canResume || model.isWorking)
+                                    .disabled(!item.canResume || model.isWorking || model.isLoading)
                                     .accessibilityLabel("Resume file change for " + item.title)
                             }
                             if model.canKeepForReview(id: item.id) { keepForReviewButton(id: item.id) }

@@ -120,11 +120,13 @@ struct DockTapePlaybackTests {
         }
         let attempts = Attempts()
         let retrying = PlaybackState(prepareFile: { _, _ in
-            if await attempts.next() == 1 { throw CocoaError(.fileReadNoPermission) }
+            if await attempts.next() == 1 { throw RecordingFileAccess.DownloadError.providerTimedOut }
             return true
         })
         retrying.play(file: "retry.mp3", url: url)
         try await waitUntil { retrying.loadError != nil }
+        try expect(retrying.loadError == RecordingFileAccess.DownloadError.providerTimedOut.localizedDescription && !retrying.isPreparing,
+                   "Unavailable provider bytes explain the failure without blocking the player")
         retrying.retry()
         try await waitUntil { retrying.avPlayer != nil || retrying.loadError != nil }
         try expect(retrying.avPlayer != nil && retrying.loadError == nil, "Playback Retry must recover without restarting the app")

@@ -52,7 +52,7 @@ struct RecordingListPane: View {
     private var recordingsContent: some View {
         VStack(spacing: 0) {
             let recs = filteredRecordings
-            List(selection: $state.library.selectedRecordings) {
+            List(selection: $state.library.selectedRecordingIDs) {
                 if state.library.recordings.isEmpty {
                     // Empty library — no recordings at all
                 } else {
@@ -64,7 +64,7 @@ struct RecordingListPane: View {
                             isCurrentlyPlaying: state.playback.playingFile == rec.filename && state.playback.isPlaying,
                             hasSummary: state.summarization.hasSummary.contains(rec.filename)
                         )
-                        .tag(rec.filename)
+                        .tag(rec.id)
                         .contextMenu { recordingContextMenu(for: rec) }
                         .draggable(state.library.recordingSelection(rec))
                     }
@@ -99,11 +99,6 @@ struct RecordingListPane: View {
             metadataLoadStatus
         }
         .navigationTitle(recordingTitle)
-        .onChange(of: state.selectedView) { _, _ in
-            // Clear selection when switching sidebar sections
-            state.library.selectedRecordings.removeAll()
-            state.library.selectedRecording = nil
-        }
         .onChange(of: state.library.selectedRecordings) { _, newValue in
             // Sync single selection for detail pane
             if newValue.count == 1 {

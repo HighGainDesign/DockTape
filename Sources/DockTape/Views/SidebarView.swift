@@ -13,7 +13,7 @@ struct SidebarView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            List(selection: $state.selectedView) {
+            List(selection: Binding(get: { state.selectedView }, set: { state.selectSidebar($0) })) {
                 Section(header: libraryHeader) {
                     Label {
                         HStack {

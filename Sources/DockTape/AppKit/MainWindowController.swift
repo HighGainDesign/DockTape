@@ -550,10 +550,10 @@ extension MainWindowController: NSMenuItemValidation {
     @objc func deleteRecording(_ sender: Any?) { deleteAction(sender) }
     @objc func mergeRecordings(_ sender: Any?) { appState.startMerge() }
     @objc func find(_ sender: Any?) { searchToolbarItem?.beginSearchInteraction() }
-    @objc func showAllRecordings(_ sender: Any?) { appState.selectedView = .allRecordings }
+    @objc func showAllRecordings(_ sender: Any?) { appState.selectSidebar(.allRecordings) }
     @objc func showDevice(_ sender: Any?) {
         guard appState.device.isConnected else { return }
-        appState.selectedView = .device
+        appState.selectSidebar(.device)
     }
     @objc func showPreviousTab(_ sender: Any?) {
         let tabs = DetailTab.allCases

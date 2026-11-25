@@ -28,7 +28,19 @@ struct DockTapeSharedLibraryTests {
     }
     @MainActor static func main() async {
         do {
-            if CommandLine.arguments.contains("--queued-content-edit-only") {
+            if CommandLine.arguments.contains("--speaker-draft-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeSpeakerDraft-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await speakerDraftChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--remote-selection-only") {
+                _ = NSApplication.shared
+                UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
+                let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeRemoteSelection-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                try await remoteSelectionChecks(parent: parent)
+            } else if CommandLine.arguments.contains("--queued-content-edit-only") {
                 _ = NSApplication.shared
                 UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
                 let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeQueuedContent-" + UUID().uuidString)
@@ -156,11 +168,246 @@ struct DockTapeSharedLibraryTests {
         }
         catch { fputs("Shared AppState checks failed: \(error)\n", stderr); exit(1) }
     }
+    @MainActor static func remoteSelectionChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library"), local = parent.appendingPathComponent("witnesses")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Archive"), withIntermediateDirectories: true)
+        let audio = Data("Synthetic remote selection audio".utf8)
+        try audio.write(to: root.appendingPathComponent("Meeting.mp3"))
+        try await TranscriptStore(baseDirectory: root).save(Transcript(recordingFilename: "Meeting.mp3", transcriptionModel: "fixture", hasSpeakerLabels: true,
+            segments: [.init(startTime: 0, endTime: 1, text: "Synthetic selected recording", speakerID: "s")], speakerNames: ["s": "Original"]), mp3Filename: "Meeting.mp3")
+        let state = AppState(baseDirectory: root, sharedIdentity: {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "remote selection fixture").load()
+        }, sharedWitnessDirectory: local)
+        try await state.setup()
+        state.library.selectedRecordings = ["Meeting.mp3"]; state.library.selectedRecording = "Meeting.mp3"
+        try expect(await state.enableSharedLibrary(), "Enable remote selection fixture")
+        try expect(state.library.selectedRecording == "Meeting.mp3", "Explicit sharing enablement retains the selected legacy file")
+        guard let owner = state.sharedLibrary.coordinator,
+              let original = state.library.recordings.first(where: { $0.filename == "Meeting.mp3" }) else { throw Failure(description: "Missing selected recording") }
+        await owner.stopMonitoring()
+        state.library.selectedRecordings = [original.filename]; state.library.selectedRecording = original.filename
+        let remote = SharedLibraryCoordinator(root: root, writerID: owner.writerID, witnessDirectory: local)
+        _ = try await remote.relocateRecording(filename: original.filename, title: "Renamed", reference: original.reference)
+        try expect(await state.library.refresh(), "Refresh remotely renamed recording")
+        try expect(state.library.selectedRecording == "Renamed.mp3" && state.library.selectedRecordings == ["Renamed.mp3"],
+                   "Remote rename must follow the selected stable ID, instead of clearing selection")
+        _ = try await remote.relocateRecording(filename: "Renamed.mp3", toFolder: "Archive", changeFolder: true, reference: original.reference)
+        try expect(await state.library.refresh(), "Refresh remotely moved recording")
+        try expect(state.library.selectedRecording == "Archive/Renamed.mp3" && state.library.selectedRecordings == ["Archive/Renamed.mp3"],
+                   "Remote move must preserve selection without a dirty editor")
+        try expect(state.library.recordings.first?.reference == original.reference, "Remote paths retain selected identity")
+        try expect(try Data(contentsOf: root.appendingPathComponent("Archive/Renamed.mp3")) == audio, "Selection refresh preserves source audio")
+        state.selectedView = .folder("Archive"); state.library.selectedFolder = "Archive"
+        _ = try await remote.relocateRecording(filename: "Archive/Renamed.mp3", changeFolder: true, reference: original.reference)
+        try expect(await state.library.refresh(), "Refresh move outside the displayed folder")
+        try expect(state.selectedView == .allRecordings && state.library.selectedRecording == "Renamed.mp3",
+                   "A remote move outside the displayed folder must reveal the retained selection")
+        _ = try await remote.relocateRecording(filename: "Renamed.mp3", toFolder: "Archive", changeFolder: true, reference: original.reference)
+        try expect(await state.library.refresh(), "Restore shared folder fixture")
+        state.selectedView = .folder("Archive"); state.library.selectedFolder = "Archive"
+        _ = try await remote.renameFolder(from: "Archive", to: "Archive Two")
+        try expect(await state.library.refresh(), "Refresh remote containing-folder rename")
+        try expect(state.selectedView == .folder("Archive Two") && state.library.selectedRecording == "Archive Two/Renamed.mp3",
+                   "Containing-folder rename must follow its stable folder and recording identities")
+        _ = try await remote.renameFolder(from: "Archive Two", to: "Archive")
+        try expect(await state.library.refresh(), "Restore containing folder path")
+        await state.sharedLibrary.close()
+        print("Actual remote selection passed: rename/move follow stable recording identity.")
+        try await delayedRemoteSelectionChecks(parent: parent, left: root, owner: remote, reference: original.reference!)
+        try await mixedSelectionChecks(parent: parent.appendingPathComponent("mixed-selection"))
+    }
+
+    @MainActor static func mixedSelectionChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        let legacy = RecordingStore(baseDirectory: root)
+        try await legacy.setup()
+        var bytes = Data(repeating: 0, count: 417)
+        bytes.replaceSubrange(0..<4, with: [0xFF, 0xFB, 0x90, 0x64])
+        for name in ["A", "B"] { _ = try await legacy.importRecording(hdaData: bytes, entry: FileEntry(filename: name + ".hda", size: UInt32(bytes.count))) }
+        let state = AppState(baseDirectory: root, sharedIdentity: {
+            try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("identity.json"), installationAnchor: "mixed selection").load()
+        }, sharedWitnessDirectory: parent.appendingPathComponent("local"), sharedTrash: { url in
+            let trash = parent.appendingPathComponent("disposed")
+            try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: url, to: trash.appendingPathComponent(url.lastPathComponent))
+        })
+        try await state.setup(); try expect(await state.enableSharedLibrary(), "Enable mixed selection fixture")
+        let coordinator = state.sharedLibrary.coordinator!
+        await coordinator.stopMonitoring()
+        let removed = state.library.recordings.first { $0.filename == "B.mp3" }!
+        let removedDraft = state.library.speakerDraft(for: removed)
+        state.library.selectedRecordingIDs = Set(state.library.recordings.map(\.id))
+        _ = try await state.library.store.renameRecording(filename: "A.mp3", to: "Moved A")
+        _ = try await state.library.store.renameRecording(filename: "B.mp3", to: "Retired B")
+        _ = try await state.library.store.importRecording(hdaData: bytes, entry: FileEntry(filename: "Replacement.hda", size: UInt32(bytes.count)))
+        _ = try await state.library.store.renameRecording(filename: "Replacement.mp3", to: "B")
+        let deletion = try await coordinator.deleteSharedRecording(filename: "Retired B.mp3")
+        try expect(deletion.result == .complete, "Synthetic deletion completes before refreshing mixed selection: \(deletion.result)")
+        try expect(await state.library.refresh(), "Refresh moved/deleted/reused-name multiselection")
+        try expect(state.library.selectedRecordings == ["Moved A.mp3"] && state.library.selectedRecordingIDs.count == 1,
+                   "Multiselection follows surviving ID and never selects a replacement at the deleted ID's old path")
+        try expect(state.library.speakerDraft(for: removed) !== removedDraft, "Definitive deletion retires its draft")
+        state.selectSidebar(.device)
+        try expect(state.library.selectedRecordings.isEmpty && state.library.selectedRecording == nil, "Explicit navigation clears retained selection")
+        await state.sharedLibrary.close()
+    }
+
+    static func deliverSelectionReplica(_ source: URL, to destination: URL, writer: UUID) throws {
+        let tree = source.appendingPathComponent(".docktape").resolvingSymlinksInPath()
+        guard let files = FileManager.default.enumerator(at: tree, includingPropertiesForKeys: [.isDirectoryKey]) else { throw Failure(description: "Missing replica metadata") }
+        for case let file as URL in files where file.pathExtension == "json" {
+            let bytes = try Data(contentsOf: file)
+            let object = try JSONSerialization.jsonObject(with: bytes) as! [String: Any]
+            let payload = object["payload"] as? [String: Any]
+            let owner = (object["writerID"] as? String) ?? (payload?["writer"] as? String) ?? (object["founder"] as? String)
+            guard owner.flatMap(UUID.init(uuidString:)) == writer else { continue }
+            let canonical = file.resolvingSymlinksInPath().path
+            try expect(canonical.hasPrefix(tree.path + "/"), "Replica file must stay in its synthetic metadata root")
+            let relative = String(canonical.dropFirst(tree.path.count + 1))
+            let target = destination.appendingPathComponent(".docktape/" + relative)
+            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try bytes.write(to: target, options: .atomic)
+        }
+    }
+
+    @MainActor static func speakerDraftChecks(parent: URL) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in ["A.mp3", "B.mp3"] { try Data("Synthetic speaker draft".utf8).write(to: root.appendingPathComponent(name)) }
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local-witness"))
+        _ = try await coordinator.enable()
+        let store = RecordingStore(baseDirectory: root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
+        let transcripts = TranscriptStore(baseDirectory: root, shared: SharedSidecarAdapter(coordinator: coordinator))
+        let library = LibraryState(store: store, transcriptStore: transcripts, sharedCoordinator: coordinator)
+        try await library.setup()
+        let first = library.recordings.first { $0.filename == "A.mp3" }!, second = library.recordings.first { $0.filename == "B.mp3" }!
+        let segments = [Transcript.Segment(startTime: 0, endTime: 1, text: "First", speakerID: "s"),
+                        Transcript.Segment(startTime: 1, endTime: 2, text: "Second", speakerID: "other")]
+        let original = Transcript(recordingFilename: first.filename, transcriptionModel: "fixture", hasSpeakerLabels: true,
+            segments: segments, speakerNames: ["s": "Original", "other": "Other"])
+        let draft = library.speakerDraft(for: first)
+        draft.synchronize(with: original)
+        draft.names["s"] = "Unsaved choice"
+        draft.editingSpeaker = "other"; draft.editText = "Unconfirmed inline text"
+        let afterPathChange = library.speakerDraft(for: first.retargeted(to: "Folder/Renamed.mp3"))
+        try expect(afterPathChange === draft, "Same-ID path changes must retain the actual editor state object")
+        var incoming = original; incoming.speakerNames["other"] = "Peer independent name"
+        afterPathChange.synchronize(with: incoming)
+        try expect(afterPathChange.names == ["s": "Unsaved choice", "other": "Peer independent name"], "Remote refresh preserves dirty names and refreshes untouched speaker fields")
+        try expect(afterPathChange.editingSpeaker == "other" && afterPathChange.editText == "Unconfirmed inline text", "View recreation must preserve the unconfirmed inline edit")
+        let replacement = library.speakerDraft(for: second.retargeted(to: first.filename))
+        replacement.synchronize(with: original)
+        try expect(replacement !== draft && replacement.names["s"] == "Original" && replacement.editingSpeaker == nil, "Same-name replacement must not inherit another recording's draft")
+        let anotherLibrary = LibraryState(store: store, transcriptStore: transcripts, sharedCoordinator: coordinator)
+        try expect(anotherLibrary.speakerDraft(for: first) !== draft, "Another library instance cannot inherit editor state even for the same UUID")
+        incoming.speakerNames["s"] = "Unsaved choice"
+        draft.synchronize(with: incoming)
+        try expect(!draft.hasChanges, "A successful saved value becomes the new clean baseline")
+        _ = try await transcripts.loadTranscript(for: first.filename, reference: first.reference)
+        try await transcripts.save(original, mp3Filename: first.filename, reference: first.reference)
+        let generationOne = try await transcripts.loadTranscript(for: first.filename, reference: first.reference)!
+        draft.synchronize(with: generationOne)
+        draft.names["s"] = "Name for previous generation"
+        draft.editingSpeaker = "s"; draft.editText = "Unconfirmed previous person"
+        draft.mergeConfirmation = .init(sourceSID: "s", targetSID: "other", name: "Previous merge")
+        // Even byte-identical content is a distinct accepted generation. Speaker
+        // labels must not carry editor consent between transcription runs.
+        try await transcripts.save(original, mp3Filename: first.filename, reference: first.reference)
+        let generationTwo = try await transcripts.loadTranscript(for: first.filename, reference: first.reference)!
+        try expect(generationOne.sharedGenerationID != nil && generationOne.sharedGenerationID != generationTwo.sharedGenerationID,
+                   "Store exposes the exact distinct accepted generations")
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        try expect(try encoder.encode(generationOne) == encoder.encode(generationTwo),
+                   "Read provenance must not change the canonical transcript encoding")
+        draft.synchronize(with: generationTwo)
+        try expect(!draft.hasChanges && draft.names["s"] == "Original" && draft.editingSpeaker == nil && draft.editText.isEmpty && draft.mergeConfirmation == nil,
+                   "A replacement transcript generation cannot inherit speaker identity or merge consent")
+        print("Speaker draft checks passed: path/revision reload, dirty-field merge, inline edit and replacement/library isolation.")
+    }
+
+    @MainActor static func delayedRemoteSelectionChecks(parent: URL, left: URL, owner: SharedLibraryCoordinator, reference: SharedRecordingReference) async throws {
+        let right = parent.appendingPathComponent("replica")
+        _ = try await owner.projectOutputs()
+        try FileManager.default.copyItem(at: left, to: right)
+        let identity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("peer-identity.json"), installationAnchor: "independent peer selection").load()
+        let local = parent.appendingPathComponent("peer-witnesses")
+        let peer = SharedLibraryCoordinator(root: right, writerID: identity.writer, witnessDirectory: local)
+        try await peer.requestEnrollment(requestID: identity.requestID, label: "Simulated offline peer")
+        for _ in 0..<3 {
+            try deliverSelectionReplica(right, to: left, writer: peer.writerID)
+            try expect(FileManager.default.fileExists(atPath: left.appendingPathComponent(".docktape/members/" + peer.writerID.uuidString.lowercased() + ".json").path), "Replica delivery reaches the direct member path")
+            try await owner.refresh()
+            try deliverSelectionReplica(left, to: right, writer: owner.writerID); try await peer.refresh()
+        }
+        try expect(try await peer.mayEdit(), "Independent replica enrollment completes")
+        let state = AppState(baseDirectory: right, sharedIdentity: { identity }, sharedWitnessDirectory: local)
+        try await state.setup()
+        await state.sharedLibrary.coordinator?.stopMonitoring()
+        for (old, new, name) in [("Archive/Renamed.mp3", "Archive/Arriving.mp3", "Offline rename peer"),
+                                 ("Archive/Arriving.mp3", "Arriving.mp3", "Offline move peer")] {
+        state.library.selectedRecordings = [old]; state.library.selectedRecording = old
+        _ = try await state.library.transcriptStore.loadTranscript(for: old, reference: reference)
+        // No owner files are delivered until both real stores have saved.
+        try await state.library.transcriptStore.updateSpeakerNames(for: old, names: ["s": name], reference: reference)
+        if new.contains("/") { _ = try await owner.relocateRecording(filename: old, title: "Arriving", reference: reference) }
+        else { _ = try await owner.relocateRecording(filename: old, changeFolder: true, reference: reference) }
+        let undelivered = try await state.library.transcriptStore.loadTranscript(for: old, reference: reference)
+        try expect(undelivered?.speakerNames["s"] == name && FileManager.default.fileExists(atPath: right.appendingPathComponent(old).path),
+                   "Disconnected replica keeps its own content and old physical path")
+        try deliverSelectionReplica(left, to: right, writer: owner.writerID)
+        try deliverSelectionReplica(right, to: left, writer: peer.writerID)
+        try expect(await state.library.refresh(), "Accept metadata before physical path delivery")
+        try expect(state.library.selectedRecording == new && state.library.selectedRecordings == [new],
+                   "Metadata-first rename/move must retain selected ID while its audio is still arriving")
+        try expect(state.library.recordings.contains { $0.filename == new && $0.reference == reference },
+                   "Selected pending recording stays represented by its accepted reference")
+        try expect(!state.library.downloadedFilenames.contains(new), "An arriving recording must not be described as downloaded")
+        _ = try await owner.projectOutputs()
+        for suffix in [".mp3", ".transcript.json", ".summary.json", ".transcript.md", ".summary.md", ".txt"] {
+            let newBase = String(new.dropLast(4)), oldBase = String(old.dropLast(4))
+            let source = left.appendingPathComponent(newBase + suffix)
+            if FileManager.default.fileExists(atPath: source.path) {
+                try Data(contentsOf: source).write(to: right.appendingPathComponent(newBase + suffix), options: .atomic)
+            }
+            let previous = right.appendingPathComponent(oldBase + suffix)
+            if FileManager.default.fileExists(atPath: previous.path) { try FileManager.default.removeItem(at: previous) }
+        }
+        try Data(contentsOf: left.appendingPathComponent("library.json")).write(to: right.appendingPathComponent("library.json"), options: .atomic)
+        try expect(await state.library.refresh(), "Refresh final physical delivery")
+        let transcript = try await state.library.transcriptStore.loadTranscript(for: new, reference: reference)
+        try expect(state.library.selectedRecording == new && transcript?.speakerNames["s"] == name, "Path delivery retains selection and the independent offline edit")
+        try expect(try Data(contentsOf: right.appendingPathComponent(new)) == Data("Synthetic remote selection audio".utf8), "Replica delivery preserves original audio")
+        }
+        let captured = state.library.recordings.first { $0.reference == reference }!
+        let draft = state.library.speakerDraft(for: captured)
+        draft.synchronize(with: try await state.library.transcriptStore.loadTranscript(for: captured.filename, reference: reference)!)
+        draft.names["s"] = "Draft through competing paths"
+        draft.editingSpeaker = "s"; draft.editText = "Inline through competing paths"
+        let aBase = try await owner.read(.init(id: reference.entityID, kind: .recording))
+        let bBase = try await peer.read(.init(id: reference.entityID, kind: .recording))
+        _ = try await owner.edit(.init(base: aBase, changes: [.assign(field: "title", value: .text("Left location"))]))
+        _ = try await peer.edit(.init(base: bBase, changes: [.assign(field: "title", value: .text("Right location"))]))
+        try deliverSelectionReplica(left, to: right, writer: owner.writerID)
+        try expect(await state.library.refresh(), "Observe complete competing-path catalog")
+        let afterConflict = state.library.speakerDraft(for: captured)
+        try expect(afterConflict === draft && afterConflict.names["s"] == "Draft through competing paths" && afterConflict.editText == "Inline through competing paths",
+                   "An alive recording with an ambiguous location must retain its unsaved draft")
+        let conflict = try await peer.read(.init(id: reference.entityID, kind: .recording))
+        _ = try await peer.resolve(.init(base: conflict, changes: [.assign(field: "title", value: .text("Right location"))]))
+        try expect(await state.library.refresh(), "Observe explicitly resolved location")
+        try expect(state.library.speakerDraft(for: captured.retargeted(to: "Right location.mp3")) === draft,
+                   "Resolved location returns to the same recording-owned draft")
+        await state.sharedLibrary.close()
+        print("Simulated offline rename/move versus store edit passed: metadata-first selection, later physical delivery and content convergence.")
+    }
+
     @MainActor static func run() async throws {
         _ = NSApplication.shared
         UserDefaults.standard.setVolatileDomain(["storageMode": "local"], forName: UserDefaults.argumentDomain)
         let parent = FileManager.default.temporaryDirectory.appendingPathComponent("DockTapeSharedApp-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: parent) }
+        try await remoteSelectionChecks(parent: parent.appendingPathComponent("remote-selection"))
+        try await speakerDraftChecks(parent: parent.appendingPathComponent("speaker-draft"))
         let root = parent.appendingPathComponent("library")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try Data("synthetic audio".utf8).write(to: root.appendingPathComponent("Meeting.mp3"))
@@ -591,6 +838,7 @@ struct DockTapeSharedLibraryTests {
             let badgesReady = state.transcription.statuses["B.mp3"] == .done && state.summarization.hasSummary.contains("B.mp3")
             var residentText: String?
             if residentB != nil { residentText = try await state.transcription.transcriptStore.loadTranscript(for: "B.mp3")?.segments.first?.text }
+            let residentSummary = try await state.summarization.summaryStore.loadSummary(for: "B.mp3")
             var finishedBeforeRelease = true
             var switched = true
             var switchTask: Task<Bool, Never>?
@@ -633,6 +881,7 @@ struct DockTapeSharedLibraryTests {
             try expect(emptyReady, "Independent empty folder identity arrives while unrelated authoritative metadata remains held")
             try expect(residentB?.reference != nil, "First launch must expose resident B with stable identity while unrelated A metadata remains held (deleted=\(deleted))")
             try expect(residentText == "Resident B.mp3", "B transcript must be usable while A metadata remains held")
+            try expect(residentSummary?.sections.first?.content == "Resident B summary", "B summary content must be usable while A metadata remains held")
             try expect(loadingVisible && badgesReady, "Waiting feedback and resident transcript/summary badges appear before A is available")
             try expect(!unknownAVisible, "Unknown lifecycle must not expose A's retained raw audio while metadata is pending")
             try expect(finishedBeforeRelease, "Stop/switch must complete without waiting for the held owner head")

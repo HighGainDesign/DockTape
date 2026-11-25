@@ -1,8 +1,32 @@
 // © 2026 High Gain Design. All rights reserved.
 import AppKit
+import Observation
 import HiDockKit
 
 @main struct DockTapeSharedReviewTests {
+    /// Mirrors the revision-keyed review task while retaining real AppState's
+    /// file-presenter/event subscription. No manual refresh on final removal.
+    @MainActor final class ReviewRevisionFollower {
+        let state: AppState, model: RecordingFileReviewState
+        let coordinator: SharedLibraryCoordinator
+        private var stopped = false
+        private var reload: Task<Void, Never>?
+        init(state: AppState, model: RecordingFileReviewState, coordinator: SharedLibraryCoordinator) {
+            self.state = state; self.model = model; self.coordinator = coordinator
+        }
+        func observe() {
+            guard !stopped else { return }
+            withObservationTracking { _ = state.sharedLibrary.revision } onChange: { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self, !self.stopped else { return }
+                    self.reload?.cancel()
+                    self.reload = Task { await self.model.refresh(using: self.coordinator) }
+                    self.observe()
+                }
+            }
+        }
+        func stop() { stopped = true; reload?.cancel() }
+    }
     actor CommitCount {
         private var count = 0
         func next() -> Int { count += 1; return count }
@@ -1181,6 +1205,10 @@ import HiDockKit
         // missing /private/tmp descendant differently from its existing parent.
         let parent = requestedParent.standardizedFileURL.resolvingSymlinksInPath()
         defer { if !ui { try? FileManager.default.removeItem(at: parent) } }
+        if arguments.contains("--file-review-loading-only") { try await fileReviewLoadingChecks(parent: parent); return }
+        if arguments.contains("--file-review-parent-cancel-only") { try await fileReviewLoadingChecks(parent: parent, cancelParent: true); return }
+        if arguments.contains("--file-review-failure-only") { try await fileReviewLoadingChecks(parent: parent, failRead: true); return }
+        if arguments.contains("--file-review-post-action-only") { _ = try await lateFeedback(parent, rebind: false, stopInspection: true); return }
         if arguments.contains("--dispatch-only") { try await fileReviewDispatchChecks(parent: parent); return }
         if arguments.contains("--dispatch-preview-only") { try await fileReviewDispatchChecks(parent: parent, previewOnly: true); return }
         if arguments.contains("--dispatch-feedback-only") { try await fileReviewDispatchChecks(parent: parent, feedbackOnly: true); return }
@@ -1202,6 +1230,10 @@ import HiDockKit
             return
         }
         if arguments.contains("--lifecycle-only") { try await lifecycleReviewChecks(parent: parent); try await unpreparedDeletionChecks(parent: parent.appendingPathComponent("unprepared")); return }
+        try await fileReviewLoadingChecks(parent: parent.appendingPathComponent("review-loading"))
+        try await fileReviewLoadingChecks(parent: parent.appendingPathComponent("review-parent-cancel"), cancelParent: true)
+        try await fileReviewLoadingChecks(parent: parent.appendingPathComponent("review-failed-read"), failRead: true)
+        _ = try await lateFeedback(parent.appendingPathComponent("review-post-action"), rebind: false, stopInspection: true)
         try await fileReviewDispatchChecks(parent: parent.appendingPathComponent("review-dispatch"))
         try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-scopes"))
         try await folderDeletionScopeChecks(parent: parent.appendingPathComponent("folder-peer-cleanup"), peerCleanup: true)
@@ -1308,13 +1340,23 @@ import HiDockKit
         try deliver(left, to: right, writer: a.writerID)
         let taskID = UUID()
         let summary = Summary(recordingFilename: "Meeting.mp3", model: "Synthetic", provider: "fixture", templateUsed: "meeting",
-            sections: [.init(heading: "Tasks", content: "Summary", items: [.init(id: taskID, text: "Send meeting notes", isCompleted: false)])])
+            sections: [.init(heading: "Action Items", content: "Summary", items: [.init(id: taskID, text: "Send meeting notes", isCompleted: false)])])
         let summaryDocument = try SharedDocument(id: UUID(), json: JSONEncoder().encode(summary))
         _ = try await a.edit(.init(base: try await a.read(entity), changes: [.generation(summaryDocument, component: .summary)]))
         try deliver(left, to: right, writer: a.writerID)
-        let checkA = try await a.read(entity), checkB = try await b.read(entity)
-        _ = try await a.edit(.init(base: checkA, changes: [.generationEdit(component: .summary, generation: summaryDocument.id, key: taskID.uuidString.lowercased(), value: .flag(true))]))
-        _ = try await b.edit(.init(base: checkB, changes: [.generationEdit(component: .summary, generation: summaryDocument.id, key: taskID.uuidString.lowercased(), value: .flag(false))]))
+        let reference = try await a.reference(to: "Meeting.mp3")
+        let summariesA = SummaryStore(baseDirectory: left, shared: SharedSidecarAdapter(coordinator: a))
+        let summariesB = SummaryStore(baseDirectory: right, shared: SharedSidecarAdapter(coordinator: b))
+        _ = try await summariesA.loadSummary(for: "Meeting.mp3", reference: reference)
+        _ = try await summariesB.loadSummary(for: "Meeting.mp3", reference: reference)
+        try await summariesA.toggleItem(taskID, inSummaryFor: "Meeting.mp3", reference: reference)
+        try await summariesB.toggleItem(taskID, inSummaryFor: "Meeting.mp3", reference: reference)
+        try expect(try await summariesB.loadSummary(for: "Meeting.mp3", reference: reference)?.sections[0].items?[0].isCompleted == true, "B's first real toggle is saved before toggling back")
+        try await summariesB.toggleItem(taskID, inSummaryFor: "Meeting.mp3", reference: reference)
+        let independentA = try await summariesA.loadSummary(for: "Meeting.mp3", reference: reference)
+        let independentB = try await summariesB.loadSummary(for: "Meeting.mp3", reference: reference)
+        try expect(independentA?.sections[0].items?[0].isCompleted == true && independentB?.sections[0].items?[0].isCompleted == false,
+                   "Undelivered replicas retain A's true and B's twice-toggled false independently")
         try deliver(right, to: left, writer: b.writerID)
         await model.refresh(using: a)
         let checks = model.items.first { $0.id == entity.id }!, check = model.items.first { $0.id == entity.id }!.fields[0]
@@ -1322,6 +1364,11 @@ import HiDockKit
         let completed = check.choices.first { $0.value == .flag(true) }!
         try expect(completed.detail.contains("From: This Mac") && check.choices.first { $0.value == .flag(false) }?.detail.contains("From: Second test Mac") == true, "Checklist choices identify their actual source Macs")
         try expect(await model.apply(item: checks, selections: [check.id: completed.id], using: a), "Reviewed checklist status must persist")
+        try deliver(left, to: right, writer: a.writerID)
+        let resolvedA = try await summariesA.loadSummary(for: "Meeting.mp3", reference: reference)
+        let resolvedB = try await summariesB.loadSummary(for: "Meeting.mp3", reference: reference)
+        try expect(resolvedA?.sections[0].items?[0].isCompleted == true && resolvedB?.sections[0].items?[0].isCompleted == true,
+                   "Both real summary stores converge on the reviewed checkbox value")
         // Template prompts use the same captured-context transaction.
         let templates = TemplateStore(baseDirectory: left, shared: SharedTemplateAdapter(coordinator: a))
         try await templates.load()
@@ -1330,9 +1377,11 @@ import HiDockKit
         try deliver(left, to: right, writer: a.writerID)
         let templateView = try await a.snapshots(kinds: [.template]).first { $0.state.value(for: "templateID") == .text("review-template") }!
         let templateEntity = SharedEntityIdentity(id: templateView.state.id, kind: .template)
-        let templateB = try await b.read(templateEntity)
-        _ = try await a.edit(.init(base: templateView, changes: [.assign(field: "prompt", value: .text("Prompt A"))]))
-        _ = try await b.edit(.init(base: templateB, changes: [.assign(field: "prompt", value: .text("Prompt B"))]))
+        let peerTemplates = TemplateStore(baseDirectory: right, shared: SharedTemplateAdapter(coordinator: b))
+        try await peerTemplates.load()
+        var promptA = await templates.template(forID: "review-template")!, promptB = await peerTemplates.template(forID: "review-template")!
+        promptA.promptText = "Prompt A"; promptB.promptText = "Prompt B"
+        try await templates.update(promptA); try await peerTemplates.update(promptB)
         try deliver(right, to: left, writer: b.writerID)
         await model.refresh(using: a)
         let templateItem = model.items.first { $0.id == templateEntity.id }!, prompt = model.items.first { $0.id == templateEntity.id }!.fields[0]
@@ -1341,6 +1390,9 @@ import HiDockKit
         try expect(await model.apply(item: templateItem, selections: [prompt.id: selectedPrompt.id], using: a), "Template review must persist")
         try await templates.load()
         try expect(await templates.template(forID: "review-template")?.promptText == "Prompt B", "Actual template adapter must reload the reviewed prompt")
+        try deliver(left, to: right, writer: a.writerID)
+        try await peerTemplates.load()
+        try expect(await peerTemplates.template(forID: "review-template")?.promptText == "Prompt B", "Peer template store converges after reviewed delivery")
         // Settings drafts retain the exact displayed context through refresh.
         let editor = TemplateEditingState()
         await editor.select(id: "review-template", using: templates)
@@ -1458,7 +1510,8 @@ import HiDockKit
         try expect(FileManager.default.fileExists(atPath: updatedRoot.appendingPathComponent("Next.mp3").path) && !FileManager.default.fileExists(atPath: updatedRoot.appendingPathComponent("Selected.mp3").path), "Stale preview preserves the actual source")
         let peerRoot = parent.appendingPathComponent("recovery-peer")
         try FileManager.default.copyItem(at: recoveryRoot, to: peerRoot)
-        let peer = SharedLibraryCoordinator(root: peerRoot, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("recovery-peer-local"))
+        let peerIdentity = try await SharedLibraryWriterIdentityStore(file: parent.appendingPathComponent("recovery-peer-identity.json"), installationAnchor: "independent recovery peer").load()
+        let peer = SharedLibraryCoordinator(root: peerRoot, writerID: peerIdentity.writer, witnessDirectory: parent.appendingPathComponent("recovery-peer-local"))
         try await peer.requestEnrollment(requestID: UUID(), label: "Recovery peer")
         for _ in 0..<3 {
             try deliver(peerRoot, to: recoveryRoot, writer: peer.writerID); try await recovery.refresh()
@@ -1493,9 +1546,20 @@ import HiDockKit
         try Data().write(to: latePlaceholder)
         await peerFiles.refresh(using: peer)
         try expect(peerFiles.items.count == 1, "A late companion placeholder cannot be mistaken for completed removal")
-        try FileManager.default.removeItem(at: latePlaceholder)
-        await peerFiles.refresh(using: peer)
-        try expect(peerFiles.items.isEmpty, "Exact acknowledged absence clears the mirrored pending row")
+        let peerApp = AppState(baseDirectory: peerRoot, sharedIdentity: { peerIdentity }, sharedWitnessDirectory: parent.appendingPathComponent("recovery-peer-local"))
+        try await peerApp.setup()
+        let follower = ReviewRevisionFollower(state: peerApp, model: peerFiles, coordinator: peer)
+        follower.observe()
+        let beforeRemoval = peerApp.sharedLibrary.revision
+        try await CoordinatedFileAccess().withWrite(at: latePlaceholder) { scope in try FileManager.default.removeItem(at: scope.url) }
+        let deliveryDeadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while !(peerApp.sharedLibrary.revision > beforeRemoval && peerFiles.items.isEmpty && !peerFiles.isLoading), ContinuousClock.now < deliveryDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let notifiedClean = peerApp.sharedLibrary.revision > beforeRemoval && peerFiles.items.isEmpty
+            && !peerFiles.isLoading && !peerFiles.inspectionFailed && peerFiles.message == nil
+        follower.stop(); await peerApp.sharedLibrary.close()
+        try expect(notifiedClean, "Final peer file absence must produce a clean completed inspection through actual app notifications without manual Reload")
         let mirrored = try await peer.resumeRecordingOperation(id: try await peer.snapshots(kinds: [.recording])[0].state.id)
         try expect(mirrored.result == .complete, "Exact mirrored completion must also be resumable without claiming local Trash work")
         let peerViews = try await peer.snapshots(kinds: [.recording])

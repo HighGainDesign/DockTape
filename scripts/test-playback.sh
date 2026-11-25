@@ -4,8 +4,8 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-swift build
-BIN_PATH="$(swift build --show-bin-path)"
+swift build --build-system native
+BIN_PATH="$(swift build --build-system native --show-bin-path)"
 MODULES="$BIN_PATH/Modules"
 OUTPUT=".build/release-validation/playback-tests"
 mkdir -p "$(dirname "$OUTPUT")"

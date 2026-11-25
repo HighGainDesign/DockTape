@@ -22,16 +22,57 @@ import HiDockKit
     private var binding: SharedLibraryCoordinator?
     private var request = UUID()
     private var action: Task<Bool, Never>?
+    private var inspection: Task<Void, Never>?
     private var workID = UUID()
 
+    func cancelLoading() {
+        guard isLoading, !isWorking else { return }
+        clear()
+        message = "Checking stopped. Reload to inspect the current pending file changes."
+    }
+
     func clear() {
+        inspection?.cancel(); inspection = nil
         request = UUID(); workID = UUID(); action?.cancel(); action = nil
         binding = nil; items = []; deletionPreparations = []; deletionSnapshots = [:]; message = nil; updatedPlan = nil; isLoading = false; isWorking = false; inspectionFailed = false
     }
     func refresh(using coordinator: SharedLibraryCoordinator) async {
+        guard !Task.isCancelled else { return }
         if binding !== coordinator { clear(); binding = coordinator }
         let ticket = UUID(); request = ticket; isLoading = true; message = nil; inspectionFailed = false
-        defer { if request == ticket { isLoading = false } }
+        inspection?.cancel()
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.inspect(using: coordinator, ticket: ticket)
+        }
+        inspection = task
+        await withTaskCancellationHandler(operation: { await task.value }, onCancel: { task.cancel() })
+        if request == ticket {
+            inspection = nil; isLoading = false
+            if task.isCancelled || Task.isCancelled {
+                retireReview()
+                message = "Checking stopped. Reload to inspect the current pending file changes."
+            }
+        }
+    }
+    private func retireReview() {
+        items = []; deletionPreparations = []; deletionSnapshots = [:]; updatedPlan = nil
+        inspectionFailed = true
+    }
+    /// The mutation has returned before this phase: only its read-only
+    /// follow-up may now be stopped. The accepted write is never cancelled.
+    private func refreshAfterAction(using coordinator: SharedLibraryCoordinator) async {
+        isWorking = false; action = nil
+        await refresh(using: coordinator)
+    }
+    private func inspect(using coordinator: SharedLibraryCoordinator, ticket: UUID) async {
+        defer {
+            if request == ticket {
+                if Task.isCancelled { retireReview() }
+                isLoading = false
+            }
+        }
+        guard request == ticket, binding === coordinator, !Task.isCancelled else { return }
         do {
             let views = try await coordinator.snapshots(kinds: [.recording])
             var rows: [SharedRecordingOperationReview] = [], preparations: [DeletionPreparation] = [], failures = 0
@@ -62,24 +103,29 @@ import HiDockKit
             }.map { ($0.state.id, $0) })
             if failures > 0 { inspectionFailed = true; message = "Some pending file changes could not be inspected. Reload after sync finishes or join this library before continuing." }
         } catch {
-            if request == ticket, binding === coordinator, !(error is CancellationError) { inspectionFailed = true; message = "Pending file changes could not be loaded. Reload after the library is available." }
+            if request == ticket, binding === coordinator {
+                retireReview()
+                message = error is CancellationError
+                    ? "Checking stopped. Reload to inspect the current pending file changes."
+                    : "Pending file changes could not be loaded. Reload after the library is available."
+            }
         }
     }
     @discardableResult func prepareDeletion(_ candidate: DeletionPreparation, using coordinator: SharedLibraryCoordinator) async -> Bool {
-        guard binding === coordinator, !isLoading, !isWorking else { return false }
+        guard binding === coordinator, !isLoading, !isWorking, !inspectionFailed else { return false }
         let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
         let task = Task { [weak self] in
             do {
                 try Task.checkCancellation()
                 let outcome = try await coordinator.prepareReviewedDeletion(candidate.snapshot)
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
-                await self.refresh(using: coordinator)
+                await self.refreshAfterAction(using: coordinator)
                 guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = outcome.result == .complete ? "Deletion completed." : "Cleanup prepared. Review the remaining file changes and participating Mac approvals."
                 return true
             } catch {
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return false }
-                await self.refresh(using: coordinator)
+                await self.refreshAfterAction(using: coordinator)
                 guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return false }
                 self.message = "Cleanup could not be prepared. Reload or retry after the recording and its companion files are available and any changed files have been reviewed."
                 return false
@@ -94,7 +140,7 @@ import HiDockKit
     func canKeepForReview(id: UUID) -> Bool { visibleIDs.contains(id) && deletionSnapshots[id] != nil }
 
     @discardableResult func keepForReview(id: UUID, using coordinator: SharedLibraryCoordinator) async -> Bool {
-        guard binding === coordinator, !isLoading, !isWorking, visibleIDs.contains(id),
+        guard binding === coordinator, !isLoading, !isWorking, !inspectionFailed, visibleIDs.contains(id),
               let snapshot = deletionSnapshots[id] else { return false }
         let ticket = request, work = UUID(); workID = work; isWorking = true; message = nil
         let task = Task { [weak self] in
@@ -102,13 +148,13 @@ import HiDockKit
                 try Task.checkCancellation()
                 _ = try await coordinator.resolve(.init(base: snapshot, changes: [.restore]))
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
-                await self.refresh(using: coordinator)
+                await self.refreshAfterAction(using: coordinator)
                 guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = "Recording kept. Review its external files before deleting again. Files already removed are not restored automatically."
                 return true
             } catch {
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return false }
-                await self.refresh(using: coordinator)
+                await self.refreshAfterAction(using: coordinator)
                 guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return false }
                 self.message = "The recording or library changed. Reload before keeping it for file review."
                 return false
@@ -125,7 +171,7 @@ import HiDockKit
         updatedPlan = nil
     }
     func prepareUpdatedPlan(_ review: SharedRecordingOperationReview, using coordinator: SharedLibraryCoordinator) async {
-        guard binding === coordinator, !isLoading, !isWorking, review.canReplan else { return }
+        guard binding === coordinator, !isLoading, !isWorking, !inspectionFailed, review.canReplan else { return }
         let ticket = request; let work = UUID(); workID = work; isWorking = true; message = nil
         defer { if binding === coordinator, workID == work { isWorking = false } }
         do {
@@ -139,7 +185,7 @@ import HiDockKit
         }
     }
     @discardableResult func applyUpdatedPlan(_ preview: FileReviewPreview<SharedRecordingReplanReview>, using coordinator: SharedLibraryCoordinator) async -> Bool {
-        guard binding === coordinator, !isLoading, !isWorking, updatedPlan?.id == preview.id else { return false }
+        guard binding === coordinator, !isLoading, !isWorking, !inspectionFailed, updatedPlan?.id == preview.id else { return false }
         let prepared = preview.review
         let ticket = request; let work = UUID(); workID = work; isWorking = true; message = nil
         let task = Task { [weak self] in
@@ -148,7 +194,7 @@ import HiDockKit
                 let outcome = try await coordinator.applyRecordingReplan(prepared)
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
                 self.updatedPlan = nil
-                await self.refresh(using: coordinator)
+                await self.refreshAfterAction(using: coordinator)
                 guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = outcome.result == .complete && outcome.projectionError == nil
                     ? "Updated file plan completed." : "Updated plan accepted. Review any remaining pending file changes."
@@ -156,7 +202,7 @@ import HiDockKit
             } catch {
                 guard let self, self.binding === coordinator, self.request == ticket else { return false }
                 self.updatedPlan = nil
-                await self.refresh(using: coordinator)
+                await self.refreshAfterAction(using: coordinator)
                 guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return false }
                 if !(error is CancellationError) {
                     self.message = "The updated plan could not finish. Review the current pending change before trying again; existing files are preserved."
@@ -170,7 +216,7 @@ import HiDockKit
         return result
     }
     @discardableResult func perform(_ choice: Action, review: SharedRecordingOperationReview, using coordinator: SharedLibraryCoordinator) async -> Bool {
-        guard binding === coordinator, !isLoading, !isWorking else { return false }
+        guard binding === coordinator, !isLoading, !isWorking, !inspectionFailed else { return false }
         let ticket = request; let work = UUID(); workID = work; isWorking = true; message = nil
         let task = Task { [weak self] in
             do {
@@ -192,7 +238,7 @@ import HiDockKit
                     }
                 }
                 guard let self, self.binding === coordinator, self.request == ticket, !Task.isCancelled else { return true }
-                await self.refresh(using: coordinator)
+                await self.refreshAfterAction(using: coordinator)
                 guard self.binding === coordinator, self.workID == work, !Task.isCancelled else { return true }
                 self.message = text
                 return true

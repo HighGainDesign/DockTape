@@ -35,7 +35,25 @@ final class LibraryState {
     var selectedFolder: String? = nil  // nil = "All Recordings"
     var selectedRecording: String? = nil
     var selectedRecordings: Set<String> = []
+    /// Stable List tags do not lose selection when a selected row changes path.
+    var selectedRecordingIDs: Set<String> {
+        get { Set(recordings.filter { selectedRecordings.contains($0.filename) }.map(\.id)) }
+        set {
+            selectedRecordings = Set(recordings.filter { newValue.contains($0.id) }.map(\.filename))
+            selectedRecording = selectedRecordings.count == 1 ? selectedRecordings.first : nil
+        }
+    }
     var downloadedFilenames: Set<String> = []
+    private(set) var pendingSelectedRecordings: Set<String> = []
+    private enum DraftKey: Hashable { case shared(SharedRecordingReference), legacy(String) }
+    @ObservationIgnored private var speakerDrafts: [DraftKey: TranscriptSpeakerDraft] = [:]
+    func speakerDraft(for recording: RecordingMetadata) -> TranscriptSpeakerDraft {
+        let key = recording.reference.map(DraftKey.shared) ?? .legacy(recording.filename)
+        if let draft = speakerDrafts[key] { return draft }
+        let draft = TranscriptSpeakerDraft()
+        speakerDrafts[key] = draft
+        return draft
+    }
     var searchText: String = ""
     var isSearchFocused: Bool = false
 
@@ -50,6 +68,7 @@ final class LibraryState {
     private var metadataRequest = UUID()
     private var metadataTask: Task<Void, Error>?
     var onSharedContent: (@MainActor () async -> Void)?
+    var onCatalogChange: (@MainActor ([String: String], Bool) -> Void)?
 
 
     init(store: RecordingStore, transcriptStore: TranscriptStore, sharedCoordinator: SharedLibraryCoordinator? = nil) {
@@ -113,18 +132,55 @@ final class LibraryState {
 
     private func publishCatalog(request: UUID) async {
         guard metadataRequest == request, !Task.isCancelled else { return }
-        let entries = await store.allRecordings()
+        let catalog = await store.recordingCatalog()
+        var entries = catalog.recordings
         let imported = await store.allImportedDeviceFilenames()
         let folderCatalog = await store.folderCatalog()
         let revisions = await store.contentRevisions()
         if sharedCoordinator != nil { try? await transcriptStore.loadAll(from: store) }
         guard metadataRequest == request, !Task.isCancelled else { return }
+        let previous = Dictionary(uniqueKeysWithValues: recordings.map { ($0.filename, $0) })
+        var pending: Set<String> = []
+        func currentPath(for filename: String) -> String? {
+            if let old = previous[filename], let reference = old.reference {
+                if let current = entries.first(where: { $0.reference == reference }) { return current.filename }
+                let acceptedPath = catalog.references.first { $0.value == reference }?.key
+                // An accepted alive ID can precede its physical move. A partial
+                // observation also cannot establish that an unseen ID vanished.
+                let retainedPath = acceptedPath ?? (!catalog.isComplete && !catalog.deleted.contains(reference.entityID) ? filename : nil)
+                guard let path = retainedPath,
+                      !entries.contains(where: { $0.filename == path && $0.reference != reference }) else { return nil }
+                entries.append(old.retargeted(to: path)); pending.insert(path)
+                return path
+            }
+            // A legacy selection has no captured shared identity. It keeps its
+            // filename semantics, including explicit in-place sharing setup.
+            return entries.contains { $0.filename == filename } ? filename : nil
+        }
+        let selection = Set(selectedRecordings.compactMap(currentPath))
+        let single = selectedRecording.flatMap(currentPath)
+        var folderMoves: [String: String] = [:]
+        for (name, reference) in folderReferences {
+            if let current = folderCatalog.references.first(where: { $0.value == reference })?.key,
+               current != name { folderMoves[name] = current }
+        }
         recordings = entries
-        downloadedFilenames = Set(entries.map(\.filename))
-        selectedRecordings.formIntersection(downloadedFilenames)
-        if let selectedRecording, !downloadedFilenames.contains(selectedRecording) { self.selectedRecording = nil }
+        downloadedFilenames = Set(catalog.recordings.map(\.filename))
+        pendingSelectedRecordings = pending
+        selectedRecordings = selection
+        selectedRecording = single
+        if catalog.isComplete {
+            let filenames = Set(entries.map(\.filename))
+            speakerDrafts = speakerDrafts.filter {
+                switch $0.key {
+                case .shared(let reference): return !catalog.deleted.contains(reference.entityID)
+                case .legacy(let filename): return filenames.contains(filename)
+                }
+            }
+        }
         importedDeviceFilenames = imported; folders = folderCatalog.names; folderReferences = folderCatalog.references
         contentRevisions = revisions
+        onCatalogChange?(folderMoves, catalog.isComplete)
         if sharedCoordinator != nil { await onSharedContent?() }
     }
 

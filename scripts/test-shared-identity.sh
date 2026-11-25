@@ -28,8 +28,8 @@ allowed={k:entitlements[k] for k in ['com.apple.application-identifier','com.app
 (root/'entitlements.plist').write_bytes(plistlib.dumps(allowed))
 (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier':info['CFBundleIdentifier'],'CFBundleExecutable':'identity-probe','CFBundlePackageType':'APPL','CFBundleName':'DockTape Identity Probe','CFBundleVersion':'1','LSUIElement':True}))
 PY
-swift build
-BIN_PATH="$(swift build --show-bin-path)"
+swift build --build-system native
+BIN_PATH="$(swift build --build-system native --show-bin-path)"
 OBJECTS=()
 while IFS= read -r object; do
     case "$object" in */HiDockCLI.build/*) continue;; esac

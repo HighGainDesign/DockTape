@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-swift build
-BIN_PATH="$(swift build --show-bin-path)"
+swift build --build-system native
+BIN_PATH="$(swift build --build-system native --show-bin-path)"
 OUTPUT=".build/shared-library/process-fixture"
 mkdir -p "$(dirname "$OUTPUT")"
 OBJECTS=()

@@ -3,6 +3,59 @@ import AppKit
 import HiDockKit
 
 extension DockTapeSharedReviewTests {
+    @MainActor static func fileReviewLoadingChecks(parent: URL, cancelParent: Bool = false, failRead: Bool = false) async throws {
+        let root = parent.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let bytes = Data("Synthetic held review original".utf8)
+        try bytes.write(to: root.appendingPathComponent("A.mp3"))
+        let coordinator = SharedLibraryCoordinator(root: root, writerID: UUID(), witnessDirectory: parent.appendingPathComponent("local"))
+        _ = try await coordinator.enable(); _ = try await coordinator.projectOutputs()
+        let id = try await coordinator.reference(to: "A.mp3").entityID
+        do { _ = try await coordinator.relocateRecording(filename: "A.mp3", title: "Intermediate", afterMutation: { _ in throw Failure(message: "held review interruption") }) }
+        catch let error as Failure { try expect(error.message == "held review interruption", "Expected owned move interruption") }
+        _ = try await coordinator.edit(.init(base: try await coordinator.read(.init(id: id, kind: .recording)), changes: [.assign(field: "title", value: .text("Final"))]))
+        let model = RecordingFileReviewState()
+        await model.refresh(using: coordinator)
+        guard let prior = model.items.first else { throw Failure(message: "Missing review before held reload") }
+        let head = root.appendingPathComponent(".docktape/records/" + id.uuidString.lowercased() + "/" + coordinator.writerID.uuidString.lowercased() + ".json")
+        if failRead {
+            await model.prepareUpdatedPlan(prior, using: coordinator)
+            try expect(model.updatedPlan != nil, "Failure starts with a displayed consent preview")
+            let original = try Data(contentsOf: head)
+            defer { try? original.write(to: head, options: .atomic) }
+            try Data("unreadable synthetic owner head".utf8).write(to: head, options: .atomic)
+            await model.refresh(using: coordinator)
+            try expect(model.inspectionFailed && !model.isLoading && model.items.isEmpty && model.updatedPlan == nil,
+                       "A failed reload must retire its previous actionable rows and preview")
+            try expect(!(await model.perform(.resume, review: prior, using: coordinator)), "A failed inspection cannot dispatch prior Resume")
+            return
+        }
+        let hold = HeldWrite()
+        let writer = Task.detached { try hold.hold(head) }
+        defer { hold.release() }
+        let entered = ContinuousClock.now.advanced(by: .seconds(3))
+        while !hold.waiting {
+            guard ContinuousClock.now < entered else { throw Failure(message: "Review hold did not enter") }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        var finished = false
+        let reload = Task { await model.refresh(using: coordinator); finished = true }
+        while !model.isLoading { await Task.yield() }
+        try expect(!finished && model.items.count == 1, "Held reload preserves prior display while inspecting")
+        if cancelParent { reload.cancel() } else { model.cancelLoading() }
+        let stopped = ContinuousClock.now.advanced(by: .seconds(2))
+        while !finished && ContinuousClock.now < stopped { try await Task.sleep(for: .milliseconds(5)) }
+        try expect(finished && !model.isLoading && model.items.isEmpty,
+                   "Stop or parent cancellation must retire held inspection and old rows before release")
+        try expect(!(await model.perform(.resume, review: prior, using: coordinator)), "A cancelled inspection cannot dispatch an old Resume")
+        hold.release(); try await writer.value; await reload.value
+        await model.refresh(using: coordinator)
+        try expect(!model.isLoading && model.items.count == 1 && model.message == nil, "Fresh Reload works after the held file becomes available")
+        try expect(try Data(contentsOf: root.appendingPathComponent("Intermediate.mp3")) == bytes && !FileManager.default.fileExists(atPath: root.appendingPathComponent("Final.mp3").path), "Cancelling inspection never changes recording files")
+        model.clear()
+        print("Actual pending-file loading passed: cancel held coordinated read, refuse old Resume, preserve files and retry (parent=\(cancelParent)).")
+    }
+
     final class HeldWrite: @unchecked Sendable {
         private let condition = NSCondition()
         private var entered = false
@@ -125,7 +178,7 @@ extension DockTapeSharedReviewTests {
         try expect(try Data(contentsOf: root.appendingPathComponent("A-final.mp3")) == Data("Synthetic A original".utf8), "Current A Apply preserves its audio")
         return ["accepted": accepted, "unexpectedBMove": unexpectedBMove, "AIntermediateRetained": aRetained]
     }
-    @MainActor static func lateFeedback(_ parent: URL, rebind: Bool = true) async throws -> [String: Any] {
+    @MainActor static func lateFeedback(_ parent: URL, rebind: Bool = true, stopInspection: Bool = false) async throws -> [String: Any] {
         let root = parent.appendingPathComponent("a"), other = parent.appendingPathComponent("b"), witness = parent.appendingPathComponent("a-local")
         for directory in [root, other] {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -153,6 +206,18 @@ extension DockTapeSharedReviewTests {
         while !(hold.waiting && model.isLoading) {
             guard ContinuousClock.now < limit else { hold.release(); _ = await action.value; throw Failure(message: "Action did not reach real held post-action refresh") }
             try await Task.sleep(for: .milliseconds(5))
+        }
+        if stopInspection {
+            model.cancelLoading()
+            try expect(!model.isLoading && !model.isWorking && model.visibleIDs.isEmpty,
+                       "An accepted mutation's held follow-up read must be stoppable without releasing the hold")
+            let accepted = await action.value
+            try await trigger.finish()
+            await model.refresh(using: a)
+            try expect(accepted && model.visibleIDs.isEmpty && !model.isLoading && model.message == nil,
+                       "Stopping a follow-up read preserves the accepted Keep and a later Reload succeeds")
+            try expect(try await a.read(entity).state.lifecycle == .alive, "Stopping follow-up inspection cannot undo accepted content")
+            return [:]
         }
         if rebind { model.clear(); await model.refresh(using: b) }
         let beforeRelease = model.message

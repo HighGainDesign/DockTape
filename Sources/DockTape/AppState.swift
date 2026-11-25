@@ -68,6 +68,15 @@ final class AppState {
     var sharedLibrary: SharedLibraryState
 
     var selectedView: SidebarSelection = .allRecordings
+    /// Only explicit sidebar/menu navigation clears the recording selection.
+    /// Catalog-driven folder/path changes retain the selected identities.
+    func selectSidebar(_ view: SidebarSelection) {
+        guard view != selectedView else { return }
+        library.selectedRecordings.removeAll(); library.selectedRecording = nil
+        if case .folder(let name) = view { library.selectedFolder = name }
+        else { library.selectedFolder = nil }
+        selectedView = view
+    }
     var selectedDetailTab: DetailTab = .info
     var triggerRename: Bool = false
     var triggerCustomPrompt: Bool = false
@@ -224,12 +233,29 @@ final class AppState {
         let store = RecordingStore(baseDirectory: coordinator.root, shared: SharedRecordingMetadataAdapter(coordinator: coordinator))
         let transcripts = TranscriptStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator))
         library = LibraryState(store: store, transcriptStore: transcripts, sharedCoordinator: coordinator)
+        // Carry the captured selection identities across a same-root store
+        // attachment; a later catalog must not reinterpret them by filename.
+        library.recordings = previous.recordings
         library.selectedFolder = previous.selectedFolder
         library.selectedRecording = previous.selectedRecording
         library.selectedRecordings = previous.selectedRecordings
         transcription = TranscriptionState(transcriptStore: transcripts, recordingStore: store, shared: coordinator)
         summarization = SummarizationState(summaryStore: SummaryStore(baseDirectory: coordinator.root, shared: SharedSidecarAdapter(coordinator: coordinator)), shared: coordinator)
         let currentLibrary = library, currentTranscription = transcription, currentSummary = summarization
+        library.onCatalogChange = { [weak self, weak currentLibrary] moves, complete in
+            guard let self, let currentLibrary, self.library === currentLibrary,
+                  self.sharedLibrary.coordinator === coordinator,
+                  case .folder(let previous) = self.selectedView else { return }
+            let folder = moves[previous] ?? previous
+            let movedOutside = currentLibrary.selectedRecordings.contains { !$0.hasPrefix(folder + "/") }
+            if movedOutside || (complete && !currentLibrary.folders.contains(folder)) {
+                currentLibrary.selectedFolder = nil
+                self.selectedView = .allRecordings
+            } else if folder != previous {
+                currentLibrary.selectedFolder = folder
+                self.selectedView = .folder(folder)
+            }
+        }
         library.onSharedContent = { [weak self, weak currentLibrary] in
             guard let self, let currentLibrary, self.library === currentLibrary,
                   self.sharedLibrary.coordinator === coordinator else { return }
@@ -1069,7 +1095,7 @@ final class AppState {
         stopPolling()
         await device.cleanup()
         statusMessage = "Device disconnected"
-        selectedView = .allRecordings
+        selectSidebar(.allRecordings)
     }
 
     // MARK: - Polling

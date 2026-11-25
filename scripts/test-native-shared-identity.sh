@@ -7,8 +7,8 @@ PROFILE="$APP_PATH/Contents/embedded.provisionprofile"
 test -x "$CLI_PATH"
 test -f "$PROFILE"
 codesign --verify --deep --strict "$APP_PATH"
-swift build
-BIN_PATH="$(swift build --show-bin-path)"
+swift build --build-system native
+BIN_PATH="$(swift build --build-system native --show-bin-path)"
 PROBE=".build/shared-library/native-identity/IdentityProbe.app"
 mkdir -p "$PROBE/Contents/MacOS"
 python3 - "$APP_PATH/Contents/Info.plist" "$PROBE/Contents/Info.plist" <<'PLIST'
